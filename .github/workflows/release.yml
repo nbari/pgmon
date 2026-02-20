@@ -1,0 +1,162 @@
+---
+name: Deploy
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  build:
+    name: Build and release
+    runs-on: ${{ matrix.os }}
+    needs:
+      - test
+
+    strategy:
+      matrix:
+        include:
+          - build: linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+
+          - build: macos
+            os: macos-latest
+            target: x86_64-apple-darwin
+
+          - build: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Get package name from Cargo.toml
+        id: package
+        shell: bash
+        run: |
+          PACKAGE_NAME=$(awk -F '"' '/^name = / {print $2; exit}' Cargo.toml)
+          echo "name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Package name: $PACKAGE_NAME"
+
+      - name: Get the release version from the tag
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install tools (Linux)
+        if: matrix.build == 'linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      # Linux-only prerequisites
+      - name: Install system deps (musl)
+        if: matrix.build == 'linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y musl-dev musl-tools
+
+      # Build once for Linux (musl)
+      - name: Build Linux (musl)
+        if: matrix.build == 'linux'
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Strip once and prep paths for both packagers
+      - name: Strip and prepare packaging paths (Linux)
+        if: matrix.build == 'linux'
+        run: |
+          BIN="target/${{ matrix.target }}/release/${{ steps.package.outputs.name }}"
+          ls -al "$BIN"
+          strip -s "$BIN" || true
+          # Ensure packagers' asset path exists
+          mkdir -p target/release
+          cp "$BIN" "target/release/${{ steps.package.outputs.name }}"
+
+      - name: Generate RPM
+        if: matrix.build == 'linux'
+        run: |
+          cargo generate-rpm
+          RPM_PATH="$(find target/generate-rpm -type f -name '*.rpm' -print -quit)"
+          echo "RPM_ASSET=$RPM_PATH" >> $GITHUB_ENV
+
+      - name: Generate DEB
+        if: matrix.build == 'linux'
+        run: |
+          cargo deb --no-build
+          DEB_PATH="$(find target/debian -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          echo "DEB_ASSET=$DEB_PATH" >> $GITHUB_ENV
+
+      # Non-Linux builds (macOS, Windows)
+      - name: Build
+        if: matrix.build != 'linux'
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build archive
+        shell: bash
+        run: |
+          binary_name="${{ steps.package.outputs.name }}"
+          dirname="$binary_name-${{ env.VERSION }}-${{ matrix.target }}"
+          mkdir "$dirname"
+
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            mv "target/${{ matrix.target }}/release/$binary_name.exe" "$dirname"
+          else
+            mv "target/${{ matrix.target }}/release/$binary_name" "$dirname"
+          fi
+
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            7z a "$dirname.zip" "$dirname"
+            echo "ASSET=$dirname.zip" >> $GITHUB_ENV
+          else
+            tar -czf "$dirname.tar.gz" "$dirname"
+            echo "ASSET=$dirname.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          mkdir -p release_assets
+          cp ${{ env.ASSET }} release_assets/
+          if [ -f "${{ env.RPM_ASSET }}" ]; then cp ${{ env.RPM_ASSET }} release_assets/; fi
+          if [ -f "${{ env.DEB_ASSET }}" ]; then cp ${{ env.DEB_ASSET }} release_assets/; fi
+          ls -l release_assets/
+
+      # Skip release if the tag starts with 't'
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/') && !startsWith(github.ref_name, 't')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          files: release_assets/*
+
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    needs:
+      - build
+    # Only publish to crates.io on tag pushes that DON'T start with 't'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && !startsWith(github.ref_name,
+      't')
+    continue-on-error: true
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - run: cargo publish --token ${CRATES_TOKEN}
+        env:
+          CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}

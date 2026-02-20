@@ -1,0 +1,43 @@
+[package]
+name = "pgmon"
+version = "0.1.0"
+edition = "2021"
+authors = ["nbari"]
+description = "A PostgreSQL monitoring TUI"
+license = "BSD-3-Clause"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.4", features = ["color", "env", "string"] }
+chrono = "0.4"
+crossterm = { version = "0.27", features = ["events"] }
+postgres = { version = "0.19", features = ["with-chrono-0_4"] }
+ratatui = "0.26"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-width = "0.1"
+
+[package.metadata.deb]
+maintainer = "nbari"
+copyright = "2024, nbari"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+A PostgreSQL monitoring TUI
+"""
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/pgmon", "usr/bin/", "755"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/pgmon", dest = "/usr/bin/pgmon", mode = "755" },
+]
+
+[build-dependencies]
+built = { version = "0.7", features = ["git2"] }
+
+[dev-dependencies]
+pretty_assertions = "1.4"
