@@ -101,7 +101,9 @@ impl PgClient {
             Ok(r) => r,
             Err(e) => {
                 if e.to_string().contains("shared_preload_libraries") {
-                    return Ok(vec![vec!["pg_stat_statements library not loaded".to_string()]]);
+                    return Ok(vec![vec![
+                        "pg_stat_statements library not loaded".to_string()
+                    ]]);
                 }
                 return Err(e.into());
             }
