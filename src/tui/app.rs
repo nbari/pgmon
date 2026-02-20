@@ -3,9 +3,9 @@ use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     io,
     sync::mpsc,
@@ -84,27 +84,27 @@ impl App {
         while !self.should_quit {
             terminal.draw(|f| crate::tui::ui::draw(f, self))?;
 
-            if let Ok(true) = event::poll(Duration::from_millis(50)) {
-                if let Event::Key(key) = event::read()? {
-                    match key.code {
-                        KeyCode::Char('q') => self.should_quit = true,
-                        KeyCode::Char('1') => self.set_tab(Tab::Activity),
-                        KeyCode::Char('2') => self.set_tab(Tab::Database),
-                        KeyCode::Char('3') => self.set_tab(Tab::Locks),
-                        KeyCode::Char('4') => self.set_tab(Tab::IO),
-                        KeyCode::Char('5') => self.set_tab(Tab::Statements),
-                        KeyCode::Down => {
-                            if !self.data.is_empty() && self.selected_row < self.data.len() - 1 {
-                                self.selected_row += 1;
-                            }
+            if let Ok(true) = event::poll(Duration::from_millis(50))
+                && let Event::Key(key) = event::read()?
+            {
+                match key.code {
+                    KeyCode::Char('q') => self.should_quit = true,
+                    KeyCode::Char('1') => self.set_tab(Tab::Activity),
+                    KeyCode::Char('2') => self.set_tab(Tab::Database),
+                    KeyCode::Char('3') => self.set_tab(Tab::Locks),
+                    KeyCode::Char('4') => self.set_tab(Tab::IO),
+                    KeyCode::Char('5') => self.set_tab(Tab::Statements),
+                    KeyCode::Down => {
+                        if !self.data.is_empty() && self.selected_row < self.data.len() - 1 {
+                            self.selected_row += 1;
                         }
-                        KeyCode::Up => {
-                            if self.selected_row > 0 {
-                                self.selected_row -= 1;
-                            }
-                        }
-                        _ => {}
                     }
+                    KeyCode::Up => {
+                        if self.selected_row > 0 {
+                            self.selected_row -= 1;
+                        }
+                    }
+                    _ => {}
                 }
             }
 

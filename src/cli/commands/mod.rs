@@ -1,6 +1,6 @@
 use clap::{
-    builder::styling::{AnsiColor, Effects, Styles},
     Arg, ArgAction, ColorChoice, Command,
+    builder::styling::{AnsiColor, Effects, Styles},
 };
 
 pub mod built_info {
@@ -101,7 +101,10 @@ mod tests {
 
     #[test]
     fn test_cli_dsn_required() {
-        std::env::remove_var("PGMON_DSN");
+        // SAFETY: This is a test environment and we're ensuring PGMON_DSN is cleared.
+        unsafe {
+            std::env::remove_var("PGMON_DSN");
+        }
         let cmd = new();
         let matches = cmd.try_get_matches_from(vec!["pgmon"]);
         assert!(matches.is_err());

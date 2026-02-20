@@ -75,7 +75,7 @@ impl PgClient {
     pub fn fetch_io_stats(&mut self) -> Result<Vec<Vec<String>>> {
         if !self.view_exists("pg_stat_io")? {
             return Ok(vec![vec![
-                "pg_stat_io not available (PG 16+ required)".to_string()
+                "pg_stat_io not available (PG 16+ required)".to_string(),
             ]]);
         }
         let rows = self.client.query(IO_QUERY, &[])?;
@@ -102,7 +102,7 @@ impl PgClient {
             Err(e) => {
                 if e.to_string().contains("shared_preload_libraries") {
                     return Ok(vec![vec![
-                        "pg_stat_statements library not loaded".to_string()
+                        "pg_stat_statements library not loaded".to_string(),
                     ]]);
                 }
                 return Err(e.into());
