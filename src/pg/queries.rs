@@ -1,4 +1,4 @@
-pub const ACTIVITY_QUERY: &str = r#"
+pub const ACTIVITY_QUERY: &str = r"
 SELECT 
     pid, 
     usename, 
@@ -12,9 +12,9 @@ FROM pg_stat_activity
 WHERE pid <> pg_backend_pid()
 ORDER BY COALESCE(now() - query_start, '0s'::interval) DESC
 LIMIT 500
-"#;
+";
 
-pub const DATABASE_QUERY: &str = r#"
+pub const DATABASE_QUERY: &str = r"
 SELECT 
     datname,
     numbackends,
@@ -26,9 +26,9 @@ SELECT
     stats_reset
 FROM pg_stat_database
 ORDER BY xact_commit DESC
-"#;
+";
 
-pub const LOCKS_QUERY: &str = r#"
+pub const LOCKS_QUERY: &str = r"
 SELECT 
     relation::regclass::text, 
     mode, 
@@ -36,9 +36,9 @@ SELECT
     pid
 FROM pg_locks
 LIMIT 500
-"#;
+";
 
-pub const IO_QUERY: &str = r#"
+pub const IO_QUERY: &str = r"
 SELECT 
     backend_type,
     COALESCE(reads, 0) as count_read, 
@@ -47,9 +47,9 @@ SELECT
     COALESCE(write_time, 0) as timing_write
 FROM pg_stat_io
 LIMIT 500
-"#;
+";
 
-pub const STATEMENTS_QUERY: &str = r#"
+pub const STATEMENTS_QUERY: &str = r"
 SELECT 
     query, 
     total_exec_time as total_time, 
@@ -60,4 +60,4 @@ SELECT
 FROM pg_stat_statements
 ORDER BY total_exec_time DESC
 LIMIT 500
-"#;
+";

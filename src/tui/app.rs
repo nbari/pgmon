@@ -34,19 +34,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        dsn: String,
-        refresh_ms: u64,
-        top_n: u32,
-        home_view: String,
-        _sort: String,
-    ) -> Result<Self> {
-        let current_tab = match home_view.as_str() {
+    pub fn new(dsn: String, refresh_ms: u64, top_n: u32, home_view: &str, _sort: &str) -> Self {
+        let current_tab = match home_view {
             "statements" => Tab::Statements,
             _ => Tab::Activity,
         };
 
-        Ok(Self {
+        Self {
             dsn,
             refresh_ms,
             top_n,
@@ -55,7 +49,7 @@ impl App {
             should_quit: false,
             last_refresh: Instant::now(),
             selected_row: 0,
-        })
+        }
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -108,9 +102,6 @@ impl App {
                             if self.selected_row > 0 {
                                 self.selected_row -= 1;
                             }
-                        }
-                        KeyCode::Char('/') => {
-                            // Basic filter mode could be added here
                         }
                         _ => {}
                     }

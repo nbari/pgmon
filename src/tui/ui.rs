@@ -1,6 +1,6 @@
 use crate::tui::app::{App, Tab};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs},
@@ -17,9 +17,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Min(0),    // Table
             Constraint::Length(3), // Footer / Status
         ])
-        .split(f.size());
+        .split(f.area());
 
-    // 1. Header
+    if let Some(chunk) = chunks.first() {
+        draw_header(f, app, *chunk);
+    }
+    if let Some(chunk) = chunks.get(1) {
+        draw_tabs(f, app, *chunk);
+    }
+    if let Some(chunk) = chunks.get(2) {
+        draw_table(f, app, *chunk);
+    }
+    if let Some(chunk) = chunks.get(3) {
+        draw_footer(f, app, *chunk);
+    }
+}
+
+fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let header = Paragraph::new(format!(
         "DSN: {} | Refresh: {}ms | Top N: {}",
         app.dsn, app.refresh_ms, app.top_n
@@ -29,9 +43,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             .borders(Borders::ALL)
             .title("pgmon - Connection Info"),
     );
-    f.render_widget(header, chunks[0]);
+    f.render_widget(header, area);
+}
 
-    // 2. Tabs
+fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let titles = vec![
         "1:Activity",
         "2:Database",
@@ -55,9 +70,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         );
-    f.render_widget(tabs, chunks[1]);
+    f.render_widget(tabs, area);
+}
 
-    // 3. Table
+fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     let header_cells = match app.current_tab {
         Tab::Activity => vec![
             "PID", "User", "DB", "State", "Query", "Start", "App", "Client",
@@ -115,18 +131,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 .borders(Borders::ALL)
                 .title(format!("{:?} View", app.current_tab)),
         );
-    f.render_widget(table, chunks[2]);
+    f.render_widget(table, area);
+}
 
-    // 4. Footer
-    let footer_text = if !app.data.is_empty() && app.selected_row < app.data.len() {
+fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    let footer_text = if let Some(row_data) = app.data.get(app.selected_row) {
         // Show full query if on activity or statements
         match app.current_tab {
             Tab::Activity | Tab::Statements => {
-                let query = &app.data[app.selected_row][if app.current_tab == Tab::Activity {
+                let idx = if app.current_tab == Tab::Activity {
                     4
                 } else {
                     0
-                }];
+                };
+                let query = row_data.get(idx).map_or("", String::as_str);
                 format!("SELECTED QUERY: {}", query.replace('\n', " "))
             }
             _ => "q:Quit | 1-5:Switch Tab | ↑↓:Navigate".to_string(),
@@ -137,5 +155,5 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let footer = Paragraph::new(Line::from(vec![Span::raw(footer_text)]))
         .block(Block::default().borders(Borders::ALL));
-    f.render_widget(footer, chunks[3]);
+    f.render_widget(footer, area);
 }

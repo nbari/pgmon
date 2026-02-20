@@ -2,7 +2,10 @@ use crate::cli::actions::Action;
 use clap::ArgMatches;
 
 pub fn handler(matches: &ArgMatches) -> Action {
-    let dsn = matches.get_one::<String>("dsn").expect("required").clone();
+    let dsn = matches
+        .get_one::<String>("dsn")
+        .cloned()
+        .unwrap_or_default();
     let refresh_ms = *matches.get_one::<u64>("refresh-ms").unwrap_or(&1000);
     let top_n = *matches.get_one::<u32>("top-n").unwrap_or(&10);
     let home_view = matches

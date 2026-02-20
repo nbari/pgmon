@@ -1,4 +1,4 @@
-use crate::pg::queries::*;
+use crate::pg::queries::{ACTIVITY_QUERY, DATABASE_QUERY, IO_QUERY, LOCKS_QUERY, STATEMENTS_QUERY};
 use anyhow::{Context, Result};
 use postgres::{Client, NoTls};
 
@@ -9,7 +9,7 @@ pub struct PgClient {
 impl PgClient {
     pub fn new(dsn: &str) -> Result<Self> {
         let client = Client::connect(dsn, NoTls)
-            .with_context(|| format!("Failed to connect to Postgres with DSN: {}", dsn))?;
+            .with_context(|| format!("Failed to connect to Postgres with DSN: {dsn}"))?;
         Ok(Self { client })
     }
 

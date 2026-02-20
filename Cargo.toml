@@ -6,17 +6,46 @@ authors = ["nbari"]
 description = "A PostgreSQL monitoring TUI"
 license = "BSD-3-Clause"
 
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+# Allow unstable/opinionated lints (lower priority so individual lints can override)
+nursery = { level = "allow", priority = -1 }
+
+# Enforce pedantic lints
+pedantic = "deny"
+
+# Core lint groups
+all = "deny"
+correctness = "deny"
+suspicious = "deny"
+perf = "deny"
+complexity = "deny"
+
+# Safety-critical lints
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+await_holding_lock = "deny"
+
+# Performance + memory reliability
+needless_borrow = "deny"
+needless_collect = "deny"
+large_stack_arrays = "deny"
+
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.4", features = ["color", "env", "string"] }
+clap = { version = "4.5", features = ["color", "env", "string"] }
 chrono = "0.4"
-crossterm = { version = "0.27", features = ["events"] }
+crossterm = { version = "0.29", features = ["events"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }
-ratatui = "0.26"
-thiserror = "1.0"
+ratatui = "0.30"
+thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-unicode-width = "0.1"
+unicode-width = "0.2"
 
 [package.metadata.deb]
 maintainer = "nbari"
@@ -37,7 +66,7 @@ assets = [
 ]
 
 [build-dependencies]
-built = { version = "0.7", features = ["git2"] }
+built = { version = "0.8", features = ["git2"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4"

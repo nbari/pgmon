@@ -1,6 +1,16 @@
-# pgmon justfile
-
 export PGMON_DSN := "postgresql://postgres:postgres@localhost:5432/postgres"
+
+default: test
+  @just --list
+
+test: clippy fmt
+  cargo test --all-features
+
+clippy:
+    cargo clippy --all-targets --all-features
+
+fmt:
+    cargo fmt --all --check
 
 # Start a PostgreSQL 18 container (includes pg_stat_io)
 up:

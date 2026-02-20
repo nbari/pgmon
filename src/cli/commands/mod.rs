@@ -101,6 +101,7 @@ mod tests {
 
     #[test]
     fn test_cli_dsn_required() {
+        std::env::remove_var("PGMON_DSN");
         let cmd = new();
         let matches = cmd.try_get_matches_from(vec!["pgmon"]);
         assert!(matches.is_err());

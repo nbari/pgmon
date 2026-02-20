@@ -22,7 +22,7 @@ impl Action {
                 home_view,
                 sort,
             } => {
-                let mut app = App::new(dsn, refresh_ms, top_n, home_view, sort)?;
+                let mut app = App::new(dsn, refresh_ms, top_n, &home_view, &sort);
                 app.run()
             }
         }
