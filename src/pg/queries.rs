@@ -1,19 +1,3 @@
-pub const ACTIVITY_QUERY: &str = r"
-SELECT 
-    pid, 
-    usename, 
-    datname, 
-    state, 
-    query, 
-    query_start, 
-    application_name, 
-    client_addr::text
-FROM pg_stat_activity
-WHERE pid <> pg_backend_pid()
-ORDER BY COALESCE(now() - query_start, '0s'::interval) DESC
-LIMIT 500
-";
-
 pub const DATABASE_QUERY: &str = r"
 SELECT 
     datname,
@@ -60,4 +44,51 @@ SELECT
 FROM pg_stat_statements
 ORDER BY total_exec_time DESC
 LIMIT 500
+";
+
+pub const CONN_STATS_QUERY: &str = r"
+SELECT
+    COALESCE(state, 'background') as state,
+    COUNT(*)::bigint as count
+FROM pg_stat_activity
+WHERE pid <> pg_backend_pid()
+GROUP BY state
+ORDER BY
+    CASE state
+        WHEN 'active'                        THEN 1
+        WHEN 'idle in transaction'           THEN 2
+        WHEN 'idle in transaction (aborted)' THEN 3
+        WHEN 'idle'                          THEN 4
+        WHEN 'fastpath function call'        THEN 5
+        WHEN 'disabled'                      THEN 6
+        ELSE 7
+    END
+";
+
+pub const ACTIVE_QUERIES_QUERY: &str = r"
+SELECT
+    pid::text,
+    COALESCE(usename, '') as usename,
+    COALESCE(datname, '') as datname,
+    GREATEST(0, EXTRACT(EPOCH FROM (now() - query_start))::bigint) as duration_sec,
+    COALESCE(regexp_replace(query, '\s+', ' ', 'g'), '') as query
+FROM pg_stat_activity
+WHERE pid <> pg_backend_pid()
+    AND state = 'active'
+ORDER BY query_start ASC NULLS LAST
+";
+
+pub const PERF_STATS_QUERY: &str = r"
+SELECT
+    CASE
+        WHEN COALESCE(SUM(blks_hit), 0) + COALESCE(SUM(blks_read), 0) > 0
+        THEN COALESCE(SUM(blks_hit), 0)::float8
+             / (COALESCE(SUM(blks_hit), 0) + COALESCE(SUM(blks_read), 0)) * 100.0
+        ELSE 100.0
+    END as cache_hit_pct,
+    COALESCE(SUM(xact_commit), 0)::bigint    as total_commits,
+    COALESCE(SUM(xact_rollback), 0)::bigint  as total_rollbacks,
+    COALESCE(SUM(numbackends), 0)::bigint    as total_backends,
+    (SELECT setting::bigint FROM pg_settings WHERE name = 'max_connections') as max_connections
+FROM pg_stat_database
 ";

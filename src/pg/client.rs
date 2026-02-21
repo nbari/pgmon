@@ -1,4 +1,7 @@
-use crate::pg::queries::{ACTIVITY_QUERY, DATABASE_QUERY, IO_QUERY, LOCKS_QUERY, STATEMENTS_QUERY};
+use crate::pg::queries::{
+    ACTIVE_QUERIES_QUERY, CONN_STATS_QUERY, DATABASE_QUERY, IO_QUERY, LOCKS_QUERY,
+    PERF_STATS_QUERY, STATEMENTS_QUERY,
+};
 use anyhow::{Context, Result};
 use postgres::{Client, NoTls};
 
@@ -11,27 +14,6 @@ impl PgClient {
         let client = Client::connect(dsn, NoTls)
             .with_context(|| format!("Failed to connect to Postgres with DSN: {dsn}"))?;
         Ok(Self { client })
-    }
-
-    pub fn fetch_activity(&mut self) -> Result<Vec<Vec<String>>> {
-        let rows = self.client.query(ACTIVITY_QUERY, &[])?;
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                vec![
-                    row.get::<_, i32>(0).to_string(),
-                    row.get::<_, Option<String>>(1).unwrap_or_default(),
-                    row.get::<_, Option<String>>(2).unwrap_or_default(),
-                    row.get::<_, Option<String>>(3).unwrap_or_default(),
-                    row.get::<_, Option<String>>(4).unwrap_or_default(),
-                    row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(5)
-                        .map(|t| t.to_rfc3339())
-                        .unwrap_or_default(),
-                    row.get::<_, Option<String>>(6).unwrap_or_default(),
-                    row.get::<_, Option<String>>(7).unwrap_or_default(),
-                ]
-            })
-            .collect())
     }
 
     pub fn fetch_database_stats(&mut self) -> Result<Vec<Vec<String>>> {
@@ -121,6 +103,45 @@ impl PgClient {
                 ]
             })
             .collect())
+    }
+
+    pub fn fetch_conn_stats(&mut self) -> Result<Vec<(String, i64)>> {
+        let rows = self.client.query(CONN_STATS_QUERY, &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+            .collect())
+    }
+
+    pub fn fetch_active_queries(&mut self) -> Result<Vec<Vec<String>>> {
+        let rows = self.client.query(ACTIVE_QUERIES_QUERY, &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let duration_secs = row.get::<_, Option<i64>>(3).unwrap_or(0).max(0);
+                let h = duration_secs / 3600;
+                let m = (duration_secs % 3600) / 60;
+                let s = duration_secs % 60;
+                vec![
+                    row.get::<_, String>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, String>(2),
+                    format!("{h:02}:{m:02}:{s:02}"),
+                    row.get::<_, String>(4),
+                ]
+            })
+            .collect())
+    }
+
+    pub fn fetch_perf_stats(&mut self) -> Result<(f64, i64, i64, i64, i64)> {
+        let row = self.client.query_one(PERF_STATS_QUERY, &[])?;
+        Ok((
+            row.get::<_, f64>(0),
+            row.get::<_, i64>(1),
+            row.get::<_, i64>(2),
+            row.get::<_, i64>(3),
+            row.get::<_, i64>(4),
+        ))
     }
 
     fn extension_exists(&mut self, name: &str) -> Result<bool> {

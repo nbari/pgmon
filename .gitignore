@@ -22,3 +22,8 @@ target
 
 .gemini/
 gha-creds-*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
