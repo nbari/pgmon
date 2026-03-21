@@ -18,20 +18,38 @@ ORDER BY numbackends DESC, xact_commit DESC
 ";
 
 pub const LOCKS_QUERY: &str = r"
-SELECT 
-    COALESCE(relation::regclass::text, locktype) as target, 
-    mode, 
-    COUNT(*) FILTER (WHERE NOT granted)::bigint as waiters,
-    COUNT(*) FILTER (WHERE granted)::bigint as holders
-FROM pg_locks
-GROUP BY 1, 2
-ORDER BY waiters DESC, holders DESC, target ASC, mode ASC
+SELECT
+    COALESCE(blocking_locks.pid::text, '<unknown>') AS blocking_pid,
+    COALESCE(blocked_locks.pid::text, '<unknown>') AS blocked_pid,
+    COALESCE(blocked_activity.usename, '<unknown>') AS blocked_user,
+    COALESCE(blocked_locks.relation::regclass::text, blocked_locks.locktype) AS locked_item,
+    COALESCE(blocked_locks.mode, '<unknown>') AS waiting_mode,
+    GREATEST(0, EXTRACT(EPOCH FROM (now() - blocked_activity.query_start)))::bigint AS wait_duration_s,
+    COALESCE(regexp_replace(blocked_activity.query, '\s+', ' ', 'g'), '<unknown>') AS blocked_query
+FROM pg_catalog.pg_locks blocked_locks
+JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
+JOIN pg_catalog.pg_locks blocking_locks 
+    ON blocking_locks.locktype = blocked_locks.locktype
+    AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
+    AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+    AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+    AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+    AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
+    AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+    AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
+    AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+    AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
+    AND blocking_locks.pid != blocked_locks.pid
+WHERE NOT blocked_locks.granted
+ORDER BY wait_duration_s DESC
 LIMIT 500
 ";
 
 pub const IO_QUERY: &str = r"
 SELECT 
     backend_type,
+    object,
+    context,
     COALESCE(reads, 0) as count_read, 
     COALESCE(writes, 0) as count_write, 
     COALESCE(read_time, 0) as timing_read, 
@@ -41,16 +59,40 @@ ORDER BY COALESCE(read_time, 0) + COALESCE(write_time, 0) DESC, backend_type ASC
 LIMIT 500
 ";
 
+pub const SETTINGS_QUERY: &str = r"
+SELECT 
+    name, 
+    setting, 
+    COALESCE(unit, '') as unit, 
+    category,
+    short_desc 
+FROM pg_settings 
+ORDER BY category, name
+";
+
 pub const STATEMENTS_QUERY: &str = r"
 SELECT 
-    query, 
-    total_exec_time as total_time, 
-    mean_exec_time as mean_time, 
-    calls, 
-    shared_blk_read_time as blk_read_time, 
-    shared_blk_write_time as blk_write_time
+    COALESCE(regexp_replace(query, '\s+', ' ', 'g'), '') as query, 
+    COALESCE(total_exec_time, 0)::float8 as total_time, 
+    COALESCE(mean_exec_time, 0)::float8 as mean_time, 
+    COALESCE(calls, 0)::bigint as calls, 
+    COALESCE(shared_blk_read_time, 0)::float8 as blk_read_time, 
+    COALESCE(shared_blk_write_time, 0)::float8 as blk_write_time
 FROM pg_stat_statements
 ORDER BY total_exec_time DESC
+LIMIT 500
+";
+
+pub const STATEMENTS_QUERY_V12: &str = r"
+SELECT 
+    COALESCE(regexp_replace(query, '\s+', ' ', 'g'), '') as query, 
+    COALESCE(total_time, 0)::float8 as total_time, 
+    COALESCE(mean_time, 0)::float8 as mean_time, 
+    COALESCE(calls, 0)::bigint as calls, 
+    COALESCE(shared_blk_read_time, 0)::float8 as blk_read_time, 
+    COALESCE(shared_blk_write_time, 0)::float8 as blk_write_time
+FROM pg_stat_statements
+ORDER BY total_time DESC
 LIMIT 500
 ";
 
@@ -138,7 +180,7 @@ WITH activity AS (
         COALESCE(datname, '') as datname,
         COALESCE(application_name, '') as application_name,
         COALESCE(usename, '') as usename,
-        COALESCE(client_addr::text, client_hostname, '[local]') as client,
+        COALESCE(host(client_addr), client_hostname, '[local]') as client,
         GREATEST(
             0,
             EXTRACT(

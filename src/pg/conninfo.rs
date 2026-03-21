@@ -75,6 +75,89 @@ pub fn describe_connection_target(dsn: &str) -> String {
     "PostgreSQL".to_string()
 }
 
+/// Extract only the host information from a DSN for shorter display.
+pub fn describe_host(dsn: &str) -> String {
+    if let Some(host) = extract_host_from_conninfo(dsn) {
+        return format!("host={host}");
+    }
+    if let Some(host) = extract_host_from_uri(dsn) {
+        return format!("host={host}");
+    }
+    "PostgreSQL".to_string()
+}
+
+fn extract_host_from_conninfo(dsn: &str) -> Option<String> {
+    let mut chars = dsn.chars().peekable();
+
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+
+        let mut key = String::new();
+        while let Some(&c) = chars.peek() {
+            if c == '=' || c.is_whitespace() {
+                break;
+            }
+            key.push(c);
+            chars.next();
+        }
+
+        if chars.peek() == Some(&'=') {
+            chars.next();
+            let mut value = String::new();
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\'' {
+                        break;
+                    } else if c == '\\' {
+                        if let Some(escaped) = chars.next() {
+                            value.push(escaped);
+                        }
+                    } else {
+                        value.push(c);
+                    }
+                }
+            } else {
+                while let Some(&c) = chars.peek() {
+                    if c.is_whitespace() {
+                        break;
+                    }
+                    value.push(c);
+                    chars.next();
+                }
+            }
+
+            if key == "host" {
+                return Some(value);
+            }
+        } else {
+            chars.next();
+        }
+    }
+    None
+}
+
+fn extract_host_from_uri(dsn: &str) -> Option<String> {
+    let scheme_end = dsn.find("://")?;
+    let remainder = &dsn[scheme_end + 3..];
+    let (authority_and_path, _) = remainder.split_once(['?', '#']).unwrap_or((remainder, ""));
+    let (authority, _) = authority_and_path
+        .split_once('/')
+        .unwrap_or((authority_and_path, ""));
+    let (_, host_port) = authority
+        .rsplit_once('@')
+        .map_or((None, authority), |(auth, host)| (Some(auth), host));
+
+    if host_port.is_empty() {
+        None
+    } else {
+        Some(host_port.to_string())
+    }
+}
+
 fn resolve_dsn_from_path(
     explicit_dsn: Option<&str>,
     pgpass_path: Option<PathBuf>,
@@ -189,18 +272,63 @@ fn quote_conninfo_value(value: &str) -> String {
 }
 
 fn summarize_conninfo(dsn: &str) -> Option<String> {
-    let parts: Vec<String> = dsn
-        .split_whitespace()
-        .filter_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            match key {
-                "host" | "port" | "dbname" | "user" => {
-                    Some(format!("{key}={}", value.trim_matches('\'')))
-                }
-                _ => None,
+    let mut parts = Vec::new();
+    let mut chars = dsn.chars().peekable();
+
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+
+        // Parse key
+        let mut key = String::new();
+        while let Some(&c) = chars.peek() {
+            if c == '=' || c.is_whitespace() {
+                break;
             }
-        })
-        .collect();
+            key.push(c);
+            chars.next();
+        }
+
+        if chars.peek() == Some(&'=') {
+            chars.next(); // skip '='
+
+            // Parse value
+            let mut value = String::new();
+            if chars.peek() == Some(&'\'') {
+                chars.next(); // skip '\''
+                while let Some(c) = chars.next() {
+                    if c == '\'' {
+                        break;
+                    } else if c == '\\' {
+                        if let Some(escaped) = chars.next() {
+                            value.push(escaped);
+                        }
+                    } else {
+                        value.push(c);
+                    }
+                }
+            } else {
+                while let Some(&c) = chars.peek() {
+                    if c.is_whitespace() {
+                        break;
+                    }
+                    value.push(c);
+                    chars.next();
+                }
+            }
+
+            match key.as_str() {
+                "host" | "port" | "dbname" | "user" => {
+                    parts.push(format!("{key}={value}"));
+                }
+                _ => {}
+            }
+        } else {
+            chars.next();
+        }
+    }
 
     if parts.is_empty() {
         None
@@ -212,10 +340,20 @@ fn summarize_conninfo(dsn: &str) -> Option<String> {
 fn summarize_uri(dsn: &str) -> Option<String> {
     let scheme_end = dsn.find("://")?;
     let remainder = &dsn[scheme_end + 3..];
-    let (authority, path_and_query) = remainder.split_once('/').unwrap_or((remainder, ""));
+
+    // Separate the query/fragment from authority/path
+    let (authority_and_path, _) = remainder.split_once(['?', '#']).unwrap_or((remainder, ""));
+
+    // Separate authority from path
+    let (authority, path) = authority_and_path
+        .split_once('/')
+        .unwrap_or((authority_and_path, ""));
+
+    // Separate credentials from host:port
     let (credentials, host_port) = authority
         .rsplit_once('@')
         .map_or((None, authority), |(auth, host)| (Some(auth), host));
+
     let user = credentials.and_then(|auth| {
         auth.split_once(':')
             .map_or(Some(auth), |(name, _)| Some(name))
@@ -225,12 +363,12 @@ fn summarize_uri(dsn: &str) -> Option<String> {
     if !host_port.is_empty() {
         parts.push(format!("host={host_port}"));
     }
-    if !path_and_query.is_empty() {
-        let database = path_and_query.split(['?', '#']).next().unwrap_or_default();
-        if !database.is_empty() {
-            parts.push(format!("dbname={database}"));
-        }
+
+    let database = path.trim_start_matches('/');
+    if !database.is_empty() {
+        parts.push(format!("dbname={database}"));
     }
+
     if let Some(user) = user.filter(|name| !name.is_empty()) {
         parts.push(format!("user={user}"));
     }
@@ -306,6 +444,58 @@ mod tests {
             result,
             Err(ResolveDsnError::MissingConnectionSettings { .. })
         ));
+    }
+
+    #[test]
+    fn test_describe_connection_target() {
+        use super::describe_connection_target;
+
+        assert_eq!(
+            describe_connection_target(
+                "postgresql://user:pass@localhost:5432/mydb?sslmode=disable"
+            ),
+            "host=localhost:5432 dbname=mydb user=user"
+        );
+        assert_eq!(
+            describe_connection_target(
+                "host=localhost port=5432 dbname=mydb user=postgres password=secret"
+            ),
+            "host=localhost port=5432 dbname=mydb user=postgres"
+        );
+        assert_eq!(
+            describe_connection_target("host='my host' user=postgres"),
+            "host=my host user=postgres"
+        );
+        assert_eq!(
+            describe_connection_target("postgresql://localhost?target_session_attrs=read-write"),
+            "host=localhost"
+        );
+        assert_eq!(
+            describe_connection_target("postgresql:///dbname?host=/var/run/postgresql"),
+            "dbname=dbname"
+        );
+    }
+
+    #[test]
+    fn test_describe_host() {
+        use super::describe_host;
+
+        assert_eq!(
+            describe_host("postgresql://user:pass@localhost:5432/mydb?sslmode=disable"),
+            "host=localhost:5432"
+        );
+        assert_eq!(
+            describe_host("host=localhost port=5432 dbname=mydb user=postgres password=secret"),
+            "host=localhost"
+        );
+        assert_eq!(
+            describe_host("host='my host' user=postgres"),
+            "host=my host"
+        );
+        assert_eq!(
+            describe_host("postgresql://localhost?target_session_attrs=read-write"),
+            "host=localhost"
+        );
     }
 
     fn write_temp_pgpass(content: &str) -> Result<PathBuf, Box<dyn Error>> {

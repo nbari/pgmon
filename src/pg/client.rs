@@ -1,7 +1,8 @@
 use crate::pg::conninfo::describe_connection_target;
 use crate::pg::queries::{
     ACTIVITY_PROCESS_QUERY, ACTIVITY_SESSIONS_QUERY, ACTIVITY_SUMMARY_QUERY, DATABASE_QUERY,
-    DATABASE_TREE_QUERY, IO_QUERY, LOCKS_QUERY, STATEMENTS_QUERY,
+    DATABASE_TREE_QUERY, IO_QUERY, LOCKS_QUERY, SETTINGS_QUERY, STATEMENTS_QUERY,
+    STATEMENTS_QUERY_V12,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -23,6 +24,8 @@ pub(crate) struct ActivitySummarySnapshot {
     pub(crate) total_database_bytes: i64,
     pub(crate) cache_hit_pct: f64,
     pub(crate) rollback_pct: f64,
+    pub(crate) total_commits: i64,
+    pub(crate) total_rollbacks: i64,
     pub(crate) total_xacts: i64,
     pub(crate) total_inserts: i64,
     pub(crate) total_updates: i64,
@@ -70,6 +73,12 @@ pub struct PgClient {
     client: Client,
 }
 
+impl std::fmt::Debug for PgClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgClient").finish()
+    }
+}
+
 impl PgClient {
     pub fn new(dsn: &str, connect_timeout_ms: u64) -> Result<Self> {
         let config = config_from_dsn(dsn, connect_timeout_ms)?;
@@ -84,66 +93,97 @@ impl PgClient {
 
     pub fn fetch_database_stats(&mut self) -> Result<Vec<Vec<String>>> {
         let rows = self.client.query(DATABASE_QUERY, &[])?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(|row| {
-                vec![
-                    row.get::<_, Option<String>>(0).unwrap_or_default(),
-                    row.get::<_, i32>(1).to_string(),
-                    row.get::<_, i64>(2).to_string(),
-                    row.get::<_, i64>(3).to_string(),
-                    format!("{:.1}%", row.get::<_, f64>(4)),
-                    row.get::<_, i64>(5).to_string(),
-                    row.get::<_, i64>(6).to_string(),
-                    row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(7)
+                Ok(vec![
+                    row.try_get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    row.try_get::<_, i32>(1)?.to_string(),
+                    row.try_get::<_, i64>(2)?.to_string(),
+                    row.try_get::<_, i64>(3)?.to_string(),
+                    format!("{:.1}%", row.try_get::<_, f64>(4)?),
+                    row.try_get::<_, i64>(5)?.to_string(),
+                    row.try_get::<_, i64>(6)?.to_string(),
+                    row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(7)?
                         .map(|t| t.to_rfc3339())
                         .unwrap_or_default(),
-                ]
+                ])
             })
-            .collect())
+            .collect()
     }
 
     pub fn fetch_locks(&mut self) -> Result<Vec<Vec<String>>> {
         let rows = self.client.query(LOCKS_QUERY, &[])?;
-        Ok(rows
+        let result: Result<Vec<Vec<String>>> = rows
             .into_iter()
             .map(|row| {
-                vec![
-                    row.get::<_, Option<String>>(0).unwrap_or_default(),
-                    row.get::<_, Option<String>>(1).unwrap_or_default(),
-                    row.get::<_, i64>(2).to_string(),
-                    row.get::<_, i64>(3).to_string(),
-                ]
+                Ok(vec![
+                    row.try_get::<_, String>(0)?,
+                    row.try_get::<_, String>(1)?,
+                    row.try_get::<_, String>(2)?,
+                    row.try_get::<_, String>(3)?,
+                    row.try_get::<_, String>(4)?,
+                    row.try_get::<_, i64>(5)?.to_string(),
+                    row.try_get::<_, String>(6)?,
+                ])
             })
-            .collect())
+            .collect();
+
+        let mut data = result?;
+        if data.is_empty() {
+            data.push(vec![
+                String::new(),
+                String::new(),
+                String::new(),
+                "No active locks found".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ]);
+        }
+        Ok(data)
     }
 
     pub fn fetch_io_stats(&mut self) -> Result<Vec<Vec<String>>> {
         if !self.view_exists("pg_stat_io")? {
             return Ok(vec![vec![
                 "pg_stat_io not available (PG 16+ required)".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
             ]]);
         }
         let rows = self.client.query(IO_QUERY, &[])?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(|row| {
-                vec![
-                    row.get::<_, Option<String>>(0).unwrap_or_default(),
-                    row.get::<_, i64>(1).to_string(),
-                    row.get::<_, i64>(2).to_string(),
-                    row.get::<_, f64>(3).to_string(),
-                    row.get::<_, f64>(4).to_string(),
-                ]
+                Ok(vec![
+                    row.try_get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    row.try_get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.try_get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.try_get::<_, i64>(3)?.to_string(),
+                    row.try_get::<_, i64>(4)?.to_string(),
+                    row.try_get::<_, f64>(5)?.to_string(),
+                    row.try_get::<_, f64>(6)?.to_string(),
+                ])
             })
-            .collect())
+            .collect()
     }
 
     pub fn fetch_statements(&mut self) -> Result<Vec<Vec<String>>> {
         if !self.extension_exists("pg_stat_statements")? {
             return Ok(vec![vec!["pg_stat_statements not installed".to_string()]]);
         }
-        let rows = match self.client.query(STATEMENTS_QUERY, &[]) {
+
+        let has_exec_time = self.column_exists("pg_stat_statements", "total_exec_time")?;
+        let query = if has_exec_time {
+            STATEMENTS_QUERY
+        } else {
+            STATEMENTS_QUERY_V12
+        };
+
+        let rows = match self.client.query(query, &[]) {
             Ok(r) => r,
             Err(e) => {
                 if e.to_string().contains("shared_preload_libraries") {
@@ -154,19 +194,18 @@ impl PgClient {
                 return Err(e.into());
             }
         };
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(|row| {
-                vec![
-                    row.get::<_, String>(0),
-                    row.get::<_, f64>(1).to_string(),
-                    row.get::<_, f64>(2).to_string(),
-                    row.get::<_, i64>(3).to_string(),
-                    row.get::<_, f64>(4).to_string(),
-                    row.get::<_, f64>(5).to_string(),
-                ]
+                Ok(vec![
+                    row.try_get::<_, String>(0)?,
+                    row.try_get::<_, f64>(1)?.to_string(),
+                    row.try_get::<_, f64>(2)?.to_string(),
+                    row.try_get::<_, i64>(3)?.to_string(),
+                    row.try_get::<_, f64>(4)?.to_string(),
+                    row.try_get::<_, f64>(5)?.to_string(),
+                ])
             })
-            .collect())
+            .collect()
     }
 
     pub fn fetch_activity_snapshot(&mut self) -> Result<ActivitySnapshot> {
@@ -176,53 +215,57 @@ impl PgClient {
 
         let sessions = session_rows
             .into_iter()
-            .map(|row| ActivitySession {
-                pid: row.get::<_, String>(0),
-                xmin: row.get::<_, String>(1),
-                database: row.get::<_, String>(2),
-                application: row.get::<_, String>(3),
-                user: row.get::<_, String>(4),
-                client: row.get::<_, String>(5),
-                duration_seconds: row.get::<_, i64>(6).max(0),
-                wait_info: row.get::<_, String>(7),
-                state: row.get::<_, String>(8),
-                query: row.get::<_, String>(9),
-                blocked_by_count: row.get::<_, i64>(10),
-                blocked_count: row.get::<_, i64>(11),
+            .map(|row| {
+                Ok(ActivitySession {
+                    pid: row.try_get::<_, String>(0)?,
+                    xmin: row.try_get::<_, String>(1)?,
+                    database: row.try_get::<_, String>(2)?,
+                    application: row.try_get::<_, String>(3)?,
+                    user: row.try_get::<_, String>(4)?,
+                    client: row.try_get::<_, String>(5)?,
+                    duration_seconds: row.try_get::<_, i64>(6)?.max(0),
+                    wait_info: row.try_get::<_, String>(7)?,
+                    state: row.try_get::<_, String>(8)?,
+                    query: row.try_get::<_, String>(9)?,
+                    blocked_by_count: row.try_get::<_, i64>(10)?,
+                    blocked_count: row.try_get::<_, i64>(11)?,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(ActivitySnapshot {
             summary: ActivitySummarySnapshot {
-                server_version: summary_row.get::<_, String>(0),
-                postmaster_start: summary_row.get::<_, DateTime<Utc>>(1),
-                database_count: summary_row.get::<_, i64>(2),
-                total_database_bytes: summary_row.get::<_, i64>(3),
-                cache_hit_pct: summary_row.get::<_, f64>(4),
-                rollback_pct: summary_row.get::<_, f64>(5),
-                total_xacts: summary_row.get::<_, i64>(8),
-                total_inserts: summary_row.get::<_, i64>(9),
-                total_updates: summary_row.get::<_, i64>(10),
-                total_deletes: summary_row.get::<_, i64>(11),
-                total_returned: summary_row.get::<_, i64>(12),
-                total_temp_files: summary_row.get::<_, i64>(13),
-                total_temp_bytes: summary_row.get::<_, i64>(14),
-                max_connections: summary_row.get::<_, i64>(15),
+                server_version: summary_row.try_get::<_, String>(0)?,
+                postmaster_start: summary_row.try_get::<_, DateTime<Utc>>(1)?,
+                database_count: summary_row.try_get::<_, i64>(2)?,
+                total_database_bytes: summary_row.try_get::<_, i64>(3)?,
+                cache_hit_pct: summary_row.try_get::<_, f64>(4)?,
+                rollback_pct: summary_row.try_get::<_, f64>(5)?,
+                total_commits: summary_row.try_get::<_, i64>(6)?,
+                total_rollbacks: summary_row.try_get::<_, i64>(7)?,
+                total_xacts: summary_row.try_get::<_, i64>(8)?,
+                total_inserts: summary_row.try_get::<_, i64>(9)?,
+                total_updates: summary_row.try_get::<_, i64>(10)?,
+                total_deletes: summary_row.try_get::<_, i64>(11)?,
+                total_returned: summary_row.try_get::<_, i64>(12)?,
+                total_temp_files: summary_row.try_get::<_, i64>(13)?,
+                total_temp_bytes: summary_row.try_get::<_, i64>(14)?,
+                max_connections: summary_row.try_get::<_, i64>(15)?,
             },
             process: ActivityProcessSnapshot {
-                worker_total: process_row.get::<_, i64>(0),
-                max_worker_processes: process_row.get::<_, i64>(1),
-                logical_workers: process_row.get::<_, i64>(2),
-                max_logical_workers: process_row.get::<_, i64>(3),
-                parallel_workers: process_row.get::<_, i64>(4),
-                max_parallel_workers: process_row.get::<_, i64>(5),
-                autovacuum_workers: process_row.get::<_, i64>(6),
-                max_autovacuum_workers: process_row.get::<_, i64>(7),
-                wal_senders: process_row.get::<_, i64>(8),
-                max_wal_senders: process_row.get::<_, i64>(9),
-                wal_receivers: process_row.get::<_, i64>(10),
-                replication_slots: process_row.get::<_, i64>(11),
-                max_replication_slots: process_row.get::<_, i64>(12),
+                worker_total: process_row.try_get::<_, i64>(0)?,
+                max_worker_processes: process_row.try_get::<_, i64>(1)?,
+                logical_workers: process_row.try_get::<_, i64>(2)?,
+                max_logical_workers: process_row.try_get::<_, i64>(3)?,
+                parallel_workers: process_row.try_get::<_, i64>(4)?,
+                max_parallel_workers: process_row.try_get::<_, i64>(5)?,
+                autovacuum_workers: process_row.try_get::<_, i64>(6)?,
+                max_autovacuum_workers: process_row.try_get::<_, i64>(7)?,
+                wal_senders: process_row.try_get::<_, i64>(8)?,
+                max_wal_senders: process_row.try_get::<_, i64>(9)?,
+                wal_receivers: process_row.try_get::<_, i64>(10)?,
+                replication_slots: process_row.try_get::<_, i64>(11)?,
+                max_replication_slots: process_row.try_get::<_, i64>(12)?,
             },
             sessions,
         })
@@ -230,22 +273,44 @@ impl PgClient {
 
     pub fn fetch_database_tree(&mut self) -> Result<Vec<Vec<String>>> {
         let rows = self.client.query(DATABASE_TREE_QUERY, &[])?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(|row| {
-                let depth = row.get::<_, i32>(5);
+                let depth = row.try_get::<_, i32>(5)?;
                 let label = match depth {
-                    0 => row.get::<_, String>(0),
-                    _ => format!("  {}", row.get::<_, Option<String>>(1).unwrap_or_default()),
+                    0 => row.try_get::<_, String>(0)?,
+                    _ => format!(
+                        "  {}",
+                        row.try_get::<_, Option<String>>(1)?.unwrap_or_default()
+                    ),
                 };
-                vec![
+                Ok(vec![
                     label,
-                    row.get::<_, String>(2),
-                    row.get::<_, i64>(3).to_string(),
-                    row.get::<_, String>(4),
-                ]
+                    row.try_get::<_, String>(2)?,
+                    row.try_get::<_, i64>(3)?.to_string(),
+                    row.try_get::<_, String>(4)?,
+                ])
             })
-            .collect())
+            .collect()
+    }
+
+    pub fn fetch_settings(&mut self) -> Result<Vec<Vec<String>>> {
+        let rows = self.client.query(SETTINGS_QUERY, &[])?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(vec![
+                    row.try_get::<_, String>(0)?,
+                    row.try_get::<_, String>(1)?,
+                    row.try_get::<_, String>(2)?,
+                    row.try_get::<_, String>(3)?,
+                    row.try_get::<_, String>(4)?,
+                ])
+            })
+            .collect()
+    }
+
+    pub fn execute_query(&mut self, query: &str) -> Result<u64> {
+        let result = self.client.execute(query, &[])?;
+        Ok(result)
     }
 
     fn extension_exists(&mut self, name: &str) -> Result<bool> {
@@ -259,6 +324,14 @@ impl PgClient {
         let row = self
             .client
             .query_opt("SELECT 1 FROM pg_views WHERE viewname = $1", &[&name])?;
+        Ok(row.is_some())
+    }
+
+    fn column_exists(&mut self, table_name: &str, column_name: &str) -> Result<bool> {
+        let row = self.client.query_opt(
+            "SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2",
+            &[&table_name, &column_name],
+        )?;
         Ok(row.is_some())
     }
 

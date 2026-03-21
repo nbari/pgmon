@@ -1,52 +1,18 @@
+use super::common::{format_bytes, format_duration_hms, format_uptime};
 use crate::{
-    pg::conninfo::describe_connection_target,
-    tui::app::{App, DatabaseView, Tab},
+    pg::conninfo::describe_host,
+    tui::app::{ActivitySummaryMetric, ActivitySummarySection, App},
 };
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{
-        Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, Tabs,
-        Wrap,
-    },
+    widgets::{Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table},
 };
 
-pub fn draw(f: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints([
-            Constraint::Length(3), // Tabs
-            Constraint::Min(0),    // Content
-            Constraint::Length(3), // Footer
-        ])
-        .split(f.area());
-
-    if let (Some(tabs_area), Some(content), Some(footer)) =
-        (chunks.first(), chunks.get(1), chunks.get(2))
-    {
-        draw_tabs(f, app, *tabs_area);
-        if app.current_tab == Tab::Activity {
-            draw_dashboard(f, app, *content);
-        } else {
-            draw_table(f, app, *content);
-        }
-        draw_footer(f, app, *footer);
-    }
-
-    if app.error_state.is_some() {
-        draw_error_modal(f, app);
-    } else if app.statement_detail.is_some() {
-        draw_statement_detail_modal(f, app);
-    } else if app.loading_state.is_some() {
-        draw_loading_modal(f, app);
-    }
-}
-
-fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
+pub fn draw_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -234,13 +200,10 @@ fn activity_summary_meta_row(app: &App) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            describe_connection_target(&app.dsn),
-            Style::default().fg(Color::Cyan),
-        ),
+        Span::styled(describe_host(&app.dsn), Style::default().fg(Color::Cyan)),
         Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("Ref. {}ms", app.refresh_ms),
+            format!("Refresh(r) {}ms", app.refresh_ms),
             Style::default().fg(Color::White),
         ),
         Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
@@ -315,6 +278,8 @@ fn activity_summary_sections(app: &App) -> Vec<ActivitySummarySection> {
                 ActivitySummaryMetric::new("Growth/s", summary.rates.growth_bytes_per_sec.clone()),
                 ActivitySummaryMetric::new("Cache hit", format!("{:.2}%", summary.cache_hit_pct)),
                 ActivitySummaryMetric::new("Rollback", format!("{:.2}%", summary.rollback_pct)),
+                ActivitySummaryMetric::new("Commits", summary.total_commits.to_string()),
+                ActivitySummaryMetric::new("Rollbacks", summary.total_rollbacks.to_string()),
             ],
         },
         ActivitySummarySection {
@@ -446,22 +411,12 @@ fn activity_summary_metric_line(metric: &ActivitySummaryMetric, width: u16) -> L
 }
 
 fn activity_summary_columns(width: u16) -> usize {
-    if width >= 84 {
-        3
-    } else if width >= 56 {
-        2
-    } else {
-        1
-    }
+    if width >= 56 { 2 } else { 1 }
 }
 
 fn activity_summary_rows(section_count: usize, columns: usize) -> Vec<Vec<Option<usize>>> {
     if section_count == 0 || columns == 0 {
         return Vec::new();
-    }
-
-    if section_count == 4 && columns >= 3 {
-        return vec![vec![Some(0), Some(1), Some(2)], vec![Some(3), None, None]];
     }
 
     let mut rows = Vec::new();
@@ -487,23 +442,7 @@ fn section_line_count(section: &ActivitySummarySection) -> usize {
     section.metrics.len() + 1
 }
 
-struct ActivitySummarySection {
-    title: &'static str,
-    metrics: Vec<ActivitySummaryMetric>,
-}
-
-struct ActivitySummaryMetric {
-    label: &'static str,
-    value: String,
-}
-
-impl ActivitySummaryMetric {
-    fn new(label: &'static str, value: String) -> Self {
-        Self { label, value }
-    }
-}
-
-fn draw_activity_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
+fn draw_activity_sessions_panel(f: &mut Frame, app: &mut App, area: Rect) {
     let header_cells = [
         "PID", "XMIN", "Database", "App", "User", "Client", "Time+", "Waiting", "State", "Query",
     ];
@@ -546,6 +485,11 @@ fn draw_activity_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
+            let white_style = if is_selected {
+                style
+            } else {
+                Style::default().fg(Color::White)
+            };
             let wait_style = if is_selected {
                 style
             } else {
@@ -557,18 +501,18 @@ fn draw_activity_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Yellow)
             };
             Row::new(vec![
-                Cell::from(session.pid.as_str()),
-                Cell::from(session.xmin.as_str()),
+                Cell::from(session.pid.as_str()).style(white_style),
+                Cell::from(session.xmin.as_str()).style(white_style),
                 Cell::from(session.database.as_str()).style(dim_style),
                 Cell::from(session.application.as_str()).style(dim_style),
                 Cell::from(session.user.as_str()).style(dim_style),
-                Cell::from(session.client.as_str()),
+                Cell::from(session.client.as_str()).style(white_style),
                 Cell::from(format_duration_hms(session.duration_seconds)).style(
                     activity_time_style(is_selected, session.duration_seconds, style),
                 ),
                 Cell::from(activity_wait_cell(session)).style(wait_style),
                 Cell::from(activity_state_cell(session)).style(state_style),
-                Cell::from(session.query.as_str()),
+                Cell::from(session.query.as_str()).style(white_style),
             ])
             .style(style)
         });
@@ -588,8 +532,10 @@ fn draw_activity_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
                 )
                 .bottom_margin(1),
         )
-        .block(Block::default().borders(Borders::ALL).title(title));
-    f.render_widget(table, area);
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().fg(Color::Black).bg(Color::White));
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
 fn activity_wait_cell(session: &crate::pg::client::ActivitySession) -> String {
@@ -624,419 +570,4 @@ fn activity_time_style(is_selected: bool, duration_seconds: i64, selected_style:
     } else {
         Style::default().fg(Color::Red)
     }
-}
-
-fn format_duration_hms(duration_seconds: i64) -> String {
-    let duration_seconds = duration_seconds.max(0);
-    let hours = duration_seconds / 3600;
-    let minutes = (duration_seconds % 3600) / 60;
-    let seconds = duration_seconds % 60;
-    format!("{hours:02}:{minutes:02}:{seconds:02}")
-}
-
-fn format_uptime(uptime_seconds: i64) -> String {
-    let uptime_seconds = uptime_seconds.max(0);
-    let days = uptime_seconds / 86_400;
-    let hours = (uptime_seconds % 86_400) / 3600;
-    let minutes = (uptime_seconds % 3600) / 60;
-
-    if days > 0 {
-        format!("{days}d {hours}h {minutes}m")
-    } else if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else {
-        format!("{minutes}m")
-    }
-}
-
-fn format_bytes(bytes: i64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-
-    let negative = bytes < 0;
-    let absolute = u128::from(bytes.unsigned_abs());
-    let mut unit_index = 0usize;
-    let mut divisor = 1u128;
-
-    while unit_index + 1 < UNITS.len() && absolute >= divisor * 1024 {
-        divisor *= 1024;
-        unit_index += 1;
-    }
-
-    let unit = UNITS.get(unit_index).copied().unwrap_or("B");
-    let sign = if negative { "-" } else { "" };
-
-    if unit_index == 0 {
-        format!("{sign}{absolute} {unit}")
-    } else {
-        let scaled_tenths = absolute.saturating_mul(10) / divisor;
-        let whole = scaled_tenths / 10;
-        let tenths = scaled_tenths % 10;
-        format!("{sign}{whole}.{tenths} {unit}")
-    }
-}
-
-fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let titles = vec![
-        "1:Activity",
-        "2:Database",
-        "3:Locks",
-        "4:IO",
-        "5:Statements",
-    ];
-    let selected_tab = match app.current_tab {
-        Tab::Activity => 0,
-        Tab::Database => 1,
-        Tab::Locks => 2,
-        Tab::IO => 3,
-        Tab::Statements => 4,
-    };
-    let tabs = Tabs::new(titles)
-        .block(Block::default().borders(Borders::ALL).title("Views"))
-        .select(selected_tab)
-        .style(Style::default().fg(Color::Cyan))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
-    f.render_widget(tabs, area);
-}
-
-fn draw_table(f: &mut Frame, app: &App, area: Rect) {
-    let header_cells = table_header_cells(app);
-    let widths = table_widths(app);
-
-    let rows = app.data.iter().enumerate().map(|(i, items)| {
-        let style = table_row_style(app, i, items);
-        Row::new(items.iter().map(|c| Cell::from(c.as_str()))).style(style)
-    });
-
-    let table = Table::new(rows, widths)
-        .header(
-            Row::new(header_cells.iter().map(|h| Cell::from(*h)))
-                .style(
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .bottom_margin(1),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(table_title(app)),
-        );
-    f.render_widget(table, area);
-}
-
-fn table_header_cells(app: &App) -> Vec<&'static str> {
-    match app.current_tab {
-        Tab::Activity => vec![
-            "PID", "User", "DB", "State", "Query", "Start", "App", "Client",
-        ],
-        Tab::Database => match &app.database_view {
-            DatabaseView::Summary => vec![
-                "DB",
-                "Backends",
-                "Commits",
-                "Rollbacks",
-                "Hit %",
-                "Temp Bytes",
-                "Deadlocks",
-                "Reset",
-            ],
-            DatabaseView::Tables { .. } => vec!["Node", "Type", "Children/Rows", "Size"],
-        },
-        Tab::Locks => vec!["Target", "Mode", "Waiters", "Holders"],
-        Tab::IO => vec!["Backend", "Read", "Write", "Time Read", "Time Write"],
-        Tab::Statements => vec!["Query", "Total", "Mean", "Calls", "Read", "Write"],
-    }
-}
-
-fn table_widths(app: &App) -> Vec<Constraint> {
-    match app.current_tab {
-        Tab::Activity => vec![
-            Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Percentage(40),
-            Constraint::Length(25),
-            Constraint::Length(15),
-            Constraint::Length(15),
-        ],
-        Tab::Database => match &app.database_view {
-            DatabaseView::Summary => vec![
-                Constraint::Length(18),
-                Constraint::Length(10),
-                Constraint::Length(12),
-                Constraint::Length(12),
-                Constraint::Length(10),
-                Constraint::Length(12),
-                Constraint::Length(10),
-                Constraint::Length(25),
-            ],
-            DatabaseView::Tables { .. } => vec![
-                Constraint::Percentage(45),
-                Constraint::Length(18),
-                Constraint::Length(16),
-                Constraint::Length(16),
-            ],
-        },
-        Tab::Locks => vec![
-            Constraint::Percentage(36),
-            Constraint::Percentage(32),
-            Constraint::Length(10),
-            Constraint::Length(10),
-        ],
-        Tab::IO => vec![
-            Constraint::Percentage(35),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(14),
-            Constraint::Length(14),
-        ],
-        Tab::Statements => vec![
-            Constraint::Percentage(52),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(12),
-        ],
-    }
-}
-
-fn table_row_style(app: &App, row_index: usize, items: &[String]) -> Style {
-    let is_schema_row = app.current_tab == Tab::Database
-        && matches!(app.database_view, DatabaseView::Tables { .. })
-        && items.get(1).is_some_and(|value| value == "schema");
-
-    if app.selected_row == Some(row_index) {
-        Style::default().fg(Color::Black).bg(Color::White)
-    } else if is_schema_row {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    }
-}
-
-fn table_title(app: &App) -> String {
-    match &app.database_view {
-        DatabaseView::Summary if app.current_tab == Tab::Database => format!(
-            " Database View | rows: {} | top-n: {} | Enter:Browse ",
-            app.data.len(),
-            app.top_n
-        ),
-        DatabaseView::Tables { database } if app.current_tab == Tab::Database => format!(
-            " Database Tree | {database} | nodes: {} | Esc:Back ",
-            app.data.len()
-        ),
-        _ => format!(
-            " {:?} View | rows: {} | top-n: {} ",
-            app.current_tab,
-            app.data.len(),
-            app.top_n
-        ),
-    }
-}
-
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let footer_text = if let Some(notice) = app.notice_state.as_ref() {
-        notice.message.clone()
-    } else if app.error_state.is_some() {
-        "q:Quit | r:Retry | 1-5:Switch Tab".to_string()
-    } else if app.current_tab == Tab::Activity {
-        if let Some(session) = app
-            .selected_row
-            .and_then(|selected_row| app.dashboard.sessions.get(selected_row))
-        {
-            format!(
-                "QUERY: {} | Enter:Save Query | a/w/b/t:Subviews",
-                session.query.replace('\n', " ")
-            )
-        } else {
-            "q:Quit | 1-5:Switch Tab | ↑↓:Navigate | Enter:Save Query | a/w/b/t:Subviews"
-                .to_string()
-        }
-    } else if let Some(row_data) = app
-        .selected_row
-        .and_then(|selected_row| app.data.get(selected_row))
-    {
-        match app.current_tab {
-            Tab::Statements => {
-                let query = row_data.first().map_or("", String::as_str);
-                format!(
-                    "QUERY: {} | Enter:Save Query | i:Details",
-                    query.replace('\n', " ")
-                )
-            }
-            Tab::Database => match &app.database_view {
-                DatabaseView::Summary => {
-                    let database = row_data.first().map_or("", String::as_str);
-                    format!("DB: {database} | Enter:Browse Tables")
-                }
-                DatabaseView::Tables { database } => {
-                    let node = row_data.first().map_or("", String::as_str);
-                    format!("DB: {database} | NODE: {} | Esc:Back", node.trim())
-                }
-            },
-            _ => "q:Quit | 1-5:Switch Tab | ↑↓:Navigate".to_string(),
-        }
-    } else {
-        match app.current_tab {
-            Tab::Activity => {
-                "q:Quit | 1-5:Switch Tab | ↑↓:Navigate | Enter:Save Query | a/w/b/t:Subviews"
-                    .to_string()
-            }
-            Tab::Statements => {
-                "q:Quit | 1-5:Switch Tab | ↑↓:Navigate | Enter:Save Query | i:Details".to_string()
-            }
-            Tab::Database => match &app.database_view {
-                DatabaseView::Summary => {
-                    "q:Quit | 1-5:Switch Tab | ↑↓:Navigate | Enter:Browse Tables".to_string()
-                }
-                DatabaseView::Tables { .. } => {
-                    "q:Quit | 1-5:Switch Tab | ↑↓:Navigate | Esc:Back".to_string()
-                }
-            },
-            _ => "q:Quit | 1-5:Switch Tab | ↑↓:Navigate".to_string(),
-        }
-    };
-
-    let footer = Paragraph::new(Line::from(vec![Span::raw(footer_text)]))
-        .block(Block::default().borders(Borders::ALL));
-    f.render_widget(footer, area);
-}
-
-fn draw_loading_modal(f: &mut Frame, app: &App) {
-    let Some(loading_state) = app.loading_state.as_ref() else {
-        return;
-    };
-
-    let area = centered_rect(f.area(), 70, 7);
-    let elapsed = loading_state.started_at.elapsed().as_secs();
-    let content = vec![
-        Line::styled(
-            "Connecting",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(""),
-        Line::raw(loading_state.message.as_str()),
-        Line::raw(format!("Elapsed: {elapsed}s")),
-        Line::raw("Press q to quit."),
-    ];
-
-    let modal = Paragraph::new(content).alignment(Alignment::Center).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Connection ")
-            .style(Style::default().bg(Color::Black)),
-    );
-
-    f.render_widget(Clear, area);
-    f.render_widget(modal, area);
-}
-
-fn draw_statement_detail_modal(f: &mut Frame, app: &App) {
-    let Some(detail) = app.statement_detail.as_ref() else {
-        return;
-    };
-
-    let area = centered_rect(f.area(), 85, 14);
-    let content = vec![
-        Line::styled(
-            "Statement Detail",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(""),
-        Line::raw(format!(
-            "total: {} ms | mean: {} ms | calls: {}",
-            detail.total_time, detail.mean_time, detail.calls
-        )),
-        Line::raw(format!(
-            "read: {} ms | write: {} ms",
-            detail.read_time, detail.write_time
-        )),
-        Line::raw(""),
-        Line::raw(detail.query.as_str()),
-        Line::raw(""),
-        Line::styled(
-            "Enter:Save Query | Esc:Close",
-            Style::default().fg(Color::Cyan),
-        ),
-    ];
-
-    let modal = Paragraph::new(content).wrap(Wrap { trim: true }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Statement ")
-            .style(Style::default().bg(Color::Black)),
-    );
-
-    f.render_widget(Clear, area);
-    f.render_widget(modal, area);
-}
-
-fn draw_error_modal(f: &mut Frame, app: &App) {
-    let Some(error_state) = app.error_state.as_ref() else {
-        return;
-    };
-
-    let area = centered_rect(f.area(), 80, 9);
-    let content = vec![
-        Line::styled(
-            error_state.title.as_str(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(""),
-        Line::raw(error_state.details.as_str()),
-        Line::raw(""),
-        Line::styled(
-            "Press r to retry or q to quit.",
-            Style::default().fg(Color::Yellow),
-        ),
-    ];
-
-    let modal = Paragraph::new(content)
-        .alignment(Alignment::Left)
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Error ")
-                .style(Style::default().bg(Color::Black)),
-        );
-
-    f.render_widget(Clear, area);
-    f.render_widget(modal, area);
-}
-
-fn centered_rect(area: Rect, width_percentage: u16, height: u16) -> Rect {
-    let vertical = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(height),
-        Constraint::Fill(1),
-    ])
-    .flex(Flex::Center)
-    .split(area);
-    let Some(mid_row) = vertical.get(1) else {
-        return area;
-    };
-
-    let horizontal = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Percentage(width_percentage),
-        Constraint::Fill(1),
-    ])
-    .flex(Flex::Center)
-    .split(*mid_row);
-
-    horizontal.get(1).copied().unwrap_or(*mid_row)
 }
