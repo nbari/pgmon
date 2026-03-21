@@ -1,8 +1,8 @@
 use crate::pg::conninfo::describe_connection_target;
 use crate::pg::queries::{
     ACTIVITY_PROCESS_QUERY, ACTIVITY_SESSIONS_QUERY, ACTIVITY_SUMMARY_QUERY, DATABASE_QUERY,
-    DATABASE_TREE_QUERY, IO_QUERY, LOCKS_QUERY, SETTINGS_QUERY, STATEMENTS_QUERY,
-    STATEMENTS_QUERY_V12,
+    DATABASE_TREE_QUERY, IO_QUERY, LOCKS_QUERY, REPLICATION_RECEIVER_QUERY,
+    REPLICATION_SENDERS_QUERY, REPLICATION_SLOTS_QUERY, SETTINGS_QUERY,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -56,6 +56,7 @@ pub(crate) struct ActivityProcessSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct ActivitySession {
     pub(crate) pid: String,
+    pub(crate) backend_type: String,
     pub(crate) xmin: String,
     pub(crate) database: String,
     pub(crate) application: String,
@@ -67,6 +68,39 @@ pub(crate) struct ActivitySession {
     pub(crate) query: String,
     pub(crate) blocked_by_count: i64,
     pub(crate) blocked_count: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReplicationSnapshot {
+    pub(crate) receiver_summary: Option<String>,
+    pub(crate) senders: Vec<ReplicationSender>,
+    pub(crate) slots: Vec<ReplicationSlot>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplicationSender {
+    pub(crate) pid: String,
+    pub(crate) user: String,
+    pub(crate) application: String,
+    pub(crate) client: String,
+    pub(crate) state: String,
+    pub(crate) sync_state: String,
+    pub(crate) slot_name: String,
+    pub(crate) sent_lag_bytes: i64,
+    pub(crate) write_lag_bytes: i64,
+    pub(crate) flush_lag_bytes: i64,
+    pub(crate) replay_lag_bytes: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplicationSlot {
+    pub(crate) slot_name: String,
+    pub(crate) slot_type: String,
+    pub(crate) active: String,
+    pub(crate) active_pid: String,
+    pub(crate) restart_lsn: String,
+    pub(crate) confirmed_flush_lsn: String,
+    pub(crate) wal_status: String,
 }
 
 pub struct PgClient {
@@ -176,14 +210,36 @@ impl PgClient {
             return Ok(vec![vec!["pg_stat_statements not installed".to_string()]]);
         }
 
-        let has_exec_time = self.column_exists("pg_stat_statements", "total_exec_time")?;
-        let query = if has_exec_time {
-            STATEMENTS_QUERY
+        let total_time_column = if self.column_exists("pg_stat_statements", "total_exec_time")? {
+            "total_exec_time"
         } else {
-            STATEMENTS_QUERY_V12
+            "total_time"
         };
+        let mean_time_column = if self.column_exists("pg_stat_statements", "mean_exec_time")? {
+            "mean_exec_time"
+        } else {
+            "mean_time"
+        };
+        let blk_read_time_expr =
+            if self.column_exists("pg_stat_statements", "shared_blk_read_time")? {
+                "COALESCE(shared_blk_read_time, 0)::float8"
+            } else {
+                "0::float8"
+            };
+        let blk_write_time_expr =
+            if self.column_exists("pg_stat_statements", "shared_blk_write_time")? {
+                "COALESCE(shared_blk_write_time, 0)::float8"
+            } else {
+                "0::float8"
+            };
+        let query = build_statements_query(
+            total_time_column,
+            mean_time_column,
+            blk_read_time_expr,
+            blk_write_time_expr,
+        );
 
-        let rows = match self.client.query(query, &[]) {
+        let rows = match self.client.query(query.as_str(), &[]) {
             Ok(r) => r,
             Err(e) => {
                 if e.to_string().contains("shared_preload_libraries") {
@@ -208,6 +264,70 @@ impl PgClient {
             .collect()
     }
 
+    pub fn fetch_replication_snapshot(&mut self) -> Result<ReplicationSnapshot> {
+        let receiver_summary =
+            if let Some(row) = self.client.query_opt(REPLICATION_RECEIVER_QUERY, &[])? {
+                let status = row.try_get::<_, String>(0)?;
+                let sender_host = row.try_get::<_, String>(1)?;
+                let sender_port = row.try_get::<_, String>(2)?;
+                let slot_name = row.try_get::<_, String>(3)?;
+                let latest_end_lsn = row.try_get::<_, String>(4)?;
+                Some(format_receiver_summary(
+                    &status,
+                    &sender_host,
+                    &sender_port,
+                    &slot_name,
+                    &latest_end_lsn,
+                ))
+            } else {
+                None
+            };
+
+        let senders = self
+            .client
+            .query(REPLICATION_SENDERS_QUERY, &[])?
+            .into_iter()
+            .map(|row| {
+                Ok(ReplicationSender {
+                    pid: row.try_get::<_, String>(0)?,
+                    user: row.try_get::<_, String>(1)?,
+                    application: row.try_get::<_, String>(2)?,
+                    client: row.try_get::<_, String>(3)?,
+                    state: row.try_get::<_, String>(4)?,
+                    sync_state: row.try_get::<_, String>(5)?,
+                    slot_name: row.try_get::<_, String>(6)?,
+                    sent_lag_bytes: row.try_get::<_, i64>(7)?,
+                    write_lag_bytes: row.try_get::<_, i64>(8)?,
+                    flush_lag_bytes: row.try_get::<_, i64>(9)?,
+                    replay_lag_bytes: row.try_get::<_, i64>(10)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let slots = self
+            .client
+            .query(REPLICATION_SLOTS_QUERY, &[])?
+            .into_iter()
+            .map(|row| {
+                Ok(ReplicationSlot {
+                    slot_name: row.try_get::<_, String>(0)?,
+                    slot_type: row.try_get::<_, String>(1)?,
+                    active: row.try_get::<_, String>(2)?,
+                    active_pid: row.try_get::<_, String>(3)?,
+                    restart_lsn: row.try_get::<_, String>(4)?,
+                    confirmed_flush_lsn: row.try_get::<_, String>(5)?,
+                    wal_status: row.try_get::<_, String>(6)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(ReplicationSnapshot {
+            receiver_summary,
+            senders,
+            slots,
+        })
+    }
+
     pub fn fetch_activity_snapshot(&mut self) -> Result<ActivitySnapshot> {
         let summary_row = self.client.query_one(ACTIVITY_SUMMARY_QUERY, &[])?;
         let process_row = self.client.query_one(ACTIVITY_PROCESS_QUERY, &[])?;
@@ -218,17 +338,18 @@ impl PgClient {
             .map(|row| {
                 Ok(ActivitySession {
                     pid: row.try_get::<_, String>(0)?,
-                    xmin: row.try_get::<_, String>(1)?,
-                    database: row.try_get::<_, String>(2)?,
-                    application: row.try_get::<_, String>(3)?,
-                    user: row.try_get::<_, String>(4)?,
-                    client: row.try_get::<_, String>(5)?,
-                    duration_seconds: row.try_get::<_, i64>(6)?.max(0),
-                    wait_info: row.try_get::<_, String>(7)?,
-                    state: row.try_get::<_, String>(8)?,
-                    query: row.try_get::<_, String>(9)?,
-                    blocked_by_count: row.try_get::<_, i64>(10)?,
-                    blocked_count: row.try_get::<_, i64>(11)?,
+                    backend_type: row.try_get::<_, String>(1)?,
+                    xmin: row.try_get::<_, String>(2)?,
+                    database: row.try_get::<_, String>(3)?,
+                    application: row.try_get::<_, String>(4)?,
+                    user: row.try_get::<_, String>(5)?,
+                    client: row.try_get::<_, String>(6)?,
+                    duration_seconds: row.try_get::<_, i64>(7)?.max(0),
+                    wait_info: row.try_get::<_, String>(8)?,
+                    state: row.try_get::<_, String>(9)?,
+                    query: row.try_get::<_, String>(10)?,
+                    blocked_by_count: row.try_get::<_, i64>(11)?,
+                    blocked_count: row.try_get::<_, i64>(12)?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -355,4 +476,91 @@ fn config_from_dsn(dsn: &str, connect_timeout_ms: u64) -> Result<Config> {
     })?;
     config.connect_timeout(Duration::from_millis(connect_timeout_ms));
     Ok(config)
+}
+
+fn format_receiver_summary(
+    status: &str,
+    sender_host: &str,
+    sender_port: &str,
+    slot_name: &str,
+    latest_end_lsn: &str,
+) -> String {
+    let mut parts = vec![format!("Receiver: {status}")];
+
+    if !sender_host.is_empty() {
+        if sender_port.is_empty() {
+            parts.push(format!("source={sender_host}"));
+        } else {
+            parts.push(format!("source={sender_host}:{sender_port}"));
+        }
+    }
+    if !slot_name.is_empty() {
+        parts.push(format!("slot={slot_name}"));
+    }
+    if !latest_end_lsn.is_empty() {
+        parts.push(format!("latest_end_lsn={latest_end_lsn}"));
+    }
+
+    parts.join(" | ")
+}
+
+fn build_statements_query(
+    total_time_column: &str,
+    mean_time_column: &str,
+    blk_read_time_expr: &str,
+    blk_write_time_expr: &str,
+) -> String {
+    format!(
+        r"
+SELECT 
+    COALESCE(regexp_replace(query, '\s+', ' ', 'g'), '') as query, 
+    COALESCE({total_time_column}, 0)::float8 as total_time, 
+    COALESCE({mean_time_column}, 0)::float8 as mean_time, 
+    COALESCE(calls, 0)::bigint as calls, 
+    {blk_read_time_expr} as blk_read_time, 
+    {blk_write_time_expr} as blk_write_time
+FROM pg_stat_statements
+ORDER BY {total_time_column} DESC
+LIMIT 500
+"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_statements_query, format_receiver_summary};
+
+    #[test]
+    fn test_build_statements_query_uses_exec_time_columns() {
+        let query = build_statements_query(
+            "total_exec_time",
+            "mean_exec_time",
+            "COALESCE(shared_blk_read_time, 0)::float8",
+            "COALESCE(shared_blk_write_time, 0)::float8",
+        );
+
+        assert!(query.contains("COALESCE(total_exec_time, 0)::float8 as total_time"));
+        assert!(query.contains("COALESCE(mean_exec_time, 0)::float8 as mean_time"));
+        assert!(query.contains("ORDER BY total_exec_time DESC"));
+    }
+
+    #[test]
+    fn test_build_statements_query_falls_back_when_block_timing_columns_are_missing() {
+        let query = build_statements_query(
+            "total_exec_time",
+            "mean_exec_time",
+            "0::float8",
+            "0::float8",
+        );
+
+        assert!(query.contains("0::float8 as blk_read_time"));
+        assert!(query.contains("0::float8 as blk_write_time"));
+    }
+
+    #[test]
+    fn test_format_receiver_summary_omits_empty_fields() {
+        let summary = format_receiver_summary("streaming", "replica", "5432", "", "");
+
+        assert_eq!(summary, "Receiver: streaming | source=replica:5432");
+    }
 }

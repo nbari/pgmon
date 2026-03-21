@@ -2,6 +2,12 @@
 
 Upcoming features and improvements for `pgmon`.
 
+## Recently Completed
+- [x] **Replication Monitoring**: Added a dedicated read-only Replication view for WAL senders, standby receiver status, and replication slots.
+- [x] **Statements Sort Contract Cleanup**: Aligned CLI/runtime sorting with supported `total_time`, `mean_time`, and `calls` modes.
+- [x] **Activity Waiting Accuracy**: Corrected waiting-session counts so blockers are no longer reported as waiting.
+- [x] **Replica Query Presentation**: Show human-friendly replica labels instead of raw `START_REPLICATION SLOT ...` text in the Activity UI.
+
 ## TUI & UX
 - [ ] **Metric Switching in Charts**: Add the ability to toggle the main chart between different metrics (e.g., Connections, TPS, IO Throughput).
 - [ ] **Table Export**: Implement a shortcut (e.g., `e`) to export the current (potentially filtered) table view to a CSV or JSON file.
@@ -10,7 +16,6 @@ Upcoming features and improvements for `pgmon`.
 
 ## Administration & Monitoring
 - [ ] **Extended Admin Tools**: Add context-aware tools like `VACUUM ANALYZE` or `REINDEX` for the selected table in the Database Tree view.
-- [ ] **Replication Monitoring**: Add a specialized view for WAL replication lag and replication slot status.
 - [ ] **Deadlock Visualizer**: A more detailed view of waiting transactions and the exact circular dependencies.
 - [ ] **Explain Analyze**: Integrate the ability to run `EXPLAIN (ANALYZE, BUFFERS)` on a selected query from the Statements view.
 

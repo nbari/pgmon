@@ -20,7 +20,7 @@ pub fn handler(matches: &ArgMatches) -> Result<Action> {
     let sort = matches
         .get_one::<String>("sort")
         .cloned()
-        .unwrap_or_else(|| "longest_running".into());
+        .unwrap_or_else(|| "total_time".into());
 
     Ok(Action::StartTui {
         dsn,

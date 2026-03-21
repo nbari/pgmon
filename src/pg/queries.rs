@@ -70,30 +70,47 @@ FROM pg_settings
 ORDER BY category, name
 ";
 
-pub const STATEMENTS_QUERY: &str = r"
-SELECT 
-    COALESCE(regexp_replace(query, '\s+', ' ', 'g'), '') as query, 
-    COALESCE(total_exec_time, 0)::float8 as total_time, 
-    COALESCE(mean_exec_time, 0)::float8 as mean_time, 
-    COALESCE(calls, 0)::bigint as calls, 
-    COALESCE(shared_blk_read_time, 0)::float8 as blk_read_time, 
-    COALESCE(shared_blk_write_time, 0)::float8 as blk_write_time
-FROM pg_stat_statements
-ORDER BY total_exec_time DESC
-LIMIT 500
+pub const REPLICATION_RECEIVER_QUERY: &str = r"
+SELECT
+    COALESCE(status, '') as status,
+    COALESCE(sender_host, '') as sender_host,
+    COALESCE(sender_port::text, '') as sender_port,
+    COALESCE(slot_name, '') as slot_name,
+    COALESCE(latest_end_lsn::text, '') as latest_end_lsn
+FROM pg_stat_wal_receiver
+LIMIT 1
 ";
 
-pub const STATEMENTS_QUERY_V12: &str = r"
-SELECT 
-    COALESCE(regexp_replace(query, '\s+', ' ', 'g'), '') as query, 
-    COALESCE(total_time, 0)::float8 as total_time, 
-    COALESCE(mean_time, 0)::float8 as mean_time, 
-    COALESCE(calls, 0)::bigint as calls, 
-    COALESCE(shared_blk_read_time, 0)::float8 as blk_read_time, 
-    COALESCE(shared_blk_write_time, 0)::float8 as blk_write_time
-FROM pg_stat_statements
-ORDER BY total_time DESC
-LIMIT 500
+pub const REPLICATION_SENDERS_QUERY: &str = r"
+SELECT
+    replication.pid::text,
+    COALESCE(replication.usename, '') as usename,
+    COALESCE(replication.application_name, '') as application_name,
+    COALESCE(host(replication.client_addr), replication.client_hostname, '[local]') as client,
+    COALESCE(replication.state, '') as state,
+    COALESCE(replication.sync_state, '') as sync_state,
+    COALESCE(slots.slot_name, '') as slot_name,
+    GREATEST(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replication.sent_lsn), 0), 0)::bigint as sent_lag_bytes,
+    GREATEST(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replication.write_lsn), 0), 0)::bigint as write_lag_bytes,
+    GREATEST(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replication.flush_lsn), 0), 0)::bigint as flush_lag_bytes,
+    GREATEST(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replication.replay_lsn), 0), 0)::bigint as replay_lag_bytes
+FROM pg_stat_replication replication
+LEFT JOIN pg_replication_slots slots
+    ON slots.active_pid = replication.pid
+ORDER BY replay_lag_bytes DESC, write_lag_bytes DESC, replication.pid ASC
+";
+
+pub const REPLICATION_SLOTS_QUERY: &str = r"
+SELECT
+    COALESCE(slot_name, '') as slot_name,
+    COALESCE(slot_type, '') as slot_type,
+    CASE WHEN active THEN 'yes' ELSE 'no' END as active,
+    COALESCE(active_pid::text, '') as active_pid,
+    COALESCE(restart_lsn::text, '') as restart_lsn,
+    COALESCE(confirmed_flush_lsn::text, '') as confirmed_flush_lsn,
+    COALESCE(wal_status, '') as wal_status
+FROM pg_replication_slots
+ORDER BY active DESC, slot_name ASC
 ";
 
 pub const ACTIVITY_SUMMARY_QUERY: &str = r"
@@ -176,6 +193,7 @@ pub const ACTIVITY_SESSIONS_QUERY: &str = r"
 WITH activity AS (
     SELECT
         pid,
+        COALESCE(backend_type, '') as backend_type,
         COALESCE(backend_xmin::text, '') as xmin,
         COALESCE(datname, '') as datname,
         COALESCE(application_name, '') as application_name,
@@ -197,7 +215,7 @@ WITH activity AS (
         pg_blocking_pids(pid) as blocking_pids
     FROM pg_stat_activity
     WHERE pid <> pg_backend_pid()
-      AND backend_type = 'client backend'
+      AND backend_type IN ('client backend', 'walsender')
 ),
 blockers AS (
     SELECT
@@ -208,6 +226,7 @@ blockers AS (
 )
 SELECT
     activity.pid::text,
+    activity.backend_type,
     activity.xmin,
     activity.datname,
     activity.application_name,
@@ -269,3 +288,15 @@ SELECT
 FROM user_tables
 ORDER BY schema_name ASC, depth ASC, sort_bytes DESC, table_name ASC NULLS LAST
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::ACTIVITY_SESSIONS_QUERY;
+
+    #[test]
+    fn test_activity_sessions_query_includes_walsender_backends() {
+        assert!(
+            ACTIVITY_SESSIONS_QUERY.contains("backend_type IN ('client backend', 'walsender')")
+        );
+    }
+}

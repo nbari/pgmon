@@ -70,7 +70,7 @@ pub(crate) fn count_sessions(sessions: &[ActivitySession]) -> SessionCounts {
             "idle in transaction (aborted)" => counts.idle_in_transaction_aborted += 1,
             _ => {}
         }
-        if session.wait_info.starts_with("Lock") || session.blocked_count > 0 {
+        if is_waiting_session(session) {
             counts.waiting += 1;
         }
     }
@@ -148,6 +148,8 @@ fn format_counter_rate(prev: i64, current: i64, elapsed_secs: f64) -> String {
 
 pub(crate) fn sort_statement_rows(mut rows: Vec<Vec<String>>, sort: &str) -> Vec<Vec<String>> {
     let column = match sort {
+        "total_time" => 1,
+        "mean_time" => 2,
         "calls" => 3,
         _ => return rows,
     };
@@ -181,9 +183,7 @@ pub(crate) fn filter_activity_sessions(
         .iter()
         .filter(|s| match subview {
             ActivitySubview::Active => s.state == "active" || s.blocked_count > 0,
-            ActivitySubview::Waiting => {
-                s.blocked_by_count > 0 || (!s.wait_info.is_empty() && s.state == "active")
-            }
+            ActivitySubview::Waiting => is_waiting_session(s),
             ActivitySubview::Blocking => s.blocked_count > 0,
             ActivitySubview::IdleInTransaction => s.state.starts_with("idle in transaction"),
         })
@@ -226,4 +226,26 @@ pub(crate) fn is_fuzzy_match(text: &str, query: &str) -> bool {
         }
     }
     true
+}
+
+pub(crate) fn format_activity_query(session: &ActivitySession) -> String {
+    if session.backend_type != "walsender" {
+        return session.query.clone();
+    }
+
+    replication_slot_name(&session.query).map_or_else(
+        || "replica".to_string(),
+        |slot_name| format!("replica {slot_name}"),
+    )
+}
+
+fn replication_slot_name(query: &str) -> Option<&str> {
+    let prefix = "START_REPLICATION SLOT \"";
+    let remainder = query.strip_prefix(prefix)?;
+    let slot_end = remainder.find('"')?;
+    remainder.get(..slot_end)
+}
+
+fn is_waiting_session(session: &ActivitySession) -> bool {
+    session.blocked_by_count > 0 || (!session.wait_info.is_empty() && session.state == "active")
 }

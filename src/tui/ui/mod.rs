@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod common;
 pub mod modals;
+pub mod replication;
 pub mod table;
 
 use crate::tui::app::{App, DatabaseView, InputMode, Tab};
@@ -12,12 +13,14 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs},
 };
 
+use crate::tui::app::format::format_activity_query;
 use activity::draw_dashboard;
 use common::truncate_str;
 use modals::{
     draw_confirm_modal, draw_error_modal, draw_loading_modal, draw_refresh_modal,
     draw_statement_detail_modal, draw_top_n_modal,
 };
+use replication::draw_replication;
 use table::draw_table;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -37,6 +40,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_tabs(f, app, *tabs_area);
         if app.current_tab == Tab::Activity {
             draw_dashboard(f, app, *content);
+        } else if app.current_tab == Tab::Replication {
+            draw_replication(f, app, *content);
         } else {
             draw_table(f, app, *content);
         }
@@ -67,6 +72,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         "5:Statements",
         "6:Tools",
         "7:Settings",
+        "8:Replication",
     ];
     let selected_tab = match app.current_tab {
         Tab::Activity => 0,
@@ -76,6 +82,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         Tab::Statements => 4,
         Tab::Tools => 5,
         Tab::Settings => 6,
+        Tab::Replication => 7,
     };
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::ALL).title("Views"))
@@ -128,7 +135,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(":Retry | 1-7:Switch Tab"),
+            Span::raw(":Retry | 1-8:Switch Tab"),
         ]);
     } else if app.current_tab == Tab::Activity {
         if let Some(session) = app
@@ -137,7 +144,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         {
             footer_spans.extend(vec![
                 Span::styled("QUERY: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(truncate_str(session.query.as_str(), 60)),
+                Span::raw(truncate_str(&format_activity_query(session), 60)),
                 Span::styled(" | ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Enter",
@@ -149,9 +156,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ]);
         } else {
             footer_spans.push(Span::raw(
-                "q:Quit | 1-7:Switch Tab | ↑↓:Navigate | Enter:Save Query | a/w/b/t:Subviews",
+                "q:Quit | 1-8:Switch Tab | ↑↓:Navigate | Enter:Save Query | a/w/b/t:Subviews",
             ));
         }
+    } else if app.current_tab == Tab::Replication {
+        let receiver_summary = app
+            .replication
+            .receiver_summary
+            .as_deref()
+            .unwrap_or("Receiver: inactive");
+        footer_spans.push(Span::raw(format!(
+            "q:Quit | 1-8:Switch Tab | /:Search | n:Top | {receiver_summary}"
+        )));
     } else if let Some(row_data) = app
         .selected_row
         .and_then(|selected_row| app.data.get(selected_row))
@@ -213,33 +229,36 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     ]);
                 }
             },
-            _ => footer_spans.push(Span::raw("q:Quit | 1-7:Switch Tab | ↑↓:Navigate")),
+            _ => footer_spans.push(Span::raw("q:Quit | 1-8:Switch Tab | ↑↓:Navigate")),
         }
     } else {
         match app.current_tab {
             Tab::Activity => {
                 footer_spans.push(Span::raw(
-                    "q:Quit | 1-7:Switch Tab | ↑↓:Navigate | Enter:Save Query | a/w/b/t:Subviews",
+                    "q:Quit | 1-8:Switch Tab | ↑↓:Navigate | Enter:Save Query | a/w/b/t:Subviews",
                 ));
+            }
+            Tab::Replication => {
+                footer_spans.push(Span::raw("q:Quit | 1-8:Switch Tab | /:Search | n:Top"));
             }
             Tab::Statements => {
                 footer_spans.push(Span::raw(
-                    "q:Quit | 1-7:Switch Tab | ↑↓:Navigate | Enter:Save Query | i:Details",
+                    "q:Quit | 1-8:Switch Tab | ↑↓:Navigate | Enter:Save Query | i:Details",
                 ));
             }
             Tab::Database => match &app.database_view {
                 DatabaseView::Summary => {
                     footer_spans.push(Span::raw(
-                        "q:Quit | 1-7:Switch Tab | ↑↓:Navigate | Enter:Browse Tables",
+                        "q:Quit | 1-8:Switch Tab | ↑↓:Navigate | Enter:Browse Tables",
                     ));
                 }
                 DatabaseView::Tables { .. } => {
                     footer_spans.push(Span::raw(
-                        "q:Quit | 1-7:Switch Tab | ↑↓:Navigate | Esc:Back",
+                        "q:Quit | 1-8:Switch Tab | ↑↓:Navigate | Esc:Back",
                     ));
                 }
             },
-            _ => footer_spans.push(Span::raw("q:Quit | 1-7:Switch Tab | ↑↓:Navigate")),
+            _ => footer_spans.push(Span::raw("q:Quit | 1-8:Switch Tab | ↑↓:Navigate")),
         }
     }
 

@@ -1,10 +1,11 @@
 use super::state::{DatabaseView, Tab};
-use crate::pg::client::{ActivitySnapshot, PgClient};
+use crate::pg::client::{ActivitySnapshot, PgClient, ReplicationSnapshot};
 use anyhow::Result;
 
 #[derive(Debug)]
 pub enum RefreshPayload {
     Activity(Box<ActivitySnapshot>, PgClient),
+    Replication(Box<ReplicationSnapshot>, PgClient),
     Table(Vec<Vec<String>>, PgClient),
 }
 
@@ -24,6 +25,10 @@ pub fn load_refresh_payload(
         Tab::Activity => {
             let snapshot = client.fetch_activity_snapshot()?;
             Ok(RefreshPayload::Activity(Box::new(snapshot), client))
+        }
+        Tab::Replication => {
+            let snapshot = client.fetch_replication_snapshot()?;
+            Ok(RefreshPayload::Replication(Box::new(snapshot), client))
         }
         Tab::Database => match database_view {
             DatabaseView::Summary => {

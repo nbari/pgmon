@@ -149,7 +149,7 @@ fn table_cell_style(app: &App, col_index: usize, value: &str, is_selected: bool)
             2..=4 => return Some(Style::default().fg(Color::DarkGray)),
             _ => {}
         },
-        Tab::Activity => {}
+        Tab::Replication | Tab::Activity => {}
     }
 
     None
@@ -200,6 +200,7 @@ fn table_header_cells(app: &App) -> Vec<&'static str> {
             "Write(ms)",
         ],
         Tab::Tools => vec!["Action", "Description"],
+        Tab::Replication => Vec::new(),
         Tab::Settings => vec!["Name", "Value", "Unit", "Category", "Description"],
     }
 }
@@ -261,6 +262,7 @@ fn table_widths(app: &App) -> Vec<Constraint> {
             Constraint::Length(12),
         ],
         Tab::Tools => vec![Constraint::Length(40), Constraint::Percentage(70)],
+        Tab::Replication => Vec::new(),
         Tab::Settings => vec![
             Constraint::Percentage(25),
             Constraint::Length(12),

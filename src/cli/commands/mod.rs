@@ -90,9 +90,9 @@ pub fn new() -> Command {
                 .long("sort")
                 .value_name("COLUMN")
                 .help("Default sort column")
-                .long_help("Define the default sorting criteria for the views. This is particularly useful for the 'statements' view.")
-                .value_parser(["total_time", "mean_time", "calls", "longest_running"])
-                .default_value("longest_running"),
+                .long_help("Define the default sorting criteria for the Statements view.")
+                .value_parser(["total_time", "mean_time", "calls"])
+                .default_value("total_time"),
         )
         .arg(
             Arg::new("verbose")
@@ -134,6 +134,10 @@ mod tests {
             matches.get_one::<String>("home-view"),
             Some(&"activity".to_string())
         );
+        assert_eq!(
+            matches.get_one::<String>("sort"),
+            Some(&"total_time".to_string())
+        );
     }
 
     #[test]
@@ -144,6 +148,10 @@ mod tests {
 
         let matches =
             new().try_get_matches_from(vec!["pgmon", "--dsn", "x", "--refresh-ms", "100"]);
+        assert!(matches.is_err());
+
+        let matches =
+            new().try_get_matches_from(vec!["pgmon", "--dsn", "x", "--sort", "longest_running"]);
         assert!(matches.is_err());
     }
 }

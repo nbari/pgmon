@@ -1,7 +1,7 @@
 use super::common::{format_bytes, format_duration_hms, format_uptime};
 use crate::{
     pg::conninfo::describe_host,
-    tui::app::{ActivitySummaryMetric, ActivitySummarySection, App},
+    tui::app::{ActivitySummaryMetric, ActivitySummarySection, App, format::format_activity_query},
 };
 use ratatui::{
     Frame,
@@ -512,7 +512,7 @@ fn draw_activity_sessions_panel(f: &mut Frame, app: &mut App, area: Rect) {
                 ),
                 Cell::from(activity_wait_cell(session)).style(wait_style),
                 Cell::from(activity_state_cell(session)).style(state_style),
-                Cell::from(session.query.as_str()).style(white_style),
+                Cell::from(format_activity_query(session)).style(white_style),
             ])
             .style(style)
         });

@@ -7,7 +7,7 @@ pub mod ui_state;
 mod tests;
 
 use crate::pg::{
-    client::{ActivitySnapshot, PgClient},
+    client::{ActivitySnapshot, PgClient, ReplicationSnapshot},
     conninfo::describe_connection_target,
 };
 use anyhow::{Context, Result};
@@ -67,6 +67,7 @@ pub struct App {
     pub input_mode: InputMode,
     pub search_query: String,
     pub has_loaded_once: bool,
+    pub(crate) replication: ReplicationSnapshot,
     pg_client: Option<PgClient>,
     activity_sessions: Vec<ActivitySession>,
     previous_activity_sample: Option<ActivityCounterSample>,
@@ -114,6 +115,7 @@ impl App {
             input_mode: InputMode::Normal,
             search_query: String::new(),
             has_loaded_once: false,
+            replication: ReplicationSnapshot::default(),
             pg_client: None,
             activity_sessions: Vec::new(),
             previous_activity_sample: None,
@@ -247,6 +249,7 @@ impl App {
                 KeyCode::Char('5') => self.set_tab(Tab::Statements),
                 KeyCode::Char('6') => self.set_tab(Tab::Tools),
                 KeyCode::Char('7') => self.set_tab(Tab::Settings),
+                KeyCode::Char('8') => self.set_tab(Tab::Replication),
                 KeyCode::Down | KeyCode::Char('j') => {
                     if let Some(ref mut modal) = self.refresh_interval_modal {
                         if modal.selected_index < modal.options.len() - 1 {
@@ -366,7 +369,7 @@ impl App {
             Tab::Activity | Tab::Statements => self.save_selected_query(),
             Tab::Database => self.open_selected_database_tree(),
             Tab::Tools => self.prompt_tool_action(),
-            Tab::Locks | Tab::IO | Tab::Settings => {}
+            Tab::Locks | Tab::IO | Tab::Settings | Tab::Replication => {}
         }
     }
 
@@ -601,6 +604,10 @@ impl App {
                 self.pg_client = Some(client);
                 self.apply_activity_snapshot(*activity);
             }
+            RefreshPayload::Replication(replication, client) => {
+                self.pg_client = Some(client);
+                self.apply_replication_snapshot(*replication);
+            }
             RefreshPayload::Table(data, client) => {
                 self.pg_client = Some(client);
                 self.data = self.prepare_table_data(data);
@@ -654,6 +661,12 @@ impl App {
         self.activity_sessions = snapshot.sessions;
         self.apply_activity_session_view();
         self.push_conn_history();
+        self.data.clear();
+    }
+
+    fn apply_replication_snapshot(&mut self, snapshot: ReplicationSnapshot) {
+        self.replication = snapshot;
+        self.selected_row = None;
         self.data.clear();
     }
 
@@ -715,6 +728,7 @@ fn query_output_path(tab: Tab, directory: &Path) -> Result<PathBuf> {
         .as_millis();
     let tab_name = match tab {
         Tab::Activity => "activity",
+        Tab::Replication => "replication",
         Tab::Database => "database",
         Tab::Locks => "locks",
         Tab::IO => "io",

@@ -1,7 +1,8 @@
 #[cfg(test)]
 mod test_harness {
     use super::super::format::{
-        count_sessions, filter_activity_sessions, sort_statement_rows, sorted_activity_sessions,
+        count_sessions, filter_activity_sessions, format_activity_query, sort_statement_rows,
+        sorted_activity_sessions,
     };
     use super::super::{ActivitySession, ActivitySubview, Tab, clamp_selected_row};
     use std::path::Path;
@@ -24,6 +25,18 @@ mod test_harness {
         assert_eq!(counts.total, 3);
         assert_eq!(counts.active, 2);
         assert_eq!(counts.idle, 1);
+        assert_eq!(counts.waiting, 1);
+    }
+
+    #[test]
+    fn test_count_sessions_does_not_count_blockers_as_waiting() {
+        let mut blocker = create_test_session("1", "active", "");
+        blocker.blocked_count = 2;
+        let mut waiter = create_test_session("2", "active", "");
+        waiter.blocked_by_count = 1;
+
+        let counts = count_sessions(&[blocker, waiter]);
+
         assert_eq!(counts.waiting, 1);
     }
 
@@ -64,6 +77,44 @@ mod test_harness {
 
     #[test]
     #[allow(clippy::unwrap_used)]
+    fn test_sort_statement_rows_by_total_time_desc() {
+        let rows = vec![
+            vec!["q1".into(), "10".into(), "5".into(), "100".into()],
+            vec!["q2".into(), "20".into(), "2".into(), "50".into()],
+        ];
+        let sorted = sort_statement_rows(rows, "total_time");
+        assert_eq!(sorted.first().unwrap().first().unwrap(), "q2");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_sort_statement_rows_by_mean_time_desc() {
+        let rows = vec![
+            vec!["q1".into(), "10".into(), "5".into(), "100".into()],
+            vec!["q2".into(), "20".into(), "2".into(), "200".into()],
+        ];
+        let sorted = sort_statement_rows(rows, "mean_time");
+        assert_eq!(sorted.first().unwrap().first().unwrap(), "q1");
+    }
+
+    #[test]
+    fn test_format_activity_query_returns_replica_slot_label_for_walsender() {
+        let mut session = create_test_session("1", "active", "");
+        session.backend_type = "walsender".to_string();
+        session.query = "START_REPLICATION SLOT \"replica_a\" 0/0 TIMELINE 1".to_string();
+
+        assert_eq!(format_activity_query(&session), "replica replica_a");
+    }
+
+    #[test]
+    fn test_format_activity_query_preserves_regular_queries() {
+        let session = create_test_session("1", "active", "");
+
+        assert_eq!(format_activity_query(&session), "SELECT 1");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
     fn test_prepare_table_data_statements_sorting() {
         use super::super::App;
         let app = App::new(String::new(), 0, None, 1000, 10, "statements", "calls");
@@ -88,6 +139,7 @@ mod test_harness {
     fn create_test_session(pid: &str, state: &str, wait_info: &str) -> ActivitySession {
         ActivitySession {
             pid: pid.to_string(),
+            backend_type: "client backend".to_string(),
             xmin: String::new(),
             database: "db".to_string(),
             application: "app".to_string(),

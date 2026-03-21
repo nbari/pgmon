@@ -4,6 +4,7 @@ use std::{collections::VecDeque, time::Instant};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Tab {
     Activity,
+    Replication,
     Database,
     Locks,
     IO,

@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-03-21
+
+### Added
+- **New Replication View (shortcut 8)**: Added a dedicated read-only replication dashboard showing WAL senders, standby receiver status, and replication slot state.
+
+### Fixed
+- **Statements Sorting Contract**: Aligned the CLI and runtime behavior so `--sort` now consistently supports `total_time`, `mean_time`, and `calls`.
+- **Waiting Session Accuracy**: Corrected Activity waiting counts so blocking sessions are no longer misreported as waiting.
+- **Replica Query Labels**: Replaced raw `START_REPLICATION SLOT ...` activity text with compact replica labels across Activity previews.
+- **PostgreSQL Compatibility**: Extended `pg_stat_statements` compatibility to tolerate installations where block timing columns are absent while still supporting newer timing column names.
+
+### Changed
+- **Default Statements Sort**: Changed the default statements sort mode to `total_time`.
+- **Documentation Cleanup**: Removed stale references to the unimplemented `g`/`interesting` Activity subview and updated keybinding/docs for the Replication tab.
+
 ## [0.2.0] - 2026-03-21
 
 ### Added
