@@ -27,3 +27,6 @@ gha-creds-*.json
 __pycache__/
 *.pyc
 *.pyo
+
+# Local PostgreSQL credentials for manual testing
+.pgpass

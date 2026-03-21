@@ -26,7 +26,7 @@ pub fn new() -> Command {
         .long_version(long_version)
         .color(ColorChoice::Auto)
         .styles(styles)
-        .override_usage("pgmon [OPTIONS] --dsn <DSN>")
+        .override_usage("pgmon [OPTIONS] [--dsn <DSN>]")
         .after_help("For more information, visit: https://github.com/nbari/pgmon")
         .arg(
             Arg::new("dsn")
@@ -35,9 +35,25 @@ pub fn new() -> Command {
                 .aliases(["url"])
                 .value_name("STRING")
                 .help("PostgreSQL DSN (connection string)")
-                .long_help("The PostgreSQL connection string (DSN). It can be a URI-style string (e.g., postgresql://user:password@host:port/dbname) or a key=value pair string (e.g., host=localhost user=postgres).")
-                .required(true)
+                .long_help("The PostgreSQL connection string (DSN). It can be a URI-style string (e.g., postgresql://user:password@host:port/dbname) or a key=value pair string (e.g., host=localhost user=postgres). If omitted, pgmon falls back to PGMON_DSN and then to the first usable entry in PGPASSFILE or ~/.pgpass.")
                 .env("PGMON_DSN"),
+        )
+        .arg(
+            Arg::new("connect-timeout-ms")
+                .long("connect-timeout-ms")
+                .value_name("u64")
+                .help("Connection timeout in milliseconds")
+                .long_help("Set how long pgmon waits for each PostgreSQL connection attempt before failing. This applies at startup and on refresh reconnects. The value must be between 250ms and 60,000ms (1 minute).")
+                .value_parser(clap::value_parser!(u64).range(250..=60000))
+                .default_value("3000"),
+        )
+        .arg(
+            Arg::new("query-output-dir")
+                .long("query-output-dir")
+                .value_name("PATH")
+                .help("Directory used when saving queries with Enter")
+                .long_help("Set the directory used when saving a selected query from the Activity or Statements view. If omitted, pgmon writes query files into the system temporary directory.")
+                .env("PGMON_QUERY_OUTPUT_DIR"),
         )
         .arg(
             Arg::new("refresh-ms")
@@ -100,20 +116,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cli_dsn_required() {
-        // SAFETY: This is a test environment and we're ensuring PGMON_DSN is cleared.
-        unsafe {
-            std::env::remove_var("PGMON_DSN");
-        }
+    fn test_cli_accepts_pgpass_fallback_without_dsn() {
         let cmd = new();
         let matches = cmd.try_get_matches_from(vec!["pgmon"]);
-        assert!(matches.is_err());
+        assert!(matches.is_ok());
     }
 
     #[test]
     fn test_cli_default_values() {
         let cmd = new();
         let matches = cmd.get_matches_from(vec!["pgmon", "--dsn", "postgres://localhost"]);
+        assert_eq!(matches.get_one::<u64>("connect-timeout-ms"), Some(&3000));
+        assert_eq!(matches.get_one::<String>("query-output-dir"), None);
         assert_eq!(matches.get_one::<u64>("refresh-ms"), Some(&1000));
         assert_eq!(matches.get_one::<u32>("top-n"), Some(&10));
         assert_eq!(
@@ -124,8 +138,12 @@ mod tests {
 
     #[test]
     fn test_cli_range_validation() {
-        let cmd = new();
-        let matches = cmd.try_get_matches_from(vec!["pgmon", "--dsn", "x", "--refresh-ms", "100"]);
+        let matches =
+            new().try_get_matches_from(vec!["pgmon", "--dsn", "x", "--connect-timeout-ms", "100"]);
+        assert!(matches.is_err());
+
+        let matches =
+            new().try_get_matches_from(vec!["pgmon", "--dsn", "x", "--refresh-ms", "100"]);
         assert!(matches.is_err());
     }
 }

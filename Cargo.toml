@@ -1,6 +1,6 @@
 [package]
 name = "pgmon"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Nicolas Embriz <nbari@tequila.io>"]
 description = "A PostgreSQL monitoring TUI"
@@ -41,7 +41,7 @@ large_stack_arrays = "deny"
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.5", features = ["color", "env", "string"] }
+clap = { version = "4.6", features = ["color", "env", "string"] }
 chrono = "0.4"
 crossterm = { version = "0.29", features = ["events"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }
@@ -51,26 +51,25 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
 
-[package.metadata.deb]
-maintainer = "nbari"
-copyright = "2024, nbari"
-license-file = ["LICENSE", "4"]
-extended-description = """\
-A PostgreSQL monitoring TUI
-"""
-section = "utils"
-priority = "optional"
-assets = [
-    ["target/release/pgmon", "usr/bin/", "755"],
-]
-
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/pgmon", dest = "/usr/bin/pgmon", mode = "755" },
+    { source = "target/release/pgmon", dest = "/usr/local/bin/pgmon", mode = "0755" },
 ]
+
+[package.metadata.deb]
+assets = [
+    ["target/release/pgmon", "/usr/local/bin/pgmon", "755"],
+]
+depends = ""
+
 
 [build-dependencies]
 built = { version = "0.8", features = ["git2"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

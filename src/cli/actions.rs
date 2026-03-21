@@ -1,10 +1,13 @@
 use crate::tui::app::App;
 use anyhow::Result;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum Action {
     StartTui {
         dsn: String,
+        connect_timeout_ms: u64,
+        query_output_dir: Option<PathBuf>,
         refresh_ms: u64,
         top_n: u32,
         home_view: String,
@@ -17,12 +20,22 @@ impl Action {
         match self {
             Action::StartTui {
                 dsn,
+                connect_timeout_ms,
+                query_output_dir,
                 refresh_ms,
                 top_n,
                 home_view,
                 sort,
             } => {
-                let mut app = App::new(dsn, refresh_ms, top_n, &home_view, &sort);
+                let mut app = App::new(
+                    dsn,
+                    connect_timeout_ms,
+                    query_output_dir,
+                    refresh_ms,
+                    top_n,
+                    &home_view,
+                    &sort,
+                );
                 app.run()
             }
         }
