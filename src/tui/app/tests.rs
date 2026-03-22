@@ -7,8 +7,9 @@ mod test_harness {
     };
     use super::super::{
         ActivityChartMetric, ActivitySession, ActivitySubview, App, CapabilityStatus,
-        ConnectionStatus, OfflineState, PendingRequest, PendingRequestKind, QueryDetailSource,
-        QueryDetailState, QueryStats, RefreshPayload, Tab, clamp_selected_row, parse_rate_value,
+        ConnectionStatus, InputMode, OfflineState, PendingRequest, PendingRequestKind,
+        QueryDetailSource, QueryDetailState, QueryStats, RefreshPayload, Tab, clamp_selected_row,
+        parse_rate_value,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::{
@@ -490,6 +491,57 @@ mod test_harness {
     }
 
     #[test]
+    fn test_handle_key_event_opens_refresh_modal_with_restored_options() {
+        let mut app = App::new(
+            "postgres://localhost/postgres".to_string(),
+            3000,
+            None,
+            1000,
+            10,
+            "activity",
+            "total_time",
+            crate::config::Config::default(),
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+
+        let Some(modal) = app.refresh_interval_modal.as_ref() else {
+            panic!("refresh modal should open");
+        };
+        assert_eq!(
+            modal.options,
+            vec![500, 1000, 2000, 3000, 4000, 5000, 10000]
+        );
+        assert_eq!(modal.selected_index, 1);
+    }
+
+    #[test]
+    fn test_handle_key_event_refresh_modal_preselects_and_applies_500ms() {
+        let mut app = App::new(
+            "not a dsn".to_string(),
+            3000,
+            None,
+            500,
+            10,
+            "activity",
+            "total_time",
+            crate::config::Config::default(),
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+
+        let Some(modal) = app.refresh_interval_modal.as_ref() else {
+            panic!("refresh modal should open");
+        };
+        assert_eq!(modal.selected_index, 0);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.refresh_ms, 500);
+        assert!(app.refresh_interval_modal.is_none());
+    }
+
+    #[test]
     fn test_handle_key_event_cycles_activity_chart_metric() {
         let mut app = App::new(
             "postgres://localhost/postgres".to_string(),
@@ -741,6 +793,97 @@ mod test_harness {
                 .iter()
                 .any(|line| line.contains("Explain is intentionally unavailable"))
         }));
+    }
+
+    #[test]
+    fn test_handle_key_event_help_modal_includes_capability_reason() {
+        let mut app = App::new(
+            "postgres://localhost/postgres".to_string(),
+            3000,
+            None,
+            1000,
+            10,
+            "statements",
+            "total_time",
+            crate::config::Config::default(),
+        );
+        app.capabilities.statements =
+            CapabilityStatus::Unavailable("pg_stat_statements extension is missing.".to_string());
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+
+        let Some(help) = app.help_modal.as_ref() else {
+            panic!("help modal should open");
+        };
+        assert!(help.sections.iter().any(|section| {
+            section
+                .lines
+                .iter()
+                .any(|line| line.contains("pg_stat_statements extension is missing"))
+        }));
+    }
+
+    #[test]
+    fn test_handle_request_failure_refresh_tracks_offline_backoff() {
+        let mut app = App::new(
+            "postgres://localhost/postgres".to_string(),
+            3000,
+            None,
+            1000,
+            10,
+            "activity",
+            "total_time",
+            crate::config::Config::default(),
+        );
+        app.has_loaded_once = true;
+        app.last_refresh = instant_secs_ago(4);
+
+        app.handle_request_failure(
+            PendingRequestKind::Refresh,
+            "connection lost\nwith extra detail".to_string(),
+        );
+
+        let Some(offline) = app.offline_state() else {
+            panic!("refresh failure should set offline state");
+        };
+        assert_eq!(offline.last_error, "connection lost");
+        assert_eq!(offline.failed_attempts, 1);
+        assert!(offline.next_retry_at > Instant::now());
+        assert!(app.connection_health.last_error.is_some());
+        assert!(app.pg_client.is_none());
+    }
+
+    #[test]
+    fn test_can_manual_reconnect_requires_normal_mode_and_no_pending_request() {
+        let mut app = App::new(
+            "postgres://localhost/postgres".to_string(),
+            3000,
+            None,
+            1000,
+            10,
+            "activity",
+            "total_time",
+            crate::config::Config::default(),
+        );
+        app.connection_status = ConnectionStatus::Offline(OfflineState {
+            last_error: "lost".to_string(),
+            failed_attempts: 1,
+            next_retry_at: Instant::now() + Duration::from_secs(1),
+            last_successful_refresh_at: Some(instant_secs_ago(1)),
+        });
+        assert!(app.can_manual_reconnect());
+
+        app.input_mode = InputMode::Search;
+        assert!(!app.can_manual_reconnect());
+
+        app.input_mode = InputMode::Normal;
+        let (_tx, rx) = mpsc::channel();
+        app.pending_request = Some(PendingRequest {
+            kind: PendingRequestKind::Refresh,
+            rx,
+            started_at: Instant::now(),
+        });
+        assert!(!app.can_manual_reconnect());
     }
 
     #[test]

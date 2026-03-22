@@ -7,6 +7,12 @@
 
 A PostgreSQL monitoring TUI inspired by `pg_activity`.
 
+<p align="center">
+  <a href="./pgmon.png">
+    <img src="./pgmon.png" alt="pgmon screenshot" width="800">
+  </a>
+</p>
+
 ## Features
 
 - Real-time views of:

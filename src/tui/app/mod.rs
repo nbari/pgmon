@@ -653,7 +653,7 @@ impl App {
         if self.refresh_interval_modal.is_some() {
             self.refresh_interval_modal = None;
         } else {
-            let options = vec![1000, 2000, 5000, 10000];
+            let options = vec![500, 1000, 2000, 3000, 4000, 5000, 10000];
             let selected_index = options
                 .iter()
                 .position(|&ms| ms == self.refresh_ms)

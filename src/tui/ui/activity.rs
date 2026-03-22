@@ -797,3 +797,51 @@ fn activity_time_style(is_selected: bool, duration_seconds: i64, selected_style:
         Style::default().fg(Color::Red)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_chart_current_formats_rates_and_bytes() {
+        assert_eq!(format_chart_current(1.25, false), "1.2");
+        assert_eq!(format_chart_current(2048.0, true), "2.0 KiB/s");
+    }
+
+    #[test]
+    fn test_chart_max_applies_minimum_and_headroom() {
+        assert!((chart_max([0.0, 0.5].into_iter(), 1.0) - 2.0).abs() < f64::EPSILON);
+        assert!((chart_max([12.0, 18.0].into_iter(), 1.0) - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_activity_summary_columns_switches_to_two_columns_at_threshold() {
+        assert_eq!(activity_summary_columns(55), 1);
+        assert_eq!(activity_summary_columns(56), 2);
+    }
+
+    #[test]
+    fn test_activity_summary_rows_pads_last_row() {
+        assert_eq!(
+            activity_summary_rows(3, 2),
+            vec![vec![Some(0), Some(1)], vec![Some(2), None]]
+        );
+        assert!(activity_summary_rows(0, 2).is_empty());
+    }
+
+    #[test]
+    fn test_activity_time_style_uses_threshold_colors() {
+        assert_eq!(
+            activity_time_style(false, 2, Style::default()).fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            activity_time_style(false, 5, Style::default()).fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            activity_time_style(false, 12, Style::default()).fg,
+            Some(Color::Red)
+        );
+    }
+}

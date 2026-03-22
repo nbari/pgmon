@@ -455,6 +455,19 @@ mod tests {
     }
 
     #[test]
+    fn test_blank_sources_fall_back_to_next_available_value() -> Result<(), Box<dyn Error>> {
+        let resolved = resolve_dsn_from_path(
+            Some("   "),
+            Some(""),
+            Some("postgresql://env.example.com/postgres"),
+            Some(PathBuf::from("/tmp/does-not-matter.pgpass")),
+        )?;
+
+        assert_eq!(resolved, "postgresql://env.example.com/postgres");
+        Ok(())
+    }
+
+    #[test]
     fn test_resolve_dsn_from_pgpass_first_entry() -> Result<(), Box<dyn Error>> {
         let path = write_temp_pgpass(
             "db.example.com:5432:metrics:postgres:s3cret\nlocalhost:*:*:*:fallback\n",
@@ -508,6 +521,17 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_pgpass_returns_error() -> Result<(), Box<dyn Error>> {
+        let path = write_temp_pgpass("# comment only\n\n")?;
+        let result = resolve_dsn_from_path(None, None, None, Some(path.clone()));
+
+        assert!(matches!(result, Err(ResolveDsnError::EmptyPgPass { .. })));
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
     fn test_describe_connection_target() {
         use super::describe_connection_target;
 
@@ -535,6 +559,7 @@ mod tests {
             describe_connection_target("postgresql:///dbname?host=/var/run/postgresql"),
             "dbname=dbname"
         );
+        assert_eq!(describe_connection_target("not a dsn"), "PostgreSQL");
     }
 
     #[test]
