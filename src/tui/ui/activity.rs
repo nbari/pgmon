@@ -1,7 +1,9 @@
-use super::common::{format_bytes, format_duration_hms, format_uptime};
-use crate::{
-    pg::conninfo::describe_host,
-    tui::app::{ActivitySummaryMetric, ActivitySummarySection, App, format::format_activity_query},
+use crate::tui::app::{
+    ActivityChartMetric, ActivitySummaryMetric, ActivitySummarySection, App,
+    format::{
+        activity_state_cell, activity_wait_cell, format_activity_query, format_bytes,
+        format_duration_hms, format_uptime,
+    },
 };
 use ratatui::{
     Frame,
@@ -28,7 +30,7 @@ pub fn draw_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
             .split(*top);
 
         if let (Some(left), Some(right)) = (panels.first(), panels.get(1)) {
-            draw_conn_chart(f, app, *left);
+            draw_activity_chart(f, app, *left);
             draw_activity_summary_panel(f, app, *right);
         }
         draw_activity_sessions_panel(f, app, *bottom);
@@ -40,27 +42,77 @@ pub fn draw_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn draw_conn_chart(f: &mut Frame, app: &App, area: Rect) {
-    let history = &app.dashboard.conn_history;
+fn draw_activity_chart(f: &mut Frame, app: &App, area: Rect) {
+    let bounds = ChartBounds::new(area);
 
-    // Use the full chart width (minus borders) as the number of data points
-    let chart_width = area.width.saturating_sub(10) as usize;
-    let total_data = resample(history, chart_width, |&(_, _, t)| t as f64);
-    let idle_data = resample(history, chart_width, |&(_, i, _)| i as f64);
+    match app.activity_chart_metric {
+        ActivityChartMetric::Connections => {
+            draw_connections_chart(f, app, area, bounds);
+        }
+        ActivityChartMetric::Tps => draw_scalar_chart(
+            f,
+            area,
+            bounds,
+            ActivityChartMetric::Tps,
+            &app.dashboard.chart_history.tps,
+            Color::Cyan,
+            false,
+        ),
+        ActivityChartMetric::Dml => draw_dml_chart(f, app, area, bounds),
+        ActivityChartMetric::TempBytesPerSec => draw_scalar_chart(
+            f,
+            area,
+            bounds,
+            ActivityChartMetric::TempBytesPerSec,
+            &app.dashboard.chart_history.temp_bytes_per_sec,
+            Color::Magenta,
+            true,
+        ),
+        ActivityChartMetric::GrowthBytesPerSec => draw_scalar_chart(
+            f,
+            area,
+            bounds,
+            ActivityChartMetric::GrowthBytesPerSec,
+            &app.dashboard.chart_history.growth_bytes_per_sec,
+            Color::LightBlue,
+            true,
+        ),
+    }
+}
 
+#[derive(Clone, Copy)]
+struct ChartBounds {
+    width: usize,
+    x_max: f64,
+}
+
+impl ChartBounds {
+    fn new(area: Rect) -> Self {
+        let width_u16 = area.width.saturating_sub(10);
+        Self {
+            width: usize::from(width_u16),
+            x_max: f64::from(width_u16.max(1)),
+        }
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn draw_connections_chart(f: &mut Frame, app: &App, area: Rect, bounds: ChartBounds) {
+    let history = &app.dashboard.chart_history.connections;
+    let total_data = resample(history, bounds.width, |&(_, _, total)| total as f64);
+    let idle_data = resample(history, bounds.width, |&(_, idle, _)| idle as f64);
     let (_, idle_now, total_now) = history.back().copied().unwrap_or((0, 0, 0));
-
-    // auto-scale Y to observed peak + 10% headroom, minimum 10
     let observed_max = history
         .iter()
-        .map(|(_, _, t)| *t)
+        .map(|(_, _, total)| *total)
         .max()
         .unwrap_or(0)
         .max(10);
     let max_y = (observed_max as f64 * 1.1).ceil();
-    let x_max = chart_width.max(1) as f64;
-
-    // idle severity: green if low, yellow if >50%, red if >80%
     let idle_pct = if total_now > 0 {
         idle_now * 100 / total_now
     } else {
@@ -73,43 +125,256 @@ fn draw_conn_chart(f: &mut Frame, app: &App, area: Rect) {
     } else {
         Color::Green
     };
-
     let datasets = vec![
-        Dataset::default()
-            .marker(symbols::Marker::HalfBlock)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Cyan))
-            .data(&total_data),
-        Dataset::default()
-            .marker(symbols::Marker::HalfBlock)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(idle_color))
-            .data(&idle_data),
+        single_line_dataset(&total_data, Color::Cyan),
+        single_line_dataset(&idle_data, idle_color),
     ];
+    let title = Line::from(vec![
+        chart_metric_title(ActivityChartMetric::Connections),
+        Span::styled("━", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!(" total: {total_now}  "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("━", Style::default().fg(idle_color)),
+        Span::styled(
+            format!(" idle: {idle_now} ({idle_pct}%)  "),
+            Style::default().fg(idle_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("max: {} ", app.dashboard.summary.max_connections)),
+    ]);
+    render_chart(
+        f,
+        area,
+        datasets,
+        title,
+        bounds.x_max,
+        max_y,
+        chart_axis_labels(max_y, false),
+    );
+}
 
-    let mid_y = max_y / 2.0;
+fn draw_dml_chart(f: &mut Frame, app: &App, area: Rect, bounds: ChartBounds) {
+    let history = &app.dashboard.chart_history;
+    let insert_data = resample(&history.inserts_per_sec, bounds.width, |value| *value);
+    let update_data = resample(&history.updates_per_sec, bounds.width, |value| *value);
+    let delete_data = resample(&history.deletes_per_sec, bounds.width, |value| *value);
+    let insert_now = history.inserts_per_sec.back().copied().unwrap_or(0.0);
+    let update_now = history.updates_per_sec.back().copied().unwrap_or(0.0);
+    let delete_now = history.deletes_per_sec.back().copied().unwrap_or(0.0);
+    let max_y = chart_max(
+        history
+            .inserts_per_sec
+            .iter()
+            .chain(history.updates_per_sec.iter())
+            .chain(history.deletes_per_sec.iter())
+            .copied(),
+        1.0,
+    );
+    let datasets = vec![
+        single_line_dataset(&insert_data, Color::Green),
+        single_line_dataset(&update_data, Color::Yellow),
+        single_line_dataset(&delete_data, Color::Red),
+    ];
+    let title = Line::from(vec![
+        chart_metric_title(ActivityChartMetric::Dml),
+        Span::styled("━", Style::default().fg(Color::Green)),
+        Span::styled(
+            format!(" ins: {}  ", format_rate_value(insert_now)),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled("━", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!(" upd: {}  ", format_rate_value(update_now)),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled("━", Style::default().fg(Color::Red)),
+        Span::styled(
+            format!(" del: {} ", format_rate_value(delete_now)),
+            Style::default().fg(Color::Red),
+        ),
+    ]);
+    render_chart(
+        f,
+        area,
+        datasets,
+        title,
+        bounds.x_max,
+        max_y,
+        chart_axis_labels(max_y, false),
+    );
+}
 
-    let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled("━", Style::default().fg(Color::Cyan)),
-                    Span::styled(
-                        format!(" connected: {total_now}  "),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("━", Style::default().fg(idle_color)),
-                    Span::styled(
-                        format!(" idle: {idle_now} ({idle_pct}%)  "),
-                        Style::default().fg(idle_color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!("max: {} ", app.dashboard.summary.max_connections)),
-                ])),
+fn draw_scalar_chart(
+    f: &mut Frame,
+    area: Rect,
+    bounds: ChartBounds,
+    metric: ActivityChartMetric,
+    history: &std::collections::VecDeque<f64>,
+    color: Color,
+    bytes_mode: bool,
+) {
+    let data = resample(history, bounds.width, |value| *value);
+    let current = history.back().copied().unwrap_or(0.0);
+    let max_y = chart_max(history.iter().copied(), 1.0);
+    let datasets = vec![single_line_dataset(&data, color)];
+    let title = Line::from(vec![
+        chart_metric_title(metric),
+        Span::styled(
+            format!("current: {}", format_chart_current(current, bytes_mode)),
+            Style::default().fg(color),
+        ),
+    ]);
+    render_chart(
+        f,
+        area,
+        datasets,
+        title,
+        bounds.x_max,
+        max_y,
+        chart_axis_labels(max_y, bytes_mode),
+    );
+}
+
+fn chart_metric_title(metric: ActivityChartMetric) -> Span<'static> {
+    Span::styled(
+        format!(" {} (m) ", metric.label()),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn format_chart_current(value: f64, bytes_mode: bool) -> String {
+    if bytes_mode {
+        format!(
+            "{}/s",
+            format_bytes(round_to_i64_saturating(value.max(0.0)))
         )
+    } else {
+        format_rate_value(value)
+    }
+}
+
+/// Linearly interpolate history into `target_len` evenly spaced points.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn resample<T, F>(
+    history: &std::collections::VecDeque<T>,
+    target_len: usize,
+    extract: F,
+) -> Vec<(f64, f64)>
+where
+    F: Fn(&T) -> f64,
+{
+    if target_len == 0 {
+        return Vec::new();
+    }
+
+    let Some(first) = history.front() else {
+        return Vec::new();
+    };
+
+    if history.len() == 1 {
+        let v = extract(first);
+        return (0..target_len).map(|i| (i as f64, v)).collect();
+    }
+
+    let src_len = history.len();
+    (0..target_len)
+        .map(|i| {
+            let t = i as f64 / (target_len - 1).max(1) as f64;
+            let pos = t * (src_len - 1) as f64;
+            let lo = (pos as usize).min(src_len - 2);
+            let hi = lo + 1;
+            let frac = pos - lo as f64;
+            let lo_value = history.get(lo).map_or_else(|| extract(first), &extract);
+            let hi_value = history.get(hi).map_or(lo_value, &extract);
+            let v = lo_value * (1.0 - frac) + hi_value * frac;
+            (i as f64, v)
+        })
+        .collect()
+}
+
+fn single_line_dataset(data: &[(f64, f64)], color: Color) -> Dataset<'_> {
+    Dataset::default()
+        .marker(symbols::Marker::HalfBlock)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(color))
+        .data(data)
+}
+
+fn chart_max(values: impl Iterator<Item = f64>, minimum: f64) -> f64 {
+    let observed_max = values.fold(minimum, f64::max).max(minimum);
+    (observed_max * 1.1).ceil()
+}
+
+fn chart_axis_labels(max_y: f64, bytes_mode: bool) -> Vec<Span<'static>> {
+    let mid_y = max_y / 2.0;
+    vec![
+        Span::raw(format_chart_value(0.0, bytes_mode)),
+        Span::raw(format_chart_value(mid_y, bytes_mode)),
+        Span::raw(format_chart_value(max_y, bytes_mode)),
+    ]
+}
+
+fn format_chart_value(value: f64, bytes_mode: bool) -> String {
+    if bytes_mode {
+        format_bytes(round_to_i64_saturating(value.max(0.0)))
+    } else {
+        format_rate_value(value)
+    }
+}
+
+fn format_rate_value(value: f64) -> String {
+    if value < 10.0 {
+        format!("{value:.1}")
+    } else {
+        round_to_i64_saturating(value).to_string()
+    }
+}
+
+fn round_to_i64_saturating(value: f64) -> i64 {
+    const I64_MAX_F64: f64 = 9_223_372_036_854_775_807.0;
+    const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
+
+    if !value.is_finite() {
+        return 0;
+    }
+
+    let rounded = value.round();
+    if rounded >= I64_MAX_F64 {
+        return i64::MAX;
+    }
+    if rounded <= I64_MIN_F64 {
+        return i64::MIN;
+    }
+
+    format!("{rounded:.0}")
+        .parse::<i64>()
+        .unwrap_or(if rounded.is_sign_negative() {
+            i64::MIN
+        } else {
+            i64::MAX
+        })
+}
+
+fn render_chart(
+    f: &mut Frame,
+    area: Rect,
+    datasets: Vec<Dataset<'_>>,
+    title: Line<'_>,
+    x_max: f64,
+    max_y: f64,
+    y_labels: Vec<Span<'static>>,
+) {
+    let chart = Chart::new(datasets)
+        .block(Block::default().borders(Borders::ALL).title(title))
         .x_axis(
             Axis::default()
                 .style(Style::default().fg(Color::DarkGray))
@@ -119,49 +384,10 @@ fn draw_conn_chart(f: &mut Frame, app: &App, area: Rect) {
             Axis::default()
                 .style(Style::default().fg(Color::DarkGray))
                 .bounds([0.0, max_y])
-                .labels(vec![
-                    Span::raw("0"),
-                    Span::raw(format!("{}", mid_y as i64)),
-                    Span::raw(format!("{}", max_y as i64)),
-                ]),
+                .labels(y_labels),
         );
 
     f.render_widget(chart, area);
-}
-
-/// Linearly interpolate history into `target_len` evenly spaced points.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn resample<F>(
-    history: &std::collections::VecDeque<(i64, i64, i64)>,
-    target_len: usize,
-    extract: F,
-) -> Vec<(f64, f64)>
-where
-    F: Fn(&(i64, i64, i64)) -> f64,
-{
-    if history.is_empty() || target_len == 0 {
-        return Vec::new();
-    }
-    if history.len() == 1 {
-        let v = extract(&history[0]);
-        return (0..target_len).map(|i| (i as f64, v)).collect();
-    }
-    let src_len = history.len();
-    (0..target_len)
-        .map(|i| {
-            let t = i as f64 / (target_len - 1).max(1) as f64;
-            let pos = t * (src_len - 1) as f64;
-            let lo = (pos as usize).min(src_len - 2);
-            let hi = lo + 1;
-            let frac = pos - lo as f64;
-            let v = extract(&history[lo]) * (1.0 - frac) + extract(&history[hi]) * frac;
-            (i as f64, v)
-        })
-        .collect()
 }
 
 fn draw_activity_summary_panel(f: &mut Frame, app: &App, area: Rect) {
@@ -191,6 +417,21 @@ fn draw_activity_summary_panel(f: &mut Frame, app: &App, area: Rect) {
 
 fn activity_summary_meta_row(app: &App) -> Line<'static> {
     let summary = &app.dashboard.summary;
+    let latency = app.connection_last_refresh_duration().map_or_else(
+        || "Latency -".to_string(),
+        |duration| format!("Latency {}ms", duration.as_millis()),
+    );
+    let status = if app.is_offline() {
+        let retry_in = app
+            .offline_retry_remaining()
+            .map_or(0, |duration| duration.as_secs());
+        format!("Offline (retry {retry_in}s)")
+    } else {
+        let last_ok = app
+            .connection_last_refresh_elapsed()
+            .map_or(0, |duration| duration.as_secs());
+        format!("Last ok {last_ok}s ago")
+    };
 
     Line::from(vec![
         Span::styled(
@@ -200,14 +441,19 @@ fn activity_summary_meta_row(app: &App) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(describe_host(&app.dsn), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            app.connection_target().to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("Refresh(r) {}ms", app.refresh_ms),
             Style::default().fg(Color::White),
         ),
         Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Duration: query", Style::default().fg(Color::White)),
+        Span::styled(latency, Style::default().fg(Color::White)),
+        Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(status, Style::default().fg(Color::White)),
     ])
 }
 
@@ -536,26 +782,6 @@ fn draw_activity_sessions_panel(f: &mut Frame, app: &mut App, area: Rect) {
         .row_highlight_style(Style::default().fg(Color::Black).bg(Color::White));
 
     f.render_stateful_widget(table, area, &mut app.table_state);
-}
-
-fn activity_wait_cell(session: &crate::pg::client::ActivitySession) -> String {
-    if session.blocked_count > 0 {
-        format!("blocking {}", session.blocked_count)
-    } else if session.blocked_by_count > 0 {
-        format!("blocked by {}", session.blocked_by_count)
-    } else if session.wait_info.is_empty() {
-        "-".to_string()
-    } else {
-        session.wait_info.clone()
-    }
-}
-
-fn activity_state_cell(session: &crate::pg::client::ActivitySession) -> String {
-    if session.blocked_count > 0 {
-        format!("blocking | {}", session.state)
-    } else {
-        session.state.clone()
-    }
 }
 
 fn activity_time_style(is_selected: bool, duration_seconds: i64, selected_style: Style) -> Style {

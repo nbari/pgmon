@@ -9,6 +9,24 @@ use chrono::{DateTime, Utc};
 use postgres::{Client, Config, NoTls};
 use std::time::Duration;
 
+/// Availability state for optional `PostgreSQL` monitoring features.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum CapabilityStatus {
+    /// The capability has not been checked yet in this session.
+    #[default]
+    Unknown,
+    /// The capability is available and the view can be populated normally.
+    Available,
+    /// The capability is unavailable together with a user-facing reason.
+    Unavailable(String),
+}
+
+impl CapabilityStatus {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable(reason.into())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ActivitySnapshot {
     pub(crate) summary: ActivitySummarySnapshot,
@@ -72,6 +90,7 @@ pub(crate) struct ActivitySession {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReplicationSnapshot {
+    pub(crate) capability: CapabilityStatus,
     pub(crate) receiver_summary: Option<String>,
     pub(crate) senders: Vec<ReplicationSender>,
     pub(crate) slots: Vec<ReplicationSlot>,
@@ -105,6 +124,15 @@ pub(crate) struct ReplicationSlot {
 
 pub struct PgClient {
     client: Client,
+    capability_cache: CapabilityCache,
+}
+
+#[derive(Debug, Default)]
+struct CapabilityCache {
+    io: Option<CapabilityStatus>,
+    statements: Option<CapabilityStatus>,
+    replication: CapabilityStatus,
+    statements_query: Option<String>,
 }
 
 impl std::fmt::Debug for PgClient {
@@ -123,6 +151,11 @@ impl PgClient {
         let mut config = config_from_dsn(dsn, connect_timeout_ms)?;
         config.dbname(database);
         Self::connect(&config, dsn)
+    }
+
+    pub fn execute_admin_action(&mut self, query: &str) -> Result<()> {
+        self.client.simple_query(query)?;
+        Ok(())
     }
 
     pub fn fetch_database_stats(&mut self) -> Result<Vec<Vec<String>>> {
@@ -178,16 +211,8 @@ impl PgClient {
     }
 
     pub fn fetch_io_stats(&mut self) -> Result<Vec<Vec<String>>> {
-        if !self.view_exists("pg_stat_io")? {
-            return Ok(vec![vec![
-                "pg_stat_io not available (PG 16+ required)".to_string(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ]]);
+        if let CapabilityStatus::Unavailable(_) = self.ensure_io_capability()? {
+            return Ok(Vec::new());
         }
         let rows = self.client.query(IO_QUERY, &[])?;
         rows.into_iter()
@@ -206,46 +231,19 @@ impl PgClient {
     }
 
     pub fn fetch_statements(&mut self) -> Result<Vec<Vec<String>>> {
-        if !self.extension_exists("pg_stat_statements")? {
-            return Ok(vec![vec!["pg_stat_statements not installed".to_string()]]);
-        }
-
-        let total_time_column = if self.column_exists("pg_stat_statements", "total_exec_time")? {
-            "total_exec_time"
-        } else {
-            "total_time"
+        let Some(query) = self.ensure_statements_query()? else {
+            return Ok(Vec::new());
         };
-        let mean_time_column = if self.column_exists("pg_stat_statements", "mean_exec_time")? {
-            "mean_exec_time"
-        } else {
-            "mean_time"
-        };
-        let blk_read_time_expr =
-            if self.column_exists("pg_stat_statements", "shared_blk_read_time")? {
-                "COALESCE(shared_blk_read_time, 0)::float8"
-            } else {
-                "0::float8"
-            };
-        let blk_write_time_expr =
-            if self.column_exists("pg_stat_statements", "shared_blk_write_time")? {
-                "COALESCE(shared_blk_write_time, 0)::float8"
-            } else {
-                "0::float8"
-            };
-        let query = build_statements_query(
-            total_time_column,
-            mean_time_column,
-            blk_read_time_expr,
-            blk_write_time_expr,
-        );
 
         let rows = match self.client.query(query.as_str(), &[]) {
             Ok(r) => r,
             Err(e) => {
                 if e.to_string().contains("shared_preload_libraries") {
-                    return Ok(vec![vec![
-                        "pg_stat_statements library not loaded".to_string(),
-                    ]]);
+                    self.capability_cache.statements = Some(CapabilityStatus::unavailable(
+                        "pg_stat_statements extension exists, but shared_preload_libraries does not load it.",
+                    ));
+                    self.capability_cache.statements_query = None;
+                    return Ok(Vec::new());
                 }
                 return Err(e.into());
             }
@@ -253,6 +251,7 @@ impl PgClient {
         rows.into_iter()
             .map(|row| {
                 Ok(vec![
+                    row.try_get::<_, String>(6)?,
                     row.try_get::<_, String>(0)?,
                     row.try_get::<_, f64>(1)?.to_string(),
                     row.try_get::<_, f64>(2)?.to_string(),
@@ -262,6 +261,72 @@ impl PgClient {
                 ])
             })
             .collect()
+    }
+
+    pub fn fetch_explain_plan(&mut self, query: &str) -> Result<Vec<String>> {
+        use postgres::SimpleQueryMessage;
+        // Simple query protocol is used here because it doesn't try to parse parameters ($1, $2)
+        // on the client side, allowing us to send the raw query string to Postgres.
+        let explain_query = format!("EXPLAIN (ANALYZE, BUFFERS) {query}");
+        let messages = self.client.simple_query(&explain_query)?;
+        let mut plan = Vec::new();
+        for msg in messages {
+            if let SimpleQueryMessage::Row(row) = msg {
+                plan.push(row.get(0).unwrap_or_default().to_string());
+            }
+        }
+        Ok(plan)
+    }
+
+    pub fn fetch_table_definition(
+        &mut self,
+        schema: &str,
+        table: &str,
+    ) -> Result<(Vec<Vec<String>>, Vec<String>)> {
+        let col_query = r"
+            SELECT 
+                column_name, 
+                data_type, 
+                COALESCE(character_maximum_length::text, ''), 
+                is_nullable, 
+                COALESCE(column_default, '')
+            FROM information_schema.columns 
+            WHERE table_schema = $1 AND table_name = $2
+            ORDER BY ordinal_position
+        ";
+
+        let columns = self
+            .client
+            .query(col_query, &[&schema, &table])?
+            .into_iter()
+            .map(|row| {
+                Ok(vec![
+                    row.try_get::<_, String>(0)?,
+                    row.try_get::<_, String>(1)?,
+                    row.try_get::<_, String>(2)?,
+                    row.try_get::<_, String>(3)?,
+                    row.try_get::<_, String>(4)?,
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let idx_query = r"
+            SELECT pg_get_indexdef(indexrelid)
+            FROM pg_index
+            WHERE indrelid = ($1 || '.' || $2)::regclass
+        ";
+
+        let quoted_schema = format!("\"{schema}\"");
+        let quoted_table = format!("\"{table}\"");
+
+        let indexes = self
+            .client
+            .query(idx_query, &[&quoted_schema, &quoted_table])?
+            .into_iter()
+            .map(|row| row.try_get::<_, String>(0))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok((columns, indexes))
     }
 
     pub fn fetch_replication_snapshot(&mut self) -> Result<ReplicationSnapshot> {
@@ -321,11 +386,32 @@ impl PgClient {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let capability = detect_replication_capability(
+            &mut self.client,
+            receiver_summary.as_ref(),
+            &senders,
+            &slots,
+        )?;
+        self.capability_cache.replication = capability.clone();
+
         Ok(ReplicationSnapshot {
+            capability,
             receiver_summary,
             senders,
             slots,
         })
+    }
+
+    pub(crate) fn io_capability(&self) -> CapabilityStatus {
+        self.capability_cache.io.clone().unwrap_or_default()
+    }
+
+    pub(crate) fn statements_capability(&self) -> CapabilityStatus {
+        self.capability_cache.statements.clone().unwrap_or_default()
+    }
+
+    pub(crate) fn replication_capability(&self) -> CapabilityStatus {
+        self.capability_cache.replication.clone()
     }
 
     pub fn fetch_activity_snapshot(&mut self) -> Result<ActivitySnapshot> {
@@ -409,6 +495,9 @@ impl PgClient {
                     row.try_get::<_, String>(2)?,
                     row.try_get::<_, i64>(3)?.to_string(),
                     row.try_get::<_, String>(4)?,
+                    row.try_get::<_, String>(0)?, // schema
+                    row.try_get::<_, Option<String>>(1)?.unwrap_or_default(), // table
+                    depth.to_string(),
                 ])
             })
             .collect()
@@ -427,11 +516,6 @@ impl PgClient {
                 ])
             })
             .collect()
-    }
-
-    pub fn execute_query(&mut self, query: &str) -> Result<u64> {
-        let result = self.client.execute(query, &[])?;
-        Ok(result)
     }
 
     fn extension_exists(&mut self, name: &str) -> Result<bool> {
@@ -463,7 +547,79 @@ impl PgClient {
                 describe_connection_target(dsn)
             )
         })?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            capability_cache: CapabilityCache::default(),
+        })
+    }
+
+    fn ensure_io_capability(&mut self) -> Result<CapabilityStatus> {
+        if let Some(status) = self.capability_cache.io.as_ref() {
+            return Ok(status.clone());
+        }
+
+        let status = if self.view_exists("pg_stat_io")? {
+            CapabilityStatus::Available
+        } else {
+            CapabilityStatus::unavailable(
+                "pg_stat_io is not available on this server (PostgreSQL 16+ required).",
+            )
+        };
+        self.capability_cache.io = Some(status.clone());
+        Ok(status)
+    }
+
+    fn ensure_statements_query(&mut self) -> Result<Option<String>> {
+        if let Some(status) = self.capability_cache.statements.as_ref()
+            && matches!(status, CapabilityStatus::Unavailable(_))
+        {
+            return Ok(None);
+        }
+
+        if let Some(query) = self.capability_cache.statements_query.as_ref() {
+            self.capability_cache.statements = Some(CapabilityStatus::Available);
+            return Ok(Some(query.clone()));
+        }
+
+        if !self.extension_exists("pg_stat_statements")? {
+            self.capability_cache.statements = Some(CapabilityStatus::unavailable(
+                "pg_stat_statements is not installed in the current database.",
+            ));
+            return Ok(None);
+        }
+
+        let total_time_column = if self.column_exists("pg_stat_statements", "total_exec_time")? {
+            "total_exec_time"
+        } else {
+            "total_time"
+        };
+        let mean_time_column = if self.column_exists("pg_stat_statements", "mean_exec_time")? {
+            "mean_exec_time"
+        } else {
+            "mean_time"
+        };
+        let blk_read_time_expr =
+            if self.column_exists("pg_stat_statements", "shared_blk_read_time")? {
+                "COALESCE(s.shared_blk_read_time, 0)::float8"
+            } else {
+                "0::float8"
+            };
+        let blk_write_time_expr =
+            if self.column_exists("pg_stat_statements", "shared_blk_write_time")? {
+                "COALESCE(s.shared_blk_write_time, 0)::float8"
+            } else {
+                "0::float8"
+            };
+
+        let query = build_statements_query(
+            total_time_column,
+            mean_time_column,
+            blk_read_time_expr,
+            blk_write_time_expr,
+        );
+        self.capability_cache.statements_query = Some(query.clone());
+        self.capability_cache.statements = Some(CapabilityStatus::Available);
+        Ok(Some(query))
     }
 }
 
@@ -504,6 +660,33 @@ fn format_receiver_summary(
     parts.join(" | ")
 }
 
+fn detect_replication_capability(
+    client: &mut Client,
+    receiver_summary: Option<&String>,
+    senders: &[ReplicationSender],
+    slots: &[ReplicationSlot],
+) -> Result<CapabilityStatus> {
+    if receiver_summary.is_some() || !senders.is_empty() || !slots.is_empty() {
+        return Ok(CapabilityStatus::Available);
+    }
+
+    let settings = client.query_one(
+        "SELECT current_setting('max_wal_senders')::bigint, current_setting('max_replication_slots')::bigint, pg_is_in_recovery()",
+        &[],
+    )?;
+    let max_wal_senders = settings.try_get::<_, i64>(0)?;
+    let max_replication_slots = settings.try_get::<_, i64>(1)?;
+    let in_recovery = settings.try_get::<_, bool>(2)?;
+
+    if in_recovery || max_wal_senders > 0 || max_replication_slots > 0 {
+        Ok(CapabilityStatus::Available)
+    } else {
+        Ok(CapabilityStatus::unavailable(
+            "Replication is disabled on this server (max_wal_senders=0, max_replication_slots=0).",
+        ))
+    }
+}
+
 fn build_statements_query(
     total_time_column: &str,
     mean_time_column: &str,
@@ -513,14 +696,16 @@ fn build_statements_query(
     format!(
         r"
 SELECT 
-    COALESCE(regexp_replace(query, '\s+', ' ', 'g'), '') as query, 
-    COALESCE({total_time_column}, 0)::float8 as total_time, 
-    COALESCE({mean_time_column}, 0)::float8 as mean_time, 
-    COALESCE(calls, 0)::bigint as calls, 
+    COALESCE(regexp_replace(s.query, '\s+', ' ', 'g'), '') as query, 
+    COALESCE(s.{total_time_column}, 0)::float8 as total_time, 
+    COALESCE(s.{mean_time_column}, 0)::float8 as mean_time, 
+    COALESCE(s.calls, 0)::bigint as calls, 
     {blk_read_time_expr} as blk_read_time, 
-    {blk_write_time_expr} as blk_write_time
-FROM pg_stat_statements
-ORDER BY {total_time_column} DESC
+    {blk_write_time_expr} as blk_write_time,
+    COALESCE(d.datname, '') as datname
+FROM pg_stat_statements s
+LEFT JOIN pg_database d ON d.oid = s.dbid
+ORDER BY s.{total_time_column} DESC
 LIMIT 500
 "
     )
@@ -535,13 +720,13 @@ mod tests {
         let query = build_statements_query(
             "total_exec_time",
             "mean_exec_time",
-            "COALESCE(shared_blk_read_time, 0)::float8",
-            "COALESCE(shared_blk_write_time, 0)::float8",
+            "COALESCE(s.shared_blk_read_time, 0)::float8",
+            "COALESCE(s.shared_blk_write_time, 0)::float8",
         );
 
-        assert!(query.contains("COALESCE(total_exec_time, 0)::float8 as total_time"));
-        assert!(query.contains("COALESCE(mean_exec_time, 0)::float8 as mean_time"));
-        assert!(query.contains("ORDER BY total_exec_time DESC"));
+        assert!(query.contains("COALESCE(s.total_exec_time, 0)::float8 as total_time"));
+        assert!(query.contains("COALESCE(s.mean_exec_time, 0)::float8 as mean_time"));
+        assert!(query.contains("ORDER BY s.total_exec_time DESC"));
     }
 
     #[test]
@@ -555,6 +740,7 @@ mod tests {
 
         assert!(query.contains("0::float8 as blk_read_time"));
         assert!(query.contains("0::float8 as blk_write_time"));
+        assert!(!query.contains("s.0::float8"));
     }
 
     #[test]

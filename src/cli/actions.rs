@@ -1,5 +1,6 @@
+use crate::config::Config;
 use crate::tui::app::App;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -12,6 +13,11 @@ pub enum Action {
         top_n: u32,
         home_view: String,
         sort: String,
+        config: Box<Config>,
+    },
+    CheckConfig {
+        report: String,
+        success: bool,
     },
 }
 
@@ -26,6 +32,7 @@ impl Action {
                 top_n,
                 home_view,
                 sort,
+                config,
             } => {
                 let mut app = App::new(
                     dsn,
@@ -35,8 +42,18 @@ impl Action {
                     top_n,
                     &home_view,
                     &sort,
+                    *config,
                 );
                 app.run()
+            }
+            Action::CheckConfig { report, success } => {
+                if success {
+                    println!("{report}");
+                    Ok(())
+                } else {
+                    eprintln!("{report}");
+                    Err(anyhow!("Configuration check failed."))
+                }
             }
         }
     }

@@ -1,6 +1,176 @@
-use super::state::{ActivityDisplaySummary, ActivityRates, ActivitySubview, SessionCounts};
-use crate::pg::client::{ActivityProcessSnapshot, ActivitySession, ActivitySummarySnapshot};
+use super::state::{
+    ActivityDisplaySummary, ActivityRates, ActivitySubview, DatabaseView, SessionCounts, Tab,
+};
+use crate::pg::client::{
+    ActivityProcessSnapshot, ActivitySession, ActivitySummarySnapshot, ReplicationSender,
+    ReplicationSlot,
+};
 use chrono::Utc;
+
+pub(crate) fn table_header_cells(tab: Tab, database_view: &DatabaseView) -> Vec<&'static str> {
+    match tab {
+        Tab::Activity => vec![
+            "PID", "XMIN", "Database", "App", "User", "Client", "Time+", "Waiting", "State",
+            "Query",
+        ],
+        Tab::Database => match database_view {
+            DatabaseView::Summary => vec![
+                "DB",
+                "Backends",
+                "Commits",
+                "Rollbacks",
+                "Hit %",
+                "Temp Bytes",
+                "Deadlocks",
+                "Reset",
+            ],
+            DatabaseView::Tables { .. } => vec!["Node", "Type", "Children/Rows", "Size"],
+        },
+        Tab::Locks => vec![
+            "Blocking PID",
+            "Blocked PID",
+            "User",
+            "Target",
+            "Mode",
+            "Time(s)",
+            "Query",
+        ],
+        Tab::IO => vec![
+            "Backend",
+            "Object",
+            "Context",
+            "Reads",
+            "Writes",
+            "Time Read(ms)",
+            "Time Write(ms)",
+        ],
+        Tab::Statements => vec![
+            "DB",
+            "Query",
+            "Total(ms)",
+            "Mean(ms)",
+            "Calls",
+            "Read(ms)",
+            "Write(ms)",
+        ],
+        Tab::Tools => vec!["Action", "Description"],
+        Tab::Replication => vec![
+            "PID",
+            "User",
+            "App",
+            "Client",
+            "State",
+            "Sync",
+            "Slot",
+            "Sent Lag",
+            "Write Lag",
+            "Flush Lag",
+            "Replay Lag",
+        ],
+        Tab::Settings => vec!["Name", "Value", "Unit", "Category", "Description"],
+    }
+}
+
+pub(crate) fn format_duration_hms(duration_seconds: i64) -> String {
+    let duration_seconds = duration_seconds.max(0);
+    let hours = duration_seconds / 3600;
+    let minutes = (duration_seconds % 3600) / 60;
+    let seconds = duration_seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+pub(crate) fn format_uptime(uptime_seconds: i64) -> String {
+    let uptime_seconds = uptime_seconds.max(0);
+    let days = uptime_seconds / 86_400;
+    let hours = (uptime_seconds % 86_400) / 3600;
+    let minutes = (uptime_seconds % 3600) / 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+pub(crate) fn format_bytes(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    let negative = bytes < 0;
+    let absolute = u128::from(bytes.unsigned_abs());
+    let mut unit_index = 0usize;
+    let mut divisor = 1u128;
+
+    while unit_index + 1 < UNITS.len() && absolute >= divisor * 1024 {
+        divisor *= 1024;
+        unit_index += 1;
+    }
+
+    let unit = UNITS.get(unit_index).copied().unwrap_or("B");
+    let sign = if negative { "-" } else { "" };
+
+    if unit_index == 0 {
+        format!("{sign}{absolute} {unit}")
+    } else {
+        let scaled_tenths = absolute.saturating_mul(10) / divisor;
+        let whole = scaled_tenths / 10;
+        let tenths = scaled_tenths % 10;
+        format!("{sign}{whole}.{tenths} {unit}")
+    }
+}
+
+pub(crate) fn activity_wait_cell(session: &ActivitySession) -> String {
+    if session.blocked_count > 0 {
+        format!("blocking {}", session.blocked_count)
+    } else if session.blocked_by_count > 0 {
+        format!("blocked by {}", session.blocked_by_count)
+    } else if session.wait_info.is_empty() {
+        "-".to_string()
+    } else {
+        session.wait_info.clone()
+    }
+}
+
+pub(crate) fn activity_state_cell(session: &ActivitySession) -> String {
+    if session.blocked_count > 0 {
+        format!("blocking | {}", session.state)
+    } else {
+        session.state.clone()
+    }
+}
+
+pub(crate) fn sender_to_row(sender: &ReplicationSender) -> Vec<String> {
+    vec![
+        sender.pid.clone(),
+        sender.user.clone(),
+        sender.application.clone(),
+        sender.client.clone(),
+        sender.state.clone(),
+        sender.sync_state.clone(),
+        sender.slot_name.clone(),
+        format_bytes(sender.sent_lag_bytes),
+        format_bytes(sender.write_lag_bytes),
+        format_bytes(sender.flush_lag_bytes),
+        format_bytes(sender.replay_lag_bytes),
+    ]
+}
+
+pub(crate) fn slot_to_row(slot: &ReplicationSlot) -> Vec<String> {
+    vec![
+        slot.slot_name.clone(),
+        slot.slot_type.clone(),
+        slot.active.clone(),
+        slot.active_pid.clone(),
+        slot.restart_lsn.clone(),
+        slot.confirmed_flush_lsn.clone(),
+        slot.wal_status.clone(),
+    ]
+}
+
+pub(crate) fn is_normalized_query(query: &str) -> bool {
+    query.contains('$') && query.chars().any(|c| c.is_ascii_digit())
+}
 
 pub(crate) struct ActivityCounterSample {
     pub(crate) total_xacts: i64,

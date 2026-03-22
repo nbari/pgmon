@@ -1,4 +1,16 @@
-# Repository Guidelines
+# AGENTS.md
+
+These guidelines are mandatory for contributors and for any AI coding agent
+operating in this repository. The goal is to land changes safely, keep security
+invariants intact, and keep the workspace consistent over time.
+
+## Agent Contract (Read First)
+- Follow this file strictly. If a request conflicts with these rules, explain the conflict and propose a compliant alternative.
+- Keep diffs minimal: do not refactor, rename, reorder, or "clean up" unrelated code.
+- Do not change authentication, authorization, token semantics, or trust boundaries unless explicitly requested.
+- Do not weaken validation, scope checks, rate/risk controls, TLS verification, or logging hygiene.
+- If you are unsure about an invariant, prefer asking for context or leaving behavior unchanged with a clear note.
+- Do not hardcode configuration values.
 
 ## Project Structure & Module Organization
 `pgmon` is a small Rust CLI/TUI application. Core code lives in `src/`:

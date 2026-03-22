@@ -1,6 +1,6 @@
 [package]
 name = "pgmon"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Nicolas Embriz <nbari@tequila.io>"]
 description = "A PostgreSQL monitoring TUI"
@@ -50,6 +50,11 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+dirs = "6.0"
+csv = "1.4"
+serde_json = "1.0"
 
 [package.metadata.generate-rpm]
 assets = [

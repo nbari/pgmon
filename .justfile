@@ -14,7 +14,7 @@ fmt:
 
 # Start a PostgreSQL 18 container (includes pg_stat_io)
 up:
-    podman run --name pgmon-test -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:18 postgres -c 'shared_preload_libraries=pg_stat_statements'
+    podman run --name pgmon-test --replace -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:18 postgres -c 'shared_preload_libraries=pg_stat_statements'
     @echo "Waiting for Postgres to start..."
     @sleep 5
     podman exec pgmon-test psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"

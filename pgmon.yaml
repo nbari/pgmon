@@ -1,0 +1,27 @@
+---
+# Example pgmon configuration.
+#
+# The `local` connection below matches the default local PostgreSQL DSN used in
+# the README examples, so running `pgmon` or `pgmon local` works out of the box
+# when a local server is available on the default socket/TCP settings.
+default_connection: local
+theme: my_theme
+connections:
+  local:
+    dsn: postgresql://postgres:postgres@localhost:5432/postgres
+  staging:
+    dsn: host=staging-db dbname=postgres user=pgmon password=secret
+  prod:
+    dsn: postgresql://pgmon@prod.example.com/postgres
+themes:
+  my_theme:
+    ui:
+      header_border_color: '#95a8b8'
+      footer_border_color: '#98aaa4'
+    views:
+      settings:
+        colors:
+          value: '#b4a9b7'
+ui:
+  show_controls: true
+  default_export_format: csv

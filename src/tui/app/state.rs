@@ -1,23 +1,112 @@
-use crate::pg::client::{ActivityProcessSnapshot, ActivitySession};
-use std::{collections::VecDeque, time::Instant};
+use crate::pg::client::{ActivityProcessSnapshot, ActivitySession, CapabilityStatus};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Tab {
     Activity,
-    Replication,
     Database,
     Locks,
     IO,
     Statements,
-    Tools,
+    Replication,
     Settings,
+    Tools,
+}
+
+impl Tab {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Activity => Self::Database,
+            Self::Database => Self::Locks,
+            Self::Locks => Self::IO,
+            Self::IO => Self::Statements,
+            Self::Statements => Self::Replication,
+            Self::Replication => Self::Settings,
+            Self::Settings => Self::Tools,
+            Self::Tools => Self::Activity,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Activity => Self::Tools,
+            Self::Database => Self::Activity,
+            Self::Locks => Self::Database,
+            Self::IO => Self::Locks,
+            Self::Statements => Self::IO,
+            Self::Replication => Self::Statements,
+            Self::Settings => Self::Replication,
+            Self::Tools => Self::Settings,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Activity => "Activity",
+            Self::Database => "Database",
+            Self::Locks => "Locks",
+            Self::IO => "IO",
+            Self::Statements => "Statements",
+            Self::Replication => "Replication",
+            Self::Settings => "Settings",
+            Self::Tools => "Tools",
+        }
+    }
 }
 
 #[derive(Clone, Default)]
 pub struct DashboardStats {
     pub summary: ActivityDisplaySummary,
     pub sessions: Vec<ActivitySession>,
-    pub conn_history: VecDeque<(i64, i64, i64)>,
+    pub chart_history: ActivityChartHistory,
+}
+
+/// Metrics that can be rendered in the Activity chart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActivityChartMetric {
+    #[default]
+    Connections,
+    Tps,
+    Dml,
+    TempBytesPerSec,
+    GrowthBytesPerSec,
+}
+
+impl ActivityChartMetric {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Connections => Self::Tps,
+            Self::Tps => Self::Dml,
+            Self::Dml => Self::TempBytesPerSec,
+            Self::TempBytesPerSec => Self::GrowthBytesPerSec,
+            Self::GrowthBytesPerSec => Self::Connections,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Connections => "Connections",
+            Self::Tps => "TPS",
+            Self::Dml => "DML/s",
+            Self::TempBytesPerSec => "Temp Bytes/s",
+            Self::GrowthBytesPerSec => "Growth Bytes/s",
+        }
+    }
+}
+
+/// Session-scoped sampled history for the Activity chart.
+#[derive(Clone, Default)]
+pub struct ActivityChartHistory {
+    pub connections: VecDeque<(i64, i64, i64)>,
+    pub tps: VecDeque<f64>,
+    pub inserts_per_sec: VecDeque<f64>,
+    pub updates_per_sec: VecDeque<f64>,
+    pub deletes_per_sec: VecDeque<f64>,
+    pub temp_bytes_per_sec: VecDeque<f64>,
+    pub growth_bytes_per_sec: VecDeque<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +119,55 @@ pub struct LoadingState {
 pub struct ErrorState {
     pub title: String,
     pub details: String,
+}
+
+/// Connection metadata shown when background refreshes are failing.
+#[derive(Debug, Clone)]
+pub struct OfflineState {
+    /// Most recent refresh error summarized for footer display.
+    pub last_error: String,
+    /// Number of consecutive failed refresh attempts.
+    pub failed_attempts: u32,
+    /// Earliest time a background reconnect may be attempted.
+    pub next_retry_at: Instant,
+    /// Timestamp of the last successful refresh, if any.
+    pub last_successful_refresh_at: Option<Instant>,
+}
+
+/// Current connection health for the running TUI session.
+#[derive(Debug, Clone, Default)]
+pub enum ConnectionStatus {
+    /// Background refreshes are succeeding.
+    #[default]
+    Online,
+    /// Background refreshes are failing and the app is retrying.
+    Offline(OfflineState),
+}
+
+/// Capability availability for optional monitoring views.
+#[derive(Debug, Clone, Default)]
+pub struct CapabilitySummary {
+    /// Availability of the `Statements` view.
+    pub statements: CapabilityStatus,
+    /// Availability of the `IO` view.
+    pub io: CapabilityStatus,
+    /// Availability of replication monitoring.
+    pub replication: CapabilityStatus,
+}
+
+/// Connection target and recent refresh/error timings shown in the UI.
+#[derive(Debug, Clone)]
+pub struct ConnectionHealthState {
+    /// Human-readable target derived from the DSN without exposing secrets.
+    pub target: String,
+    /// Duration of the most recent successful background refresh.
+    pub last_refresh_duration: Option<Duration>,
+    /// Completion timestamp of the most recent successful background refresh.
+    pub last_refresh_at: Option<Instant>,
+    /// Summary of the most recent background refresh failure.
+    pub last_error: Option<String>,
+    /// Timestamp of the most recent background refresh failure.
+    pub last_error_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,13 +274,44 @@ pub struct NoticeState {
 }
 
 #[derive(Debug, Clone)]
-pub struct StatementDetailState {
+pub struct QueryDetailState {
     pub query: String,
+    pub database: String,
+    pub source: QueryDetailSource,
+    pub stats: Option<QueryStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryDetailSource {
+    Activity,
+    Statements,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryStats {
     pub total_time: String,
     pub mean_time: String,
     pub calls: String,
     pub read_time: String,
     pub write_time: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplainPlanState {
+    pub plan: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TableDefinitionState {
+    pub schema: String,
+    pub name: String,
+    pub columns: Vec<Vec<String>>,
+    pub indexes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeadlockGraphState {
+    pub graph: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,4 +337,24 @@ pub struct RefreshIntervalState {
 pub struct TopNState {
     pub options: Vec<u32>,
     pub selected_index: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThemeState {
+    /// Available theme names loaded from configuration.
+    pub options: Vec<String>,
+    /// Currently highlighted theme in the picker modal.
+    pub selected_index: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct HelpSection {
+    pub heading: String,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HelpState {
+    pub title: String,
+    pub sections: Vec<HelpSection>,
 }

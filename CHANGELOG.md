@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-03-22
+
+### Added
+- **Configuration & Validation**: Added `pgmon.yaml` / `pgmon.yml` support for aliases, default connections, export defaults, custom themes, and a new `pgmon check-config` command to validate config loading and connection resolution without starting the TUI.
+- **Themes**: Added built-in themes (`calibrachoa`, `sky`, `mint`, `retro`) plus runtime theme switching from inside the TUI.
+- **Contextual Help Overlay**: Added `?` to open per-view in-app help with shortcuts, metric definitions, and capability/Explain limitations.
+- **Database Admin Actions**: Added context-aware `VACUUM ANALYZE`, `REINDEX`, and table-definition inspection from the Database tree view.
+- **Activity Chart Switching**: Added `m` to cycle the Activity chart between Connections, TPS, DML/s, Temp Bytes/s, and Growth Bytes/s.
+
+### Fixed
+- **Explain Availability**: Restricted `EXPLAIN (ANALYZE, BUFFERS)` to query inspection opened from `Activity`, and prevented execution for normalized SQL without literal values.
+- **Statements and Export UX**: Removed unavailable actions from views where they created noise, including `Explain` from `Statements` and export from non-primary views.
+- **Replication Empty State**: Reworked the Replication view to show a clear capability/status panel instead of misaligned empty panels when replication is not enabled.
+- **Reconnect Behavior**: Kept the last successful data on screen after transient refresh failures, added retry backoff, and preserved a manual reconnect path.
+- **Capability Messaging**: Replaced synthetic placeholder rows with explicit availability panels for `pg_stat_statements`, `pg_stat_io`, and replication features.
+
+### Changed
+- **Activity Summary & Footer Layout**: Simplified the Activity summary metadata row and reduced footer duplication so connection identity, offline state, and slow-link signals are easier to scan.
+- **Connection Workflow**: Added alias-based startup, explicit config-path loading, default-connection fallback, and support for both `.yaml` and `.yml` config discovery.
+- **Documentation Refresh**: Expanded the README to cover config aliases, themes, `check-config`, contextual help, chart metrics, and current query-inspection behavior.
+
 ## [0.3.0] - 2026-03-21
 
 ### Added

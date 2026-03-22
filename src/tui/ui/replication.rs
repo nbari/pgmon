@@ -1,17 +1,23 @@
-use super::common::format_bytes;
-use crate::{
-    pg::client::{ReplicationSender, ReplicationSlot},
-    tui::app::{App, format::is_fuzzy_match},
+use crate::pg::client::CapabilityStatus;
+use crate::tui::app::{
+    App,
+    format::{is_fuzzy_match, sender_to_row, slot_to_row},
 };
+use crate::tui::ui::common::centered_rect;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
 };
 
 pub fn draw_replication(f: &mut Frame, app: &App, area: Rect) {
+    if let Some(reason) = replication_unavailable_reason(app) {
+        draw_replication_unavailable(f, area, reason);
+        return;
+    }
+
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -30,6 +36,40 @@ pub fn draw_replication(f: &mut Frame, app: &App, area: Rect) {
     if let Some(slots_area) = sections.get(2) {
         draw_slots_table(f, app, *slots_area);
     }
+}
+
+fn replication_unavailable_reason(app: &App) -> Option<&str> {
+    match &app.capabilities.replication {
+        CapabilityStatus::Unavailable(reason) => Some(reason.as_str()),
+        CapabilityStatus::Available | CapabilityStatus::Unknown => None,
+    }
+}
+
+fn draw_replication_unavailable(f: &mut Frame, area: Rect, reason: &str) {
+    let modal_area = centered_rect(area, 70, 7);
+    let paragraph = Paragraph::new(vec![
+        Line::styled(
+            "Replication Unavailable",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::styled(reason, Style::default().fg(Color::White)),
+        Line::styled(
+            "Enable replication settings or connect to a server with replication configured.",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Replication ")
+            .style(Style::default().bg(Color::Black)),
+    );
+
+    f.render_widget(Clear, modal_area);
+    f.render_widget(paragraph, modal_area);
 }
 
 fn draw_receiver_summary(f: &mut Frame, app: &App, area: Rect) {
@@ -174,10 +214,10 @@ fn sender_rows(app: &App) -> Vec<Vec<String>> {
 
     if rows.is_empty() {
         return vec![vec![
-            String::new(),
-            String::new(),
-            String::new(),
             "No active WAL senders".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -215,34 +255,6 @@ fn slot_rows(app: &App) -> Vec<Vec<String>> {
     rows
 }
 
-fn sender_to_row(sender: &ReplicationSender) -> Vec<String> {
-    vec![
-        sender.pid.clone(),
-        sender.user.clone(),
-        sender.application.clone(),
-        sender.client.clone(),
-        sender.state.clone(),
-        sender.sync_state.clone(),
-        sender.slot_name.clone(),
-        format_bytes(sender.sent_lag_bytes),
-        format_bytes(sender.write_lag_bytes),
-        format_bytes(sender.flush_lag_bytes),
-        format_bytes(sender.replay_lag_bytes),
-    ]
-}
-
-fn slot_to_row(slot: &ReplicationSlot) -> Vec<String> {
-    vec![
-        slot.slot_name.clone(),
-        slot.slot_type.clone(),
-        slot.active.clone(),
-        slot.active_pid.clone(),
-        slot.restart_lsn.clone(),
-        slot.confirmed_flush_lsn.clone(),
-        slot.wal_status.clone(),
-    ]
-}
-
 fn apply_replication_filters(rows: &mut Vec<Vec<String>>, search_query: &str, top_n: u32) {
     if !search_query.is_empty() {
         rows.retain(|row| row.iter().any(|cell| is_fuzzy_match(cell, search_query)));
@@ -269,8 +281,9 @@ fn slot_cell_style(column: usize) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_replication_filters, sender_to_row, slot_to_row};
+    use super::{apply_replication_filters, sender_rows, sender_to_row, slot_to_row};
     use crate::pg::client::{ReplicationSender, ReplicationSlot};
+    use crate::tui::app::App;
 
     #[test]
     fn test_apply_replication_filters_respects_search_and_top_n() {
@@ -324,5 +337,29 @@ mod tests {
 
         assert_eq!(row.first().map(String::as_str), Some("slot_a"));
         assert_eq!(row.get(6).map(String::as_str), Some("reserved"));
+    }
+
+    #[test]
+    fn test_sender_rows_empty_state_uses_first_column() {
+        let app = App::new(
+            String::new(),
+            0,
+            None,
+            1000,
+            10,
+            "activity",
+            "",
+            crate::config::Config::default(),
+        );
+
+        let rows = sender_rows(&app);
+
+        assert_eq!(rows.len(), 1);
+        let first_row = rows.first();
+        assert_eq!(
+            first_row.and_then(|row| row.first()).map(String::as_str),
+            Some("No active WAL senders")
+        );
+        assert!(first_row.is_some_and(|row| row.iter().skip(1).all(String::is_empty)));
     }
 }

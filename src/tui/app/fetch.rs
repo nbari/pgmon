@@ -7,6 +7,8 @@ pub enum RefreshPayload {
     Activity(Box<ActivitySnapshot>, PgClient),
     Replication(Box<ReplicationSnapshot>, PgClient),
     Table(Vec<Vec<String>>, PgClient),
+    Explain(Vec<String>),
+    TableDefinition(String, String, Vec<Vec<String>>, Vec<String>),
 }
 
 pub fn load_refresh_payload(
@@ -25,10 +27,6 @@ pub fn load_refresh_payload(
         Tab::Activity => {
             let snapshot = client.fetch_activity_snapshot()?;
             Ok(RefreshPayload::Activity(Box::new(snapshot), client))
-        }
-        Tab::Replication => {
-            let snapshot = client.fetch_replication_snapshot()?;
-            Ok(RefreshPayload::Replication(Box::new(snapshot), client))
         }
         Tab::Database => match database_view {
             DatabaseView::Summary => {
@@ -51,6 +49,14 @@ pub fn load_refresh_payload(
         }
         Tab::Statements => {
             let data = client.fetch_statements()?;
+            Ok(RefreshPayload::Table(data, client))
+        }
+        Tab::Replication => {
+            let snapshot = client.fetch_replication_snapshot()?;
+            Ok(RefreshPayload::Replication(Box::new(snapshot), client))
+        }
+        Tab::Settings => {
+            let data = client.fetch_settings()?;
             Ok(RefreshPayload::Table(data, client))
         }
         Tab::Tools => {
@@ -82,10 +88,6 @@ pub fn load_refresh_payload(
                 ],
             ];
             Ok(RefreshPayload::Table(tools_data, client))
-        }
-        Tab::Settings => {
-            let data = client.fetch_settings()?;
-            Ok(RefreshPayload::Table(data, client))
         }
     }
 }

@@ -1,7 +1,8 @@
 //! `PostgreSQL` connection-string resolution helpers.
 //!
-//! When no explicit DSN is provided, this module can derive a conninfo string
-//! from the first usable entry in `PGPASSFILE` or `~/.pgpass`.
+//! When no explicit DSN, alias-backed DSN, or environment DSN is provided,
+//! this module can derive a conninfo string from the first usable entry in
+//! `PGPASSFILE` or `~/.pgpass`.
 
 use std::{env, fs, io, path::PathBuf};
 
@@ -12,7 +13,7 @@ use thiserror::Error;
 pub enum ResolveDsnError {
     /// No explicit DSN or usable `.pgpass` entry was available.
     #[error(
-        "No PostgreSQL connection settings found. Pass --dsn, set PGMON_DSN, or create a usable .pgpass file at {searched_path}"
+        "No PostgreSQL connection settings found. Pass --dsn, use a configured alias, set PGMON_DSN, or create a usable .pgpass file at {searched_path}"
     )]
     MissingConnectionSettings { searched_path: String },
     /// The `.pgpass` file could not be read.
@@ -57,9 +58,13 @@ impl PgPassEntry {
     }
 }
 
-/// Resolve the DSN from the explicit CLI/env value or from `.pgpass`.
-pub fn resolve_dsn(explicit_dsn: Option<&str>) -> Result<String, ResolveDsnError> {
-    resolve_dsn_from_path(explicit_dsn, pgpass_path())
+/// Resolve the DSN from the explicit CLI value, alias-backed DSN, environment, or `.pgpass`.
+pub fn resolve_dsn(
+    explicit_dsn: Option<&str>,
+    alias_dsn: Option<&str>,
+    env_dsn: Option<&str>,
+) -> Result<String, ResolveDsnError> {
+    resolve_dsn_from_path(explicit_dsn, alias_dsn, env_dsn, pgpass_path())
 }
 
 /// Build a safe, human-readable summary of a connection target without exposing passwords.
@@ -84,6 +89,10 @@ pub fn describe_host(dsn: &str) -> String {
         return format!("host={host}");
     }
     "PostgreSQL".to_string()
+}
+
+pub(crate) fn candidate_pgpass_path() -> Option<PathBuf> {
+    pgpass_path()
 }
 
 fn extract_host_from_conninfo(dsn: &str) -> Option<String> {
@@ -160,9 +169,17 @@ fn extract_host_from_uri(dsn: &str) -> Option<String> {
 
 fn resolve_dsn_from_path(
     explicit_dsn: Option<&str>,
+    alias_dsn: Option<&str>,
+    env_dsn: Option<&str>,
     pgpass_path: Option<PathBuf>,
 ) -> Result<String, ResolveDsnError> {
     if let Some(dsn) = explicit_dsn.filter(|value| !value.trim().is_empty()) {
+        return Ok(dsn.to_owned());
+    }
+    if let Some(dsn) = alias_dsn.filter(|value| !value.trim().is_empty()) {
+        return Ok(dsn.to_owned());
+    }
+    if let Some(dsn) = env_dsn.filter(|value| !value.trim().is_empty()) {
         return Ok(dsn.to_owned());
     }
 
@@ -393,8 +410,47 @@ mod tests {
     #[test]
     fn test_explicit_dsn_takes_precedence() -> Result<(), Box<dyn Error>> {
         let path = PathBuf::from("/tmp/does-not-matter.pgpass");
-        let resolved = resolve_dsn_from_path(Some("postgresql://localhost/postgres"), Some(path))?;
+        let resolved = resolve_dsn_from_path(
+            Some("postgresql://localhost/postgres"),
+            Some("postgresql://alias/postgres"),
+            Some("postgresql://env/postgres"),
+            Some(path),
+        )?;
         assert_eq!(resolved, "postgresql://localhost/postgres");
+        Ok(())
+    }
+
+    #[test]
+    fn test_alias_dsn_takes_precedence_over_env_and_pgpass() -> Result<(), Box<dyn Error>> {
+        let path = write_temp_pgpass("db.example.com:5432:metrics:postgres:s3cret\n")?;
+
+        let resolved = resolve_dsn_from_path(
+            None,
+            Some("postgresql://alias.example.com/postgres"),
+            Some("postgresql://env.example.com/postgres"),
+            Some(path.clone()),
+        )?;
+
+        assert_eq!(resolved, "postgresql://alias.example.com/postgres");
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_env_dsn_takes_precedence_over_pgpass() -> Result<(), Box<dyn Error>> {
+        let path = write_temp_pgpass("db.example.com:5432:metrics:postgres:s3cret\n")?;
+
+        let resolved = resolve_dsn_from_path(
+            None,
+            None,
+            Some("postgresql://env.example.com/postgres"),
+            Some(path.clone()),
+        )?;
+
+        assert_eq!(resolved, "postgresql://env.example.com/postgres");
+
+        fs::remove_file(path)?;
         Ok(())
     }
 
@@ -404,7 +460,7 @@ mod tests {
             "db.example.com:5432:metrics:postgres:s3cret\nlocalhost:*:*:*:fallback\n",
         )?;
 
-        let resolved = resolve_dsn_from_path(None, Some(path.clone()))?;
+        let resolved = resolve_dsn_from_path(None, None, None, Some(path.clone()))?;
 
         assert_eq!(
             resolved,
@@ -419,7 +475,7 @@ mod tests {
     fn test_resolve_dsn_uses_wildcards_as_defaults() -> Result<(), Box<dyn Error>> {
         let path = write_temp_pgpass("*:*:*:postgres:secret\n")?;
 
-        let resolved = resolve_dsn_from_path(None, Some(path.clone()))?;
+        let resolved = resolve_dsn_from_path(None, None, None, Some(path.clone()))?;
 
         assert_eq!(resolved, "user='postgres' password='secret'");
 
@@ -439,7 +495,12 @@ mod tests {
 
     #[test]
     fn test_missing_dsn_and_pgpass_returns_error() {
-        let result = resolve_dsn_from_path(None, Some(PathBuf::from("/tmp/pgmon-missing.pgpass")));
+        let result = resolve_dsn_from_path(
+            None,
+            None,
+            None,
+            Some(PathBuf::from("/tmp/pgmon-missing.pgpass")),
+        );
         assert!(matches!(
             result,
             Err(ResolveDsnError::MissingConnectionSettings { .. })

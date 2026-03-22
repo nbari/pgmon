@@ -1,26 +1,39 @@
+use crate::pg::client::CapabilityStatus;
+use crate::tui::app::format::table_header_cells;
 use crate::tui::app::{App, DatabaseView, Tab};
+use crate::tui::ui::common::centered_rect;
 use ratatui::{
     Frame,
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Cell, Row, Table},
+    text::Line,
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
 };
 
 pub fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
-    let header_cells = table_header_cells(app);
+    if let Some(reason) = unavailable_capability_reason(app) {
+        draw_unavailable_panel(f, area, unavailable_title(app.current_tab), reason);
+        return;
+    }
+
+    let header_cells = table_header_cells_adapter(app);
     let widths = table_widths(app);
 
     let rows = app.data.iter().enumerate().map(|(i, items)| {
         let is_selected = app.selected_row == Some(i);
         let row_style = table_row_style(app, i, items);
 
-        let cells = items.iter().enumerate().map(|(col_index, c)| {
-            if let Some(cell_style) = table_cell_style(app, col_index, c, is_selected) {
-                Cell::from(c.as_str()).style(cell_style)
-            } else {
-                Cell::from(c.as_str())
-            }
-        });
+        let cells = items
+            .iter()
+            .take(header_cells.len())
+            .enumerate()
+            .map(|(col_index, c)| {
+                if let Some(cell_style) = table_cell_style(app, col_index, c, is_selected) {
+                    Cell::from(c.as_str()).style(cell_style)
+                } else {
+                    Cell::from(c.as_str())
+                }
+            });
 
         Row::new(cells).style(row_style)
     });
@@ -45,6 +58,44 @@ pub fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
+fn unavailable_capability_reason(app: &App) -> Option<&str> {
+    match app.current_view_capability()? {
+        CapabilityStatus::Unavailable(reason) => Some(reason.as_str()),
+        CapabilityStatus::Available | CapabilityStatus::Unknown => None,
+    }
+}
+
+fn unavailable_title(tab: Tab) -> &'static str {
+    match tab {
+        Tab::Statements => "pg_stat_statements Unavailable",
+        Tab::IO => "pg_stat_io Unavailable",
+        _ => "Feature Unavailable",
+    }
+}
+
+fn draw_unavailable_panel(f: &mut Frame, area: Rect, title: &str, reason: &str) {
+    let panel_area = centered_rect(area, 72, 7);
+    let paragraph = Paragraph::new(vec![
+        Line::styled(
+            title,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::styled(reason, Style::default().fg(Color::White)),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Capability ")
+            .style(Style::default().bg(Color::Black)),
+    );
+
+    f.render_widget(Clear, panel_area);
+    f.render_widget(paragraph, panel_area);
+}
+
 #[allow(clippy::too_many_lines)]
 fn table_cell_style(app: &App, col_index: usize, value: &str, is_selected: bool) -> Option<Style> {
     if is_selected {
@@ -53,8 +104,8 @@ fn table_cell_style(app: &App, col_index: usize, value: &str, is_selected: bool)
 
     match app.current_tab {
         Tab::Statements => match col_index {
-            0 => return Some(Style::default().fg(Color::White)),
-            1 => {
+            0..=1 => return Some(Style::default().fg(Color::White)),
+            2 => {
                 if let Ok(total) = value.parse::<f64>() {
                     if total > 5000.0 {
                         return Some(Style::default().fg(Color::Red));
@@ -64,7 +115,7 @@ fn table_cell_style(app: &App, col_index: usize, value: &str, is_selected: bool)
                     return Some(Style::default().fg(Color::Green));
                 }
             }
-            2 => {
+            3 => {
                 if let Ok(mean) = value.parse::<f64>() {
                     if mean > 100.0 {
                         return Some(Style::default().fg(Color::Red));
@@ -74,7 +125,7 @@ fn table_cell_style(app: &App, col_index: usize, value: &str, is_selected: bool)
                     return Some(Style::default().fg(Color::Green));
                 }
             }
-            3..=5 => return Some(Style::default().fg(Color::DarkGray)),
+            4..=6 => return Some(Style::default().fg(Color::DarkGray)),
             _ => {}
         },
         Tab::Database => match &app.database_view {
@@ -145,7 +196,14 @@ fn table_cell_style(app: &App, col_index: usize, value: &str, is_selected: bool)
             _ => {}
         },
         Tab::Settings => match col_index {
-            0 | 1 => return Some(Style::default().fg(Color::White)),
+            0 => return Some(Style::default().fg(Color::White)),
+            1 => {
+                let color = app
+                    .config
+                    .get_view_color("settings", "value")
+                    .unwrap_or(Color::Blue);
+                return Some(Style::default().fg(color));
+            }
             2..=4 => return Some(Style::default().fg(Color::DarkGray)),
             _ => {}
         },
@@ -155,54 +213,8 @@ fn table_cell_style(app: &App, col_index: usize, value: &str, is_selected: bool)
     None
 }
 
-fn table_header_cells(app: &App) -> Vec<&'static str> {
-    match app.current_tab {
-        Tab::Activity => vec![
-            "PID", "User", "DB", "State", "Query", "Start", "App", "Client",
-        ],
-        Tab::Database => match &app.database_view {
-            DatabaseView::Summary => vec![
-                "DB",
-                "Backends",
-                "Commits",
-                "Rollbacks",
-                "Hit %",
-                "Temp Bytes",
-                "Deadlocks",
-                "Reset",
-            ],
-            DatabaseView::Tables { .. } => vec!["Node", "Type", "Children/Rows", "Size"],
-        },
-        Tab::Locks => vec![
-            "Blocking PID",
-            "Blocked PID",
-            "User",
-            "Target",
-            "Mode",
-            "Time(s)",
-            "Query",
-        ],
-        Tab::IO => vec![
-            "Backend",
-            "Object",
-            "Context",
-            "Reads",
-            "Writes",
-            "Time Read(ms)",
-            "Time Write(ms)",
-        ],
-        Tab::Statements => vec![
-            "Query",
-            "Total(ms)",
-            "Mean(ms)",
-            "Calls",
-            "Read(ms)",
-            "Write(ms)",
-        ],
-        Tab::Tools => vec!["Action", "Description"],
-        Tab::Replication => Vec::new(),
-        Tab::Settings => vec!["Name", "Value", "Unit", "Category", "Description"],
-    }
+fn table_header_cells_adapter(app: &App) -> Vec<&'static str> {
+    table_header_cells(app.current_tab, &app.database_view)
 }
 
 fn table_widths(app: &App) -> Vec<Constraint> {
@@ -254,7 +266,8 @@ fn table_widths(app: &App) -> Vec<Constraint> {
             Constraint::Length(15),
         ],
         Tab::Statements => vec![
-            Constraint::Percentage(52),
+            Constraint::Length(12),
+            Constraint::Percentage(40),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(10),
@@ -309,6 +322,10 @@ fn table_title(app: &App) -> String {
         ),
         DatabaseView::Tables { database } if app.current_tab == Tab::Database => format!(
             " Database Tree | {database} | nodes: {} | Esc:Back{filter_hint} ",
+            app.data.len()
+        ),
+        _ if app.current_tab == Tab::Settings => format!(
+            " Settings View | rows: {} | Search(/){filter_hint} ",
             app.data.len()
         ),
         _ => format!(
