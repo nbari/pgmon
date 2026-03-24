@@ -712,40 +712,33 @@ fn draw_activity_sessions_panel(f: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(i, session)| {
             let is_selected = app.selected_row == Some(i);
-            let style = if is_selected {
+
+            // 1. Determine Row Style (Warnings)
+            let base_style = if is_selected {
                 Style::default().fg(Color::Black).bg(Color::White)
             } else if session.blocked_by_count > 0 {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(Color::Red) // Blocked sessions are Red (CRITICAL)
             } else if session.blocked_count > 0 {
-                Style::default().fg(Color::Red)
-            } else if matches!(
-                session.state.as_str(),
-                "idle in transaction" | "idle in transaction (aborted)"
-            ) {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(Color::Magenta) // Blocking sessions are Magenta (ACTION REQUIRED)
+            } else if session.state.contains("idle in transaction") {
+                Style::default().fg(Color::Cyan) // Idle in transaction is Cyan (WARNING)
+            } else if session.state == "active" {
+                Style::default().fg(Color::Green) // Active is Green (OK)
             } else {
-                Style::default().fg(Color::Green)
+                Style::default().fg(Color::DarkGray) // Idle/Other is Dim
             };
-            let dim_style = if is_selected {
-                style
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
+
             let white_style = if is_selected {
-                style
+                base_style
             } else {
                 Style::default().fg(Color::White)
             };
-            let wait_style = if is_selected {
-                style
+            let dim_style = if is_selected {
+                base_style
             } else {
-                Style::default().fg(Color::Red)
+                Style::default().fg(Color::DarkGray)
             };
-            let state_style = if is_selected {
-                style
-            } else {
-                Style::default().fg(Color::Yellow)
-            };
+
             Row::new(vec![
                 Cell::from(session.pid.as_str()).style(white_style),
                 Cell::from(session.xmin.as_str()).style(white_style),
@@ -754,13 +747,29 @@ fn draw_activity_sessions_panel(f: &mut Frame, app: &mut App, area: Rect) {
                 Cell::from(session.user.as_str()).style(dim_style),
                 Cell::from(session.client.as_str()).style(white_style),
                 Cell::from(format_duration_hms(session.duration_seconds)).style(
-                    activity_time_style(is_selected, session.duration_seconds, style),
+                    activity_time_style(is_selected, session.duration_seconds, base_style),
                 ),
-                Cell::from(activity_wait_cell(session)).style(wait_style),
-                Cell::from(activity_state_cell(session)).style(state_style),
+                Cell::from(activity_wait_cell(session)).style(if is_selected {
+                    base_style
+                } else if session.blocked_by_count > 0 {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                }),
+                Cell::from(activity_state_cell(session)).style(if is_selected {
+                    base_style
+                } else if session.state.contains("idle in transaction") {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else if session.state == "active" {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                }),
                 Cell::from(format_activity_query(session)).style(white_style),
             ])
-            .style(style)
+            .style(base_style)
         });
 
     let count = app.dashboard.sessions.len();
@@ -789,12 +798,12 @@ fn activity_time_style(is_selected: bool, duration_seconds: i64, selected_style:
         return selected_style;
     }
 
-    if duration_seconds < 3 {
+    if duration_seconds < 60 {
         Style::default().fg(Color::Green)
-    } else if duration_seconds < 10 {
+    } else if duration_seconds < 300 {
         Style::default().fg(Color::Yellow)
     } else {
-        Style::default().fg(Color::Red)
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     }
 }
 
@@ -832,15 +841,15 @@ mod tests {
     #[test]
     fn test_activity_time_style_uses_threshold_colors() {
         assert_eq!(
-            activity_time_style(false, 2, Style::default()).fg,
+            activity_time_style(false, 59, Style::default()).fg,
             Some(Color::Green)
         );
         assert_eq!(
-            activity_time_style(false, 5, Style::default()).fg,
+            activity_time_style(false, 299, Style::default()).fg,
             Some(Color::Yellow)
         );
         assert_eq!(
-            activity_time_style(false, 12, Style::default()).fg,
+            activity_time_style(false, 301, Style::default()).fg,
             Some(Color::Red)
         );
     }

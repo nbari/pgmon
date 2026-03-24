@@ -297,6 +297,7 @@ mod test_harness {
                 read_time: "0".to_string(),
                 write_time: "0".to_string(),
             }),
+            activity_detail: None,
         });
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
@@ -326,6 +327,7 @@ mod test_harness {
             database: "postgres".to_string(),
             source: QueryDetailSource::Activity,
             stats: None,
+            activity_detail: None,
         });
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
@@ -721,7 +723,7 @@ mod test_harness {
         assert!(app.theme_modal.is_none());
         assert_eq!(app.active_theme_name(), Some("mint"));
         assert_eq!(app.config.ui.header_border_color, "#9db39d");
-        assert!(app.notice_state.is_some());
+        assert!(app.notice_state.is_none());
     }
 
     #[test]

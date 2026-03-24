@@ -1,4 +1,4 @@
-use super::state::{DatabaseView, Tab};
+use super::state::{ActivityDetail, DatabaseView, Tab};
 use crate::pg::client::{ActivitySnapshot, PgClient, ReplicationSnapshot};
 use anyhow::Result;
 
@@ -9,6 +9,7 @@ pub enum RefreshPayload {
     Table(Vec<Vec<String>>, PgClient),
     Explain(Vec<String>),
     TableDefinition(String, String, Vec<Vec<String>>, Vec<String>),
+    ActivityDetail(ActivityDetail),
 }
 
 pub fn load_refresh_payload(

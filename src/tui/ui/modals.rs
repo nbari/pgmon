@@ -46,8 +46,8 @@ pub fn draw_query_detail_modal(f: &mut Frame, app: &App) {
     };
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let modal_height = (f64::from(f.area().height) * 0.8) as u16;
-    let area = centered_rect(f.area(), 90, modal_height);
+    let modal_height = (f64::from(f.area().height) * 0.9) as u16;
+    let area = centered_rect(f.area(), 95, modal_height);
     f.render_widget(Clear, area);
 
     let title = if detail.database.is_empty() {
@@ -69,40 +69,42 @@ pub fn draw_query_detail_modal(f: &mut Frame, app: &App) {
     let inner_area = block.inner(area);
     f.render_widget(block, area);
 
-    let constraints = if detail.stats.is_some() {
-        vec![
-            ratatui::layout::Constraint::Length(2), // Title + Warning
-            ratatui::layout::Constraint::Length(3), // Stats
-            ratatui::layout::Constraint::Min(0),    // Query (Wraps)
-            ratatui::layout::Constraint::Length(1), // Footer
-        ]
-    } else {
-        vec![
-            ratatui::layout::Constraint::Length(2), // Title + Warning
-            ratatui::layout::Constraint::Min(0),    // Query (Wraps)
-            ratatui::layout::Constraint::Length(1), // Footer
-        ]
-    };
+    let mut constraints = vec![
+        ratatui::layout::Constraint::Length(2), // Title + Warning
+    ];
+
+    if let Some(act) = &detail.activity_detail {
+        constraints.push(ratatui::layout::Constraint::Length(4)); // Basic Activity Info
+        if !act.blockers.is_empty() {
+            #[allow(clippy::cast_possible_truncation)]
+            constraints.push(ratatui::layout::Constraint::Length(
+                (act.blockers.len() as u16 + 2).min(8),
+            ));
+        }
+        if !act.locks.is_empty() {
+            #[allow(clippy::cast_possible_truncation)]
+            constraints.push(ratatui::layout::Constraint::Length(
+                (act.locks.len() as u16 + 2).min(8),
+            ));
+        }
+    }
+
+    if detail.stats.is_some() {
+        constraints.push(ratatui::layout::Constraint::Length(3)); // Stats
+    }
+
+    constraints.push(ratatui::layout::Constraint::Min(0)); // Query (Wraps)
+    constraints.push(ratatui::layout::Constraint::Length(1)); // Footer
 
     let chunks = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints(constraints)
         .split(inner_area);
 
-    if let (Some(title_area), Some(query_area), Some(footer_area)) = (
-        chunks.first(),
-        if detail.stats.is_some() {
-            chunks.get(2)
-        } else {
-            chunks.get(1)
-        },
-        if detail.stats.is_some() {
-            chunks.get(3)
-        } else {
-            chunks.get(2)
-        },
-    ) {
-        // Render Title
+    let mut current_chunk = 0;
+
+    // 1. Render Title/Header
+    if let Some(area) = chunks.get(current_chunk) {
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(
@@ -125,41 +127,220 @@ pub fn draw_query_detail_modal(f: &mut Frame, app: &App) {
                     Line::raw("")
                 },
             ]),
-            *title_area,
+            *area,
         );
+    }
+    current_chunk += 1;
 
-        // Render Stats if available
-        if let (Some(stats), Some(stats_area)) = (detail.stats.as_ref(), chunks.get(1)) {
-            let stats_lines = vec![
+    // 2. Render Activity Detail if available
+    if let Some(act) = &detail.activity_detail {
+        if let Some(area) = chunks.get(current_chunk) {
+            let mut lines = vec![
                 Line::from(vec![
-                    Span::styled("total: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(&stats.total_time),
-                    Span::raw(" ms | "),
-                    Span::styled("mean: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(&stats.mean_time),
-                    Span::raw(" ms | "),
-                    Span::styled("calls: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(&stats.calls),
+                    Span::styled("PID: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(&act.pid, Style::default().fg(Color::White)),
+                    Span::raw(" | "),
+                    Span::styled("User: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(&act.usename, Style::default().fg(Color::White)),
+                    Span::raw(" | "),
+                    Span::styled("App: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(&act.application_name, Style::default().fg(Color::White)),
+                    Span::raw(" | "),
+                    Span::styled("Client: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}:{}", act.client_addr, act.client_port),
+                        Style::default().fg(Color::White),
+                    ),
                 ]),
                 Line::from(vec![
-                    Span::styled("read: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(&stats.read_time),
-                    Span::raw(" ms | "),
-                    Span::styled("write: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(&stats.write_time),
-                    Span::raw(" ms"),
+                    Span::styled("State: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        &act.state,
+                        if act.state == "active" {
+                            Style::default().fg(Color::Green)
+                        } else if act.state.contains("idle in transaction") {
+                            Style::default().fg(Color::Red)
+                        } else {
+                            Style::default().fg(Color::White)
+                        },
+                    ),
+                    Span::raw(" | "),
+                    Span::styled("Wait: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{} / {}", act.wait_event_type, act.wait_event),
+                        if act.wait_event_type == "Lock" {
+                            Style::default().fg(Color::Red)
+                        } else {
+                            Style::default().fg(Color::White)
+                        },
+                    ),
                 ]),
+                Line::from(vec![
+                    Span::styled("Backend Start: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(&act.backend_start, Style::default().fg(Color::White)),
+                    Span::raw(" | "),
+                    Span::styled("Xact Start: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(&act.xact_start, Style::default().fg(Color::White)),
+                    Span::raw(" | "),
+                    Span::styled("State Change: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(&act.state_change, Style::default().fg(Color::White)),
+                ]),
+                if act.blocking_pids == "{}" {
+                    Line::raw("")
+                } else {
+                    Line::from(vec![
+                        Span::styled("Waiting on PIDs: ", Style::default().fg(Color::Red)),
+                        Span::styled(&act.blocking_pids, Style::default().fg(Color::White)),
+                    ])
+                },
             ];
-            f.render_widget(Paragraph::new(stats_lines), *stats_area);
+            if act.state.is_empty() {
+                lines = vec![Line::styled(
+                    "Loading extended activity details...",
+                    Style::default().fg(Color::DarkGray),
+                )];
+            }
+            f.render_widget(Paragraph::new(lines), *area);
+        }
+        current_chunk += 1;
+
+        // 3. Render Blockers
+        if !act.blockers.is_empty() {
+            if let Some(area) = chunks.get(current_chunk) {
+                let header = Row::new(vec![
+                    Cell::from("Blocked PID"),
+                    Cell::from("User"),
+                    Cell::from("State"),
+                    Cell::from("Duration"),
+                    Cell::from("Query"),
+                ])
+                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+                let rows: Vec<Row> = act
+                    .blockers
+                    .iter()
+                    .map(|b| {
+                        Row::new(vec![
+                            Cell::from(b.first().cloned().unwrap_or_default()),
+                            Cell::from(b.get(1).cloned().unwrap_or_default()),
+                            Cell::from(b.get(2).cloned().unwrap_or_default()),
+                            Cell::from(format!("{}s", b.get(3).cloned().unwrap_or_default())),
+                            Cell::from(b.get(4).cloned().unwrap_or_default()),
+                        ])
+                    })
+                    .collect();
+
+                let table = Table::new(
+                    rows,
+                    [
+                        Constraint::Length(10),
+                        Constraint::Length(15),
+                        Constraint::Length(10),
+                        Constraint::Length(10),
+                        Constraint::Min(0),
+                    ],
+                )
+                .header(header)
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .title(" Blocking Sessions "),
+                );
+                f.render_widget(table, *area);
+            }
+            current_chunk += 1;
         }
 
-        // Render Query (Wrapped)
-        f.render_widget(
-            Paragraph::new(detail.query.as_str()).wrap(Wrap { trim: true }),
-            *query_area,
-        );
+        // 4. Render Locks
+        if !act.locks.is_empty() {
+            if let Some(area) = chunks.get(current_chunk) {
+                let header = Row::new(vec![
+                    Cell::from("Lock Type"),
+                    Cell::from("Mode"),
+                    Cell::from("Granted"),
+                    Cell::from("Relation"),
+                ])
+                .style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                );
+                let rows: Vec<Row> = act
+                    .locks
+                    .iter()
+                    .map(|l| {
+                        Row::new(vec![
+                            Cell::from(l.first().cloned().unwrap_or_default()),
+                            Cell::from(l.get(1).cloned().unwrap_or_default()),
+                            Cell::from(l.get(2).cloned().unwrap_or_default()),
+                            Cell::from(l.get(3).cloned().unwrap_or_default()),
+                        ])
+                    })
+                    .collect();
 
-        // Render Footer
+                let table = Table::new(
+                    rows,
+                    [
+                        Constraint::Length(15),
+                        Constraint::Length(25),
+                        Constraint::Length(10),
+                        Constraint::Min(0),
+                    ],
+                )
+                .header(header)
+                .block(Block::default().borders(Borders::TOP).title(" Locks Held "));
+                f.render_widget(table, *area);
+            }
+            current_chunk += 1;
+        }
+    }
+
+    // 5. Render Stats if available
+    if let (Some(stats), Some(area)) = (detail.stats.as_ref(), chunks.get(current_chunk)) {
+        let stats_lines = vec![
+            Line::from(vec![
+                Span::styled("total: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(&stats.total_time),
+                Span::raw(" ms | "),
+                Span::styled("mean: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(&stats.mean_time),
+                Span::raw(" ms | "),
+                Span::styled("calls: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(&stats.calls),
+            ]),
+            Line::from(vec![
+                Span::styled("read: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(&stats.read_time),
+                Span::raw(" ms | "),
+                Span::styled("write: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(&stats.write_time),
+                Span::raw(" ms"),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(stats_lines), *area);
+        current_chunk += 1;
+    }
+
+    // 6. Render Query
+    if let Some(area) = chunks.get(current_chunk) {
+        let query_text = if let Some(act) = &detail.activity_detail {
+            if act.query.is_empty() {
+                detail.query.as_str()
+            } else {
+                act.query.as_str()
+            }
+        } else {
+            detail.query.as_str()
+        };
+        f.render_widget(
+            Paragraph::new(query_text)
+                .wrap(Wrap { trim: true })
+                .block(Block::default().borders(Borders::TOP).title(" Query ")),
+            *area,
+        );
+    }
+
+    // 7. Render Footer
+    if let Some(area) = chunks.last() {
         let mut footer_spans = if detail.source == QueryDetailSource::Statements {
             Vec::new()
         } else if is_normalized_query(detail.query.as_str()) {
@@ -184,6 +365,11 @@ pub fn draw_query_detail_modal(f: &mut Frame, app: &App) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(":Explain Analyze | ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    "K",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(":Terminate Session | ", Style::default().fg(Color::Cyan)),
             ]
         };
         footer_spans.extend([
@@ -203,10 +389,7 @@ pub fn draw_query_detail_modal(f: &mut Frame, app: &App) {
             Span::styled(":Close", Style::default().fg(Color::Cyan)),
         ]);
         let footer = Line::from(footer_spans);
-        f.render_widget(
-            Paragraph::new(footer).alignment(Alignment::Right),
-            *footer_area,
-        );
+        f.render_widget(Paragraph::new(footer).alignment(Alignment::Right), *area);
     }
 }
 

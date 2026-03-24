@@ -247,6 +247,64 @@ LEFT JOIN blockers ON activity.pid = blockers.pid
 ORDER BY activity.duration_sec DESC, activity.pid ASC
 ";
 
+pub const ACTIVITY_DETAIL_QUERY: &str = r"
+SELECT
+  pid::text,
+  COALESCE(usename, '') as usename,
+  COALESCE(application_name, '') as application_name,
+  COALESCE(host(client_addr), '[local]') as client_addr,
+  COALESCE(client_port::text, '') as client_port,
+  COALESCE(backend_start::text, '') as backend_start,
+  COALESCE(state, '') as state,
+  COALESCE(wait_event_type, '') as wait_event_type,
+  COALESCE(wait_event, '') as wait_event,
+  COALESCE(xact_start::text, '') as xact_start,
+  COALESCE(state_change::text, '') as state_change,
+  COALESCE(query, '') as query,
+  COALESCE(pg_blocking_pids(pid)::text, '{}') as blocking_pids
+FROM pg_stat_activity
+WHERE pid = $1
+";
+
+pub const ACTIVITY_BLOCKING_QUERY: &str = r"
+SELECT
+  blocked.pid::text AS blocked_pid,
+  COALESCE(blocked.usename, '') AS blocked_user,
+  COALESCE(blocked.state, '') AS blocked_state,
+  GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(blocked.query_start, blocked.xact_start)))::bigint)::text AS blocked_duration,
+  COALESCE(regexp_replace(blocked.query, '\s+', ' ', 'g'), '') AS blocked_query
+FROM pg_stat_activity blocked
+JOIN pg_locks bl ON blocked.pid = bl.pid
+JOIN pg_locks kl
+  ON bl.locktype = kl.locktype
+ AND bl.database IS NOT DISTINCT FROM kl.database
+ AND bl.relation IS NOT DISTINCT FROM kl.relation
+ AND bl.page IS NOT DISTINCT FROM kl.page
+ AND bl.tuple IS NOT DISTINCT FROM kl.tuple
+ AND bl.virtualxid IS NOT DISTINCT FROM kl.virtualxid
+ AND bl.transactionid IS NOT DISTINCT FROM kl.transactionid
+ AND bl.classid IS NOT DISTINCT FROM kl.classid
+ AND bl.objid IS NOT DISTINCT FROM kl.objid
+ AND bl.objsubid IS NOT DISTINCT FROM kl.objsubid
+ AND bl.pid <> kl.pid
+JOIN pg_stat_activity blocker ON blocker.pid = kl.pid
+WHERE NOT bl.granted
+  AND blocker.pid = $1
+";
+
+pub const ACTIVITY_LOCKS_QUERY: &str = r"
+SELECT
+  l.locktype,
+  l.mode,
+  CASE WHEN l.granted THEN 'yes' ELSE 'no' END as granted,
+  COALESCE(c.relname, l.relation::text, '') as relation
+FROM pg_locks l
+LEFT JOIN pg_class c ON l.relation = c.oid
+WHERE l.pid = $1
+ORDER BY l.granted DESC, l.locktype, l.mode
+LIMIT 100
+";
+
 pub const DATABASE_TREE_QUERY: &str = r"
 WITH user_tables AS (
     SELECT

@@ -7,10 +7,13 @@ Usage:
 
 Default DSN: postgresql://postgres:postgres@127.0.0.1:5432/postgres
 
-Connection breakdown (50 total by default):
-  IDLE_CONNS    = 30  open connections, never run a query     → state: idle
-  IDLE_IN_TX    = 10  open transaction, never committed       → state: idle in transaction
-  ACTIVE_WORKERS = 10  run queries in a loop via pool         → state: active / idle
+Connection breakdown:
+  IDLE_CONNS       = 10  open connections, never run a query     → state: idle
+  IDLE_IN_TX       = 10  open transaction, never committed       → state: idle in transaction
+  BLOCKING_ITX     = 5   idle in transaction holding a lock      → state: idle in transaction (blocking others)
+  BLOCKED_SESSIONS = 5   trying to get a lock held by blocker    → state: active (wait_event_type: Lock)
+  DEADLOCK_WORKERS = 4   trying to cause a deadlock periodically
+  ACTIVE_WORKERS   = 10  run queries in a loop via pool         → state: active / idle
 """
 
 import os, sys, time, random, signal, threading, textwrap
@@ -21,12 +24,15 @@ DEFAULT_DSN     = "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
 DSN             = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PGMON_DSN", DEFAULT_DSN)
 
 # ── tunables ──────────────────────────────────────────────────────────────────
-IDLE_CONNS      = 30   # always-idle connections (state=idle, never query)
-IDLE_IN_TX      = 10   # always idle-in-transaction (state=idle in transaction)
-ACTIVE_WORKERS  = 10   # workers querying via a connection pool
-POOL_MIN        =  5   # minimum connections kept open in pool
-POOL_MAX        = 15   # pool ceiling
-SLOW_EVERY      = 12   # seconds between slow queries per worker
+IDLE_CONNS       = 10
+IDLE_IN_TX       = 10
+BLOCKING_ITX     = 5
+BLOCKED_SESSIONS = 5
+DEADLOCK_WORKERS = 4
+ACTIVE_WORKERS   = 10
+POOL_MIN         =  5
+POOL_MAX         = 15
+SLOW_EVERY       = 12
 # ─────────────────────────────────────────────────────────────────────────────
 
 stop_event = threading.Event()
@@ -44,17 +50,23 @@ def setup():
             ts  TIMESTAMPTZ DEFAULT now()
         );
         TRUNCATE pgload_scratch;
-        INSERT INTO pgload_scratch (val)
-            SELECT random()*1000 FROM generate_series(1,500);
+        INSERT INTO pgload_scratch (id, val)
+            SELECT i, random()*1000 FROM generate_series(1,500) s(i);
+
+        CREATE TABLE IF NOT EXISTS pgload_deadlock (
+            id INT PRIMARY KEY
+        );
+        TRUNCATE pgload_deadlock;
+        INSERT INTO pgload_deadlock VALUES (1), (2);
     """)
     c.close()
-    print("[pgload] scratch table ready", file=sys.stderr)
+    print("[pgload] scratch and deadlock tables ready", file=sys.stderr)
 
 def teardown():
     try:
         c = psycopg2.connect(DSN, application_name="pgload-teardown")
         c.autocommit = True
-        c.cursor().execute("DROP TABLE IF EXISTS pgload_scratch;")
+        c.cursor().execute("DROP TABLE IF EXISTS pgload_scratch; DROP TABLE IF EXISTS pgload_deadlock;")
         c.close()
     except Exception as e:
         print(f"[pgload] teardown: {e}", file=sys.stderr)
@@ -86,8 +98,8 @@ def idle_holder(wid):
         conn = psycopg2.connect(DSN, application_name=f"pgload-idle-{wid:02d}")
         stop_event.wait()
         conn.close()
-    except Exception as e:
-        print(f"[idle-{wid}] {e}", file=sys.stderr)
+    except Exception:
+        pass
 
 
 def idle_in_tx_holder(wid):
@@ -95,12 +107,65 @@ def idle_in_tx_holder(wid):
     try:
         conn = psycopg2.connect(DSN, application_name=f"pgload-itx-{wid:02d}")
         conn.autocommit = False
-        conn.cursor().execute("SELECT pg_backend_pid()")   # starts implicit tx
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM pgload_scratch")
         stop_event.wait()
         conn.rollback()
         conn.close()
-    except Exception as e:
-        print(f"[itx-{wid}] {e}", file=sys.stderr)
+    except Exception:
+        pass
+
+def blocking_itx_holder(wid):
+    """Idle in transaction while holding an exclusive row lock."""
+    try:
+        conn = psycopg2.connect(DSN, application_name=f"pgload-blocker-{wid:02d}")
+        conn.autocommit = False
+        cur = conn.cursor()
+        row_id = (wid % BLOCKING_ITX) + 1
+        cur.execute(f"SELECT * FROM pgload_scratch WHERE id = {row_id} FOR UPDATE")
+        stop_event.wait()
+        conn.rollback()
+        conn.close()
+    except Exception:
+        pass
+
+def blocked_session_holder(wid):
+    """Try to update a row held by a blocker. Will show as active & waiting on Lock."""
+    try:
+        conn = psycopg2.connect(DSN, application_name=f"pgload-blocked-{wid:02d}")
+        conn.autocommit = False
+        cur = conn.cursor()
+        row_id = (wid % BLOCKING_ITX) + 1
+        cur.execute(f"UPDATE pgload_scratch SET val = val + 1 WHERE id = {row_id}")
+        if not stop_event.is_set():
+            conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def deadlock_worker(wid):
+    """Attempt to cause a deadlock by locking rows in different orders."""
+    while not stop_event.is_set():
+        try:
+            conn = psycopg2.connect(DSN, application_name=f"pgload-deadlock-{wid:02d}")
+            conn.autocommit = False
+            cur = conn.cursor()
+            
+            # Switch order based on worker ID to cause deadlock
+            first, second = (1, 2) if wid % 2 == 0 else (2, 1)
+            
+            cur.execute(f"SELECT * FROM pgload_deadlock WHERE id = {first} FOR UPDATE")
+            time.sleep(1) # Wait for others to get their first lock
+            cur.execute(f"SELECT * FROM pgload_deadlock WHERE id = {second} FOR UPDATE")
+            
+            conn.commit()
+            conn.close()
+        except psycopg2.errors.DeadlockDetected:
+            # Expected periodically
+            pass
+        except Exception:
+            pass
+        time.sleep(random.uniform(2, 5))
 
 
 def active_worker(wid, the_pool):
@@ -124,7 +189,7 @@ def active_worker(wid, the_pool):
             with _lock:
                 stats["queries"] += 1
         except pg_pool.PoolError:
-            pass   # pool exhausted, skip this tick
+            pass
         except Exception:
             with _lock:
                 stats["errors"] += 1
@@ -148,7 +213,6 @@ def printer():
         elapsed = int(time.time() - start)
         with _lock:
             q, e = stats["queries"], stats["errors"]
-        # quick live count from postgres
         try:
             c = psycopg2.connect(DSN, application_name="pgload-mon")
             c.autocommit = True
@@ -179,25 +243,19 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT,  handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    total = IDLE_CONNS + IDLE_IN_TX + ACTIVE_WORKERS
+    total = IDLE_CONNS + IDLE_IN_TX + BLOCKING_ITX + BLOCKED_SESSIONS + DEADLOCK_WORKERS + ACTIVE_WORKERS
     print(textwrap.dedent(f"""
         [pgload] DSN            : {DSN}
-        [pgload] idle holders   : {IDLE_CONNS:>3}  (state = idle)
-        [pgload] idle-in-tx     : {IDLE_IN_TX:>3}  (state = idle in transaction)
-        [pgload] active workers : {ACTIVE_WORKERS:>3}  (state oscillates active ↔ idle)
-        [pgload] pool           : min={POOL_MIN} max={POOL_MAX}
-        [pgload] total conns    : ~{total}
+        [pgload] idle holders   : {IDLE_CONNS:>3}
+        [pgload] idle-in-tx     : {IDLE_IN_TX:>3}
+        [pgload] blocking itx   : {BLOCKING_ITX:>3}
+        [pgload] blocked sessions: {BLOCKED_SESSIONS:>3}
+        [pgload] deadlock workers: {DEADLOCK_WORKERS:>3}
+        [pgload] active workers : {ACTIVE_WORKERS:>3}
         [pgload] Ctrl-C to stop
     """), file=sys.stderr)
 
     setup()
-
-    # test connection + print current state before starting
-    c = psycopg2.connect(DSN)
-    cur = c.cursor()
-    cur.execute("SELECT coalesce(state,'bg'), count(*) FROM pg_stat_activity WHERE pid<>pg_backend_pid() GROUP BY 1")
-    print("[pgload] pg_stat_activity before load:", dict(cur.fetchall()), file=sys.stderr)
-    c.close()
 
     the_pool = pg_pool.ThreadedConnectionPool(POOL_MIN, POOL_MAX, DSN,
                                               application_name="pgload-pool")
@@ -211,23 +269,27 @@ if __name__ == "__main__":
         t = threading.Thread(target=idle_in_tx_holder, args=(i,), daemon=True)
         t.start(); threads.append(t)
 
+    for i in range(BLOCKING_ITX):
+        t = threading.Thread(target=blocking_itx_holder, args=(i,), daemon=True)
+        t.start(); threads.append(t)
+
+    for i in range(BLOCKED_SESSIONS):
+        t = threading.Thread(target=blocked_session_holder, args=(i,), daemon=True)
+        t.start(); threads.append(t)
+
+    for i in range(DEADLOCK_WORKERS):
+        t = threading.Thread(target=deadlock_worker, args=(i,), daemon=True)
+        t.start(); threads.append(t)
+
     for i in range(ACTIVE_WORKERS):
         t = threading.Thread(target=active_worker, args=(i, the_pool), daemon=True)
         t.start(); threads.append(t)
-
-    time.sleep(1)   # let connections settle
-
-    c2 = psycopg2.connect(DSN)
-    cur2 = c2.cursor()
-    cur2.execute("SELECT coalesce(state,'bg'), count(*) FROM pg_stat_activity WHERE pid<>pg_backend_pid() GROUP BY 1")
-    print("[pgload] pg_stat_activity after  load:", dict(cur2.fetchall()), file=sys.stderr)
-    c2.close()
 
     threading.Thread(target=printer, daemon=True).start()
 
     stop_event.wait()
     for t in threads:
-        t.join(timeout=3)
+        t.join(timeout=1)
 
     the_pool.closeall()
     teardown()

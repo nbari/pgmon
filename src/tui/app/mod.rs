@@ -35,7 +35,7 @@ use format::{
     sort_statement_rows, sorted_activity_sessions, table_header_cells,
 };
 pub use state::{
-    ActivityChartMetric, ActivitySubview, CapabilitySummary, ConfirmActionState,
+    ActivityChartMetric, ActivityDetail, ActivitySubview, CapabilitySummary, ConfirmActionState,
     ConnectionHealthState, ConnectionStatus, DashboardStats, DatabaseView, DeadlockGraphState,
     ErrorState, ExplainPlanState, HelpSection, HelpState, InputMode, LoadingState, NoticeState,
     OfflineState, QueryDetailSource, QueryDetailState, QueryStats, RefreshIntervalState, Tab,
@@ -59,6 +59,7 @@ enum PendingRequestKind {
     Explain,
     AdminAction,
     TableDefinition,
+    ActivityDetail,
 }
 
 struct PendingRequest {
@@ -328,6 +329,20 @@ impl App {
                         }
                     }
                 },
+                KeyCode::Char('K') => {
+                    if let Some(act) = &detail.activity_detail {
+                        self.confirm_action = Some(ConfirmActionState {
+                            title: "Terminate Session".to_string(),
+                            description: format!(
+                                "Are you sure you want to terminate session with PID {}?",
+                                act.pid
+                            ),
+                            query: format!("SELECT pg_terminate_backend({});", act.pid),
+                        });
+                        self.query_detail = None;
+                    }
+                }
+
                 _ => {}
             }
             return;
@@ -459,7 +474,14 @@ impl App {
                 }
                 KeyCode::Char('i') => match self.current_tab {
                     Tab::Activity => {
-                        self.query_detail = self.selected_activity_detail();
+                        if let Some(session) = self
+                            .selected_row
+                            .and_then(|i| self.dashboard.sessions.get(i))
+                            && let Ok(pid) = session.pid.parse::<i32>()
+                        {
+                            self.request_activity_detail(pid);
+                            self.query_detail = self.selected_activity_detail();
+                        }
                     }
                     Tab::Statements => {
                         self.query_detail = self.selected_statement_detail();
@@ -902,10 +924,6 @@ impl App {
         match self.config.apply_theme_by_name(theme_name) {
             Ok(()) => {
                 self.theme_modal = None;
-                self.notice_state = Some(NoticeState {
-                    message: format!("Theme switched to {theme_name} for this session."),
-                    created_at: Instant::now(),
-                });
             }
             Err(error) => {
                 self.theme_modal = None;
@@ -941,6 +959,7 @@ impl App {
             database: session.database.clone(),
             source: QueryDetailSource::Activity,
             stats: None,
+            activity_detail: None,
         })
     }
 
@@ -963,6 +982,7 @@ impl App {
                 read_time: row.get(5)?.clone(),
                 write_time: row.get(6)?.clone(),
             }),
+            activity_detail: None,
         })
     }
 
@@ -1331,6 +1351,36 @@ impl App {
         });
     }
 
+    fn request_activity_detail(&mut self, pid: i32) {
+        let dsn = self.dsn.clone();
+        let timeout = self.connect_timeout_ms;
+
+        self.request_refresh_worker(PendingRequestKind::ActivityDetail, move |tx| {
+            let result = (|| -> Result<RefreshPayload> {
+                let mut client = PgClient::new(&dsn, timeout)?;
+                let detail = client.fetch_activity_detail(pid)?;
+                Ok(RefreshPayload::ActivityDetail(ActivityDetail {
+                    pid: detail.pid,
+                    usename: detail.usename,
+                    application_name: detail.application_name,
+                    client_addr: detail.client_addr,
+                    client_port: detail.client_port,
+                    backend_start: detail.backend_start,
+                    state: detail.state,
+                    wait_event_type: detail.wait_event_type,
+                    wait_event: detail.wait_event,
+                    xact_start: detail.xact_start,
+                    state_change: detail.state_change,
+                    query: detail.query,
+                    blocking_pids: detail.blocking_pids,
+                    blockers: detail.blockers,
+                    locks: detail.locks,
+                }))
+            })();
+            let _ = tx.send(result);
+        });
+    }
+
     fn start_admin_action_request(&mut self, dsn: String, timeout: u64, query: String) {
         self.request_refresh_worker(PendingRequestKind::AdminAction, move |tx| {
             let result = (|| -> Result<RefreshPayload> {
@@ -1388,6 +1438,11 @@ impl App {
                     columns,
                     indexes,
                 });
+            }
+            RefreshPayload::ActivityDetail(detail) => {
+                if let Some(query_detail) = self.query_detail.as_mut() {
+                    query_detail.activity_detail = Some(detail);
+                }
             }
         }
 

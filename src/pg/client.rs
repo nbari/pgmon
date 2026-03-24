@@ -1,8 +1,9 @@
 use crate::pg::conninfo::describe_connection_target;
 use crate::pg::queries::{
-    ACTIVITY_PROCESS_QUERY, ACTIVITY_SESSIONS_QUERY, ACTIVITY_SUMMARY_QUERY, DATABASE_QUERY,
-    DATABASE_TREE_QUERY, IO_QUERY, LOCKS_QUERY, REPLICATION_RECEIVER_QUERY,
-    REPLICATION_SENDERS_QUERY, REPLICATION_SLOTS_QUERY, SETTINGS_QUERY,
+    ACTIVITY_BLOCKING_QUERY, ACTIVITY_DETAIL_QUERY, ACTIVITY_LOCKS_QUERY, ACTIVITY_PROCESS_QUERY,
+    ACTIVITY_SESSIONS_QUERY, ACTIVITY_SUMMARY_QUERY, DATABASE_QUERY, DATABASE_TREE_QUERY, IO_QUERY,
+    LOCKS_QUERY, REPLICATION_RECEIVER_QUERY, REPLICATION_SENDERS_QUERY, REPLICATION_SLOTS_QUERY,
+    SETTINGS_QUERY,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -86,6 +87,25 @@ pub(crate) struct ActivitySession {
     pub(crate) query: String,
     pub(crate) blocked_by_count: i64,
     pub(crate) blocked_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ActivityDetail {
+    pub(crate) pid: String,
+    pub(crate) usename: String,
+    pub(crate) application_name: String,
+    pub(crate) client_addr: String,
+    pub(crate) client_port: String,
+    pub(crate) backend_start: String,
+    pub(crate) state: String,
+    pub(crate) wait_event_type: String,
+    pub(crate) wait_event: String,
+    pub(crate) xact_start: String,
+    pub(crate) state_change: String,
+    pub(crate) query: String,
+    pub(crate) blocking_pids: String,
+    pub(crate) blockers: Vec<Vec<String>>,
+    pub(crate) locks: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -475,6 +495,56 @@ impl PgClient {
                 max_replication_slots: process_row.try_get::<_, i64>(12)?,
             },
             sessions,
+        })
+    }
+
+    pub fn fetch_activity_detail(&mut self, pid: i32) -> Result<ActivityDetail> {
+        let row = self.client.query_one(ACTIVITY_DETAIL_QUERY, &[&pid])?;
+        let blockers = self
+            .client
+            .query(ACTIVITY_BLOCKING_QUERY, &[&pid])?
+            .into_iter()
+            .map(|row| {
+                Ok(vec![
+                    row.try_get::<_, String>(0)?,
+                    row.try_get::<_, String>(1)?,
+                    row.try_get::<_, String>(2)?,
+                    row.try_get::<_, String>(3)?,
+                    row.try_get::<_, String>(4)?,
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let locks = self
+            .client
+            .query(ACTIVITY_LOCKS_QUERY, &[&pid])?
+            .into_iter()
+            .map(|row| {
+                Ok(vec![
+                    row.try_get::<_, String>(0)?,
+                    row.try_get::<_, String>(1)?,
+                    row.try_get::<_, String>(2)?,
+                    row.try_get::<_, String>(3)?,
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(ActivityDetail {
+            pid: row.try_get::<_, String>(0)?,
+            usename: row.try_get::<_, String>(1)?,
+            application_name: row.try_get::<_, String>(2)?,
+            client_addr: row.try_get::<_, String>(3)?,
+            client_port: row.try_get::<_, String>(4)?,
+            backend_start: row.try_get::<_, String>(5)?,
+            state: row.try_get::<_, String>(6)?,
+            wait_event_type: row.try_get::<_, String>(7)?,
+            wait_event: row.try_get::<_, String>(8)?,
+            xact_start: row.try_get::<_, String>(9)?,
+            state_change: row.try_get::<_, String>(10)?,
+            query: row.try_get::<_, String>(11)?,
+            blocking_pids: row.try_get::<_, String>(12)?,
+            blockers,
+            locks,
         })
     }
 

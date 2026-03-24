@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-03-24
+
+### Added
+- **Deep Activity Diagnostics**: Pressing `i` in the Activity view now shows extended details including exact wait events (`ClientRead`, `Lock`, etc.), transaction start times, and state change timestamps.
+- **Blocking Chain Visibility**: The Activity detail view now explicitly lists sessions that are being blocked by the selected PID, including their queries, state, and wait durations.
+- **"Waiting on PIDs" Detection**: Sessions that are waiting for other transactions now display the specific blocker PIDs in the detail view, enabling rapid tracing of locking bottlenecks.
+- **Lock Inspection**: Added a dedicated section in the Activity detail modal to list all locks currently held by the session and the relations they apply to.
+- **Direct Session Termination**: Added `K` (capital K) shortcut within the Activity detail modal to immediately terminate the inspected session with a secure confirmation workflow.
+- **Activity Visual Alerts**: Implemented functional color-coding in the main Activity list to make issues "glanceable":
+    - **Red**: Blocked sessions (Critical bottleneck).
+    - **Magenta**: Blocking sessions (Root cause of contention).
+    - **Cyan**: Idle in transaction (Potential risk).
+    - **Bold Red Time**: Long-running sessions (> 5 minutes).
+
+### Changed
+- **UX Refinement**: Removed the "Theme switched" notice message to keep the UI clean, as the color change provides immediate feedback.
+- **Diagnostics Tooling**: Upgraded `pgload.py` to support advanced row-level locking, blocking chain simulation, and periodic deadlock generation for robust TUI testing.
+
 ## [0.4.0] - 2026-03-22
 
 ### Added

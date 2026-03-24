@@ -279,12 +279,32 @@ pub struct QueryDetailState {
     pub database: String,
     pub source: QueryDetailSource,
     pub stats: Option<QueryStats>,
+    pub activity_detail: Option<ActivityDetail>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryDetailSource {
     Activity,
     Statements,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActivityDetail {
+    pub pid: String,
+    pub usename: String,
+    pub application_name: String,
+    pub client_addr: String,
+    pub client_port: String,
+    pub backend_start: String,
+    pub state: String,
+    pub wait_event_type: String,
+    pub wait_event: String,
+    pub xact_start: String,
+    pub state_change: String,
+    pub query: String,
+    pub blocking_pids: String,
+    pub blockers: Vec<Vec<String>>,
+    pub locks: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
