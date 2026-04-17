@@ -8,7 +8,7 @@ pub fn run() -> Result<()> {
     let matches = commands::new().get_matches();
 
     let verbosity = matches.get_count("verbose");
-    telemetry::init(verbosity as u8);
+    telemetry::init(verbosity);
 
     let config_path = selected_config_path(&matches);
     let resolved_config_path = crate::config::resolved_config_path(config_path);

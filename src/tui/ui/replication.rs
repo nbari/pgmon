@@ -14,7 +14,7 @@ use ratatui::{
 
 pub fn draw_replication(f: &mut Frame, app: &App, area: Rect) {
     if let Some(reason) = replication_unavailable_reason(app) {
-        draw_replication_unavailable(f, area, reason);
+        draw_replication_unavailable(f, app, area, reason);
         return;
     }
 
@@ -45,13 +45,16 @@ fn replication_unavailable_reason(app: &App) -> Option<&str> {
     }
 }
 
-fn draw_replication_unavailable(f: &mut Frame, area: Rect, reason: &str) {
+fn draw_replication_unavailable(f: &mut Frame, app: &App, area: Rect, reason: &str) {
     let modal_area = centered_rect(area, 70, 7);
     let paragraph = Paragraph::new(vec![
         Line::styled(
             "Replication Unavailable",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app
+                    .config
+                    .get_view_color("table", "header_fg")
+                    .unwrap_or(Color::Yellow))
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
@@ -82,7 +85,10 @@ fn draw_receiver_summary(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             "Standby Receiver ",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app
+                    .config
+                    .get_view_color("table", "header_fg")
+                    .unwrap_or(Color::Yellow))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(summary, Style::default().fg(Color::White)),
@@ -139,7 +145,10 @@ fn draw_senders_table(f: &mut Frame, app: &App, area: Rect) {
         ])
         .style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app
+                    .config
+                    .get_view_color("table", "header_fg")
+                    .unwrap_or(Color::Yellow))
                 .add_modifier(Modifier::BOLD),
         )
         .bottom_margin(1),
@@ -189,7 +198,10 @@ fn draw_slots_table(f: &mut Frame, app: &App, area: Rect) {
         ])
         .style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app
+                    .config
+                    .get_view_color("table", "header_fg")
+                    .unwrap_or(Color::Yellow))
                 .add_modifier(Modifier::BOLD),
         )
         .bottom_margin(1),

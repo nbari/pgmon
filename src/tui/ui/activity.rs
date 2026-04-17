@@ -1,8 +1,7 @@
 use crate::tui::app::{
     ActivityChartMetric, ActivitySummaryMetric, ActivitySummarySection, App,
     format::{
-        activity_state_cell, activity_wait_cell, format_activity_query, format_bytes,
-        format_duration_hms, format_uptime,
+        activity_state_cell, activity_wait_cell, format_activity_query, format_bytes, format_uptime,
     },
 };
 use ratatui::{
@@ -55,7 +54,9 @@ fn draw_activity_chart(f: &mut Frame, app: &App, area: Rect) {
             bounds,
             ActivityChartMetric::Tps,
             &app.dashboard.chart_history.tps,
-            Color::Cyan,
+            app.config
+                .get_view_color("chart", "line1")
+                .unwrap_or(Color::Cyan),
             false,
         ),
         ActivityChartMetric::Dml => draw_dml_chart(f, app, area, bounds),
@@ -65,7 +66,9 @@ fn draw_activity_chart(f: &mut Frame, app: &App, area: Rect) {
             bounds,
             ActivityChartMetric::TempBytesPerSec,
             &app.dashboard.chart_history.temp_bytes_per_sec,
-            Color::Magenta,
+            app.config
+                .get_view_color("chart", "line1")
+                .unwrap_or(Color::Magenta),
             true,
         ),
         ActivityChartMetric::GrowthBytesPerSec => draw_scalar_chart(
@@ -74,7 +77,9 @@ fn draw_activity_chart(f: &mut Frame, app: &App, area: Rect) {
             bounds,
             ActivityChartMetric::GrowthBytesPerSec,
             &app.dashboard.chart_history.growth_bytes_per_sec,
-            Color::LightBlue,
+            app.config
+                .get_view_color("chart", "line1")
+                .unwrap_or(Color::LightBlue),
             true,
         ),
     }
@@ -125,17 +130,21 @@ fn draw_connections_chart(f: &mut Frame, app: &App, area: Rect, bounds: ChartBou
     } else {
         Color::Green
     };
+    let line1_color = app
+        .config
+        .get_view_color("chart", "line1")
+        .unwrap_or(Color::Cyan);
     let datasets = vec![
-        single_line_dataset(&total_data, Color::Cyan),
+        single_line_dataset(&total_data, line1_color),
         single_line_dataset(&idle_data, idle_color),
     ];
     let title = Line::from(vec![
         chart_metric_title(ActivityChartMetric::Connections),
-        Span::styled("━", Style::default().fg(Color::Cyan)),
+        Span::styled("━", Style::default().fg(line1_color)),
         Span::styled(
             format!(" total: {total_now}  "),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(line1_color)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("━", Style::default().fg(idle_color)),
@@ -173,27 +182,40 @@ fn draw_dml_chart(f: &mut Frame, app: &App, area: Rect, bounds: ChartBounds) {
             .copied(),
         1.0,
     );
+    let line1_color = app
+        .config
+        .get_view_color("chart", "line1")
+        .unwrap_or(Color::Green);
+    let line2_color = app
+        .config
+        .get_view_color("chart", "line2")
+        .unwrap_or(Color::Yellow);
+    let line3_color = app
+        .config
+        .get_view_color("chart", "line3")
+        .unwrap_or(Color::Red);
+
     let datasets = vec![
-        single_line_dataset(&insert_data, Color::Green),
-        single_line_dataset(&update_data, Color::Yellow),
-        single_line_dataset(&delete_data, Color::Red),
+        single_line_dataset(&insert_data, line1_color),
+        single_line_dataset(&update_data, line2_color),
+        single_line_dataset(&delete_data, line3_color),
     ];
     let title = Line::from(vec![
         chart_metric_title(ActivityChartMetric::Dml),
-        Span::styled("━", Style::default().fg(Color::Green)),
+        Span::styled("━", Style::default().fg(line1_color)),
         Span::styled(
             format!(" ins: {}  ", format_rate_value(insert_now)),
-            Style::default().fg(Color::Green),
+            Style::default().fg(line1_color),
         ),
-        Span::styled("━", Style::default().fg(Color::Yellow)),
+        Span::styled("━", Style::default().fg(line2_color)),
         Span::styled(
             format!(" upd: {}  ", format_rate_value(update_now)),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(line2_color),
         ),
-        Span::styled("━", Style::default().fg(Color::Red)),
+        Span::styled("━", Style::default().fg(line3_color)),
         Span::styled(
             format!(" del: {} ", format_rate_value(delete_now)),
-            Style::default().fg(Color::Red),
+            Style::default().fg(line3_color),
         ),
     ]);
     render_chart(
@@ -437,7 +459,10 @@ fn activity_summary_meta_row(app: &App) -> Line<'static> {
         Span::styled(
             format!("PostgreSQL {}", summary.server_version),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app
+                    .config
+                    .get_view_color("table", "header_fg")
+                    .unwrap_or(Color::Yellow))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
@@ -712,64 +737,7 @@ fn draw_activity_sessions_panel(f: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(i, session)| {
             let is_selected = app.selected_row == Some(i);
-
-            // 1. Determine Row Style (Warnings)
-            let base_style = if is_selected {
-                Style::default().fg(Color::Black).bg(Color::White)
-            } else if session.blocked_by_count > 0 {
-                Style::default().fg(Color::Red) // Blocked sessions are Red (CRITICAL)
-            } else if session.blocked_count > 0 {
-                Style::default().fg(Color::Magenta) // Blocking sessions are Magenta (ACTION REQUIRED)
-            } else if session.state.contains("idle in transaction") {
-                Style::default().fg(Color::Cyan) // Idle in transaction is Cyan (WARNING)
-            } else if session.state == "active" {
-                Style::default().fg(Color::Green) // Active is Green (OK)
-            } else {
-                Style::default().fg(Color::DarkGray) // Idle/Other is Dim
-            };
-
-            let white_style = if is_selected {
-                base_style
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let dim_style = if is_selected {
-                base_style
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            Row::new(vec![
-                Cell::from(session.pid.as_str()).style(white_style),
-                Cell::from(session.xmin.as_str()).style(white_style),
-                Cell::from(session.database.as_str()).style(dim_style),
-                Cell::from(session.application.as_str()).style(dim_style),
-                Cell::from(session.user.as_str()).style(dim_style),
-                Cell::from(session.client.as_str()).style(white_style),
-                Cell::from(format_duration_hms(session.duration_seconds)).style(
-                    activity_time_style(is_selected, session.duration_seconds, base_style),
-                ),
-                Cell::from(activity_wait_cell(session)).style(if is_selected {
-                    base_style
-                } else if session.blocked_by_count > 0 {
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                }),
-                Cell::from(activity_state_cell(session)).style(if is_selected {
-                    base_style
-                } else if session.state.contains("idle in transaction") {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else if session.state == "active" {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                }),
-                Cell::from(format_activity_query(session)).style(white_style),
-            ])
-            .style(base_style)
+            session_to_row(session, is_selected)
         });
 
     let count = app.dashboard.sessions.len();
@@ -782,15 +750,93 @@ fn draw_activity_sessions_panel(f: &mut Frame, app: &mut App, area: Rect) {
             Row::new(header_cells.iter().map(|h| Cell::from(*h)))
                 .style(
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(app
+                            .config
+                            .get_view_color("table", "header_fg")
+                            .unwrap_or(Color::Yellow))
                         .add_modifier(Modifier::BOLD),
                 )
                 .bottom_margin(1),
         )
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().fg(Color::Black).bg(Color::White));
+        .row_highlight_style(
+            Style::default()
+                .fg(app
+                    .config
+                    .get_view_color("table", "highlight_fg")
+                    .unwrap_or(Color::Black))
+                .bg(app
+                    .config
+                    .get_view_color("table", "highlight_bg")
+                    .unwrap_or(Color::White)),
+        );
 
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn session_to_row(session: &crate::pg::client::ActivitySession, is_selected: bool) -> Row<'_> {
+    // 1. Determine Row Style (Warnings)
+    let base_style = if is_selected {
+        Style::default().fg(Color::Black).bg(Color::White)
+    } else if session.blocked_by_count > 0 {
+        Style::default().fg(Color::Red) // Blocked sessions are Red (CRITICAL)
+    } else if session.blocked_count > 0 {
+        Style::default().fg(Color::Magenta) // Blocking sessions are Magenta (ACTION REQUIRED)
+    } else if session.state.contains("idle in transaction") {
+        Style::default().fg(Color::Cyan) // Idle in transaction is Cyan (WARNING)
+    } else if session.state == "active" {
+        Style::default().fg(Color::Green) // Active is Green (OK)
+    } else {
+        Style::default().fg(Color::DarkGray) // Idle/Other is Dim
+    };
+
+    let white_style = if is_selected {
+        base_style
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let dim_style = if is_selected {
+        base_style
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    Row::new(vec![
+        Cell::from(session.pid.as_str()).style(white_style),
+        Cell::from(session.xmin.as_str()).style(white_style),
+        Cell::from(session.database.as_str()).style(dim_style),
+        Cell::from(session.application.as_str()).style(dim_style),
+        Cell::from(session.user.as_str()).style(dim_style),
+        Cell::from(session.client.as_str()).style(white_style),
+        Cell::from(crate::tui::app::format::format_duration_hms(
+            session.duration_seconds,
+        ))
+        .style(activity_time_style(
+            is_selected,
+            session.duration_seconds,
+            base_style,
+        )),
+        Cell::from(activity_wait_cell(session)).style(if is_selected {
+            base_style
+        } else if session.blocked_by_count > 0 {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }),
+        Cell::from(activity_state_cell(session)).style(if is_selected {
+            base_style
+        } else if session.state.contains("idle in transaction") {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if session.state == "active" {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }),
+        Cell::from(format_activity_query(session)).style(white_style),
+    ])
+    .style(base_style)
 }
 
 fn activity_time_style(is_selected: bool, duration_seconds: i64, selected_style: Style) -> Style {

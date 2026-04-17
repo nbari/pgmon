@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-04-17
+
+### Added
+- **Expanded Theme Support**: Improved the theme engine to customize more UI elements including table headers, row highlight colors (foreground and background), and chart line colors.
+- **Rich Built-in Themes**: Updated all built-in themes (`calibrachoa`, `sky`, `mint`, `retro`) to provide a fully themed experience across all views.
+- **Themed UI Accents**: Keybinding labels in the footer and active tab highlights now dynamically follow the active theme's accent colors.
+
+### Fixed
+- **Strict Linting Compliance**: Fixed multiple Clippy warnings related to unnecessary casts and collapsible match arms, ensuring 100% compliance with strict pedantic rules.
+- **Code Organization**: Refactored theme definitions and session rendering into smaller, more maintainable functions to meet clean code standards.
+- **Formatting**: Standardized the entire codebase with `cargo fmt`.
+
 ## [0.5.0] - 2026-03-24
 
 ### Added

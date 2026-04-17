@@ -117,10 +117,13 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
                 .style(Style::default().fg(header_color)),
         )
         .select(selected_tab)
-        .style(Style::default().fg(Color::Cyan))
+        .style(Style::default().fg(header_color))
         .highlight_style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app
+                    .config
+                    .get_view_color("table", "header_fg")
+                    .unwrap_or(Color::Yellow))
                 .add_modifier(Modifier::BOLD),
         );
     f.render_widget(tabs, area);
@@ -129,13 +132,17 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
 #[allow(clippy::too_many_lines)]
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let mut footer_spans = Vec::new();
+    let accent_color = app
+        .config
+        .get_view_color("table", "header_fg")
+        .unwrap_or(Color::Yellow);
 
     if app.input_mode == InputMode::Search {
         footer_spans.extend(vec![
             Span::styled(
                 "SEARCH",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(accent_color)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(": ", Style::default().fg(Color::DarkGray)),
@@ -145,14 +152,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 "Esc",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(accent_color)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(":Cancel | ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 "Enter",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(accent_color)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(":Keep Filter", Style::default().fg(Color::DarkGray)),
@@ -163,12 +170,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Green),
         ));
     } else if app.error_state.is_some() {
-        footer_spans.extend(style_keybinding("q:Quit | r:Retry | 1-8:Switch Tab"));
+        footer_spans.extend(style_keybinding(
+            "q:Quit | r:Retry | 1-8:Switch Tab",
+            accent_color,
+        ));
     } else if matches!(
         app.current_view_capability(),
         Some(CapabilityStatus::Unavailable(_))
     ) {
-        footer_spans.extend(style_keybinding("q:Quit | hjkl:Navigate | 1-8:Tabs"));
+        footer_spans.extend(style_keybinding(
+            "q:Quit | hjkl:Navigate | 1-8:Tabs",
+            accent_color,
+        ));
     } else if app.current_tab == Tab::Activity {
         if let Some(session) = app
             .selected_row
@@ -184,10 +197,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ]);
             footer_spans.extend(style_keybinding(
                 "e:Export | /:Search | Enter:Save Query | a/w/b/t:Subviews | m:Metric",
+                accent_color,
             ));
         } else {
             footer_spans.extend(style_keybinding(
                 "q:Quit | hjkl:Navigate | 1-8:Tabs | e:Export | /:Search | Enter:Save Query | a/w/b/t:Subviews | m:Metric",
+                accent_color,
             ));
         }
     } else if app.current_tab == Tab::Replication {
@@ -198,6 +213,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             .unwrap_or("Receiver: inactive");
         footer_spans.extend(style_keybinding(
             "q:Quit | hjkl:Navigate | 1-8:Tabs | /:Search | n:Top",
+            accent_color,
         ));
         footer_spans.extend(vec![
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
@@ -215,7 +231,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(truncate_str(query, 60), Style::default().fg(Color::White)),
                     Span::styled(" | ", Style::default().fg(Color::DarkGray)),
                 ]);
-                footer_spans.extend(style_keybinding("e:Export | Enter:Save Query | i:Details"));
+                footer_spans.extend(style_keybinding(
+                    "e:Export | Enter:Save Query | i:Details",
+                    accent_color,
+                ));
             }
             Tab::Database => match &app.database_view {
                 DatabaseView::Summary => {
@@ -225,7 +244,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                         Span::styled(database, Style::default().fg(Color::White)),
                         Span::styled(" | ", Style::default().fg(Color::DarkGray)),
                     ]);
-                    footer_spans.extend(style_keybinding("Enter:Browse Tables"));
+                    footer_spans.extend(style_keybinding("Enter:Browse Tables", accent_color));
                 }
                 DatabaseView::Tables { database } => {
                     let node = row_data.first().map_or("", String::as_str);
@@ -236,63 +255,79 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                         Span::styled(node.trim(), Style::default().fg(Color::White)),
                         Span::styled(" | ", Style::default().fg(Color::DarkGray)),
                     ]);
-                    footer_spans
-                        .extend(style_keybinding("s:Show | v:Vacuum | R:Reindex | Esc:Back"));
+                    footer_spans.extend(style_keybinding(
+                        "s:Show | v:Vacuum | R:Reindex | Esc:Back",
+                        accent_color,
+                    ));
                 }
             },
             Tab::Settings => {
                 footer_spans.extend(style_keybinding(
                     "q:Quit | hjkl:Navigate | 1-8:Tabs | /:Search",
+                    accent_color,
                 ));
             }
-            _ => footer_spans.extend(style_keybinding("q:Quit | hjkl:Navigate | 1-8:Tabs")),
+            _ => footer_spans.extend(style_keybinding(
+                "q:Quit | hjkl:Navigate | 1-8:Tabs",
+                accent_color,
+            )),
         }
     } else {
         match app.current_tab {
             Tab::Activity => {
                 footer_spans.extend(style_keybinding(
                     "q:Quit | hjkl:Navigate | 1-8:Tabs | e:Export | /:Search | Enter:Save Query | a/w/b/t:Subviews | m:Metric",
+                    accent_color,
                 ));
             }
             Tab::Replication => {
                 footer_spans.extend(style_keybinding(
                     "q:Quit | hjkl:Navigate | 1-8:Tabs | /:Search | n:Top",
+                    accent_color,
                 ));
             }
             Tab::Statements => {
                 footer_spans.extend(style_keybinding(
                     "q:Quit | hjkl:Navigate | 1-8:Tabs | e:Export | Enter:Save Query | i:Details",
+                    accent_color,
                 ));
             }
             Tab::Database => match &app.database_view {
                 DatabaseView::Summary => {
                     footer_spans.extend(style_keybinding(
                         "q:Quit | hjkl:Navigate | 1-8:Tabs | Enter:Browse Tables",
+                        accent_color,
                     ));
                 }
                 DatabaseView::Tables { .. } => {
                     footer_spans.extend(style_keybinding(
                         "q:Quit | hjkl:Navigate | 1-8:Tabs | s:Show | v:Vacuum | R:Reindex | Esc:Back",
+                        accent_color,
                     ));
                 }
             },
             Tab::Locks => {
                 footer_spans.extend(style_keybinding(
                     "q:Quit | hjkl:Navigate | 1-8:Tabs | i:Visualizer",
+                    accent_color,
                 ));
             }
             Tab::Settings => {
                 footer_spans.extend(style_keybinding(
                     "q:Quit | hjkl:Navigate | 1-8:Tabs | /:Search",
+                    accent_color,
                 ));
             }
-            _ => footer_spans.extend(style_keybinding("q:Quit | hjkl:Navigate | 1-8:Tabs")),
+            _ => footer_spans.extend(style_keybinding(
+                "q:Quit | hjkl:Navigate | 1-8:Tabs",
+                accent_color,
+            )),
         }
     }
 
-    append_offline_status(&mut footer_spans, app);
-    append_theme_binding(&mut footer_spans, app);
-    append_help_binding(&mut footer_spans, app);
+    append_offline_status(&mut footer_spans, app, accent_color);
+    append_theme_binding(&mut footer_spans, app, accent_color);
+    append_help_binding(&mut footer_spans, app, accent_color);
     append_link_state(&mut footer_spans, app);
 
     let footer_color = parse_color(&app.config.ui.footer_border_color).unwrap_or(Color::Cyan);
@@ -305,7 +340,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(footer, area);
 }
 
-fn style_keybinding(text: &str) -> Vec<Span<'_>> {
+fn style_keybinding(text: &str, accent_color: Color) -> Vec<Span<'_>> {
     let mut spans = Vec::new();
     let parts: Vec<&str> = text.split(" | ").collect();
     for (i, part) in parts.iter().enumerate() {
@@ -313,7 +348,7 @@ fn style_keybinding(text: &str) -> Vec<Span<'_>> {
             spans.push(Span::styled(
                 key,
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(accent_color)
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(":", Style::default().fg(Color::DarkGray)));
@@ -328,7 +363,7 @@ fn style_keybinding(text: &str) -> Vec<Span<'_>> {
     spans
 }
 
-fn append_offline_status(footer_spans: &mut Vec<Span<'_>>, app: &App) {
+fn append_offline_status(footer_spans: &mut Vec<Span<'_>>, app: &App, accent_color: Color) {
     if !app.is_offline() {
         return;
     }
@@ -361,11 +396,11 @@ fn append_offline_status(footer_spans: &mut Vec<Span<'_>>, app: &App) {
 
     if app.can_manual_reconnect() {
         footer_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        footer_spans.extend(style_keybinding("c:Reconnect"));
+        footer_spans.extend(style_keybinding("c:Reconnect", accent_color));
     }
 }
 
-fn append_theme_binding(footer_spans: &mut Vec<Span<'_>>, app: &App) {
+fn append_theme_binding(footer_spans: &mut Vec<Span<'_>>, app: &App, accent_color: Color) {
     if app.input_mode != InputMode::Normal
         || !app.has_theme_options()
         || app.notice_state.is_some()
@@ -377,10 +412,10 @@ fn append_theme_binding(footer_spans: &mut Vec<Span<'_>>, app: &App) {
     if !footer_spans.is_empty() {
         footer_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
     }
-    footer_spans.extend(style_keybinding("T:Theme"));
+    footer_spans.extend(style_keybinding("T:Theme", accent_color));
 }
 
-fn append_help_binding(footer_spans: &mut Vec<Span<'_>>, app: &App) {
+fn append_help_binding(footer_spans: &mut Vec<Span<'_>>, app: &App, accent_color: Color) {
     if app.input_mode != InputMode::Normal
         || app.notice_state.is_some()
         || app.error_state.is_some()
@@ -391,7 +426,7 @@ fn append_help_binding(footer_spans: &mut Vec<Span<'_>>, app: &App) {
     if !footer_spans.is_empty() {
         footer_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
     }
-    footer_spans.extend(style_keybinding("?:Help"));
+    footer_spans.extend(style_keybinding("?:Help", accent_color));
 }
 
 fn append_link_state(footer_spans: &mut Vec<Span<'_>>, app: &App) {

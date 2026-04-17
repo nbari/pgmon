@@ -43,7 +43,10 @@ pub fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             Row::new(header_cells.iter().map(|h| Cell::from(*h)))
                 .style(
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(app
+                            .config
+                            .get_view_color("table", "header_fg")
+                            .unwrap_or(Color::Yellow))
                         .add_modifier(Modifier::BOLD),
                 )
                 .bottom_margin(1),
@@ -53,7 +56,17 @@ pub fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
                 .borders(Borders::ALL)
                 .title(table_title(app)),
         )
-        .row_highlight_style(Style::default().fg(Color::Black).bg(Color::White));
+        .row_highlight_style(
+            Style::default()
+                .fg(app
+                    .config
+                    .get_view_color("table", "highlight_fg")
+                    .unwrap_or(Color::Black))
+                .bg(app
+                    .config
+                    .get_view_color("table", "highlight_bg")
+                    .unwrap_or(Color::White)),
+        );
 
     f.render_stateful_widget(table, area, &mut app.table_state);
 }

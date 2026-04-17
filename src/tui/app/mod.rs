@@ -361,15 +361,13 @@ impl App {
                         self.request_refresh();
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if modal.selected_index < modal.options.len() - 1 {
-                        modal.selected_index += 1;
-                    }
+                KeyCode::Down | KeyCode::Char('j')
+                    if modal.selected_index < modal.options.len() - 1 =>
+                {
+                    modal.selected_index += 1;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if modal.selected_index > 0 {
-                        modal.selected_index -= 1;
-                    }
+                KeyCode::Up | KeyCode::Char('k') if modal.selected_index > 0 => {
+                    modal.selected_index -= 1;
                 }
                 _ => {}
             }
@@ -389,15 +387,13 @@ impl App {
                         self.request_refresh();
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if modal.selected_index < modal.options.len() - 1 {
-                        modal.selected_index += 1;
-                    }
+                KeyCode::Down | KeyCode::Char('j')
+                    if modal.selected_index < modal.options.len() - 1 =>
+                {
+                    modal.selected_index += 1;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if modal.selected_index > 0 {
-                        modal.selected_index -= 1;
-                    }
+                KeyCode::Up | KeyCode::Char('k') if modal.selected_index > 0 => {
+                    modal.selected_index -= 1;
                 }
                 _ => {}
             }
@@ -416,15 +412,13 @@ impl App {
                     KeyCode::Enter => {
                         selected_theme = modal.options.get(modal.selected_index).cloned();
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if modal.selected_index < modal.options.len().saturating_sub(1) {
-                            modal.selected_index += 1;
-                        }
+                    KeyCode::Down | KeyCode::Char('j')
+                        if modal.selected_index < modal.options.len().saturating_sub(1) =>
+                    {
+                        modal.selected_index += 1;
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if modal.selected_index > 0 {
-                            modal.selected_index -= 1;
-                        }
+                    KeyCode::Up | KeyCode::Char('k') if modal.selected_index > 0 => {
+                        modal.selected_index -= 1;
                     }
                     _ => {}
                 }
@@ -460,10 +454,8 @@ impl App {
                 KeyCode::Char('6') => self.set_tab(Tab::Replication),
                 KeyCode::Char('7') => self.set_tab(Tab::Settings),
                 KeyCode::Char('8') => self.set_tab(Tab::Tools),
-                KeyCode::Char('e') => {
-                    if self.can_export_current_view() {
-                        self.export_current_table();
-                    }
+                KeyCode::Char('e') if self.can_export_current_view() => {
+                    self.export_current_table();
                 }
                 KeyCode::Char('s') => {
                     if let (Tab::Database, DatabaseView::Tables { .. }) =
@@ -532,17 +524,13 @@ impl App {
                     self.table_state.select(self.selected_row);
                 }
                 KeyCode::Char('n') => self.toggle_top_n_modal(),
-                KeyCode::Char('m') => {
-                    if self.current_tab == Tab::Activity {
-                        self.cycle_activity_chart_metric();
-                    }
+                KeyCode::Char('m') if self.current_tab == Tab::Activity => {
+                    self.cycle_activity_chart_metric();
                 }
                 KeyCode::Char('?') => self.toggle_help_modal(),
                 KeyCode::Char('T') => self.toggle_theme_modal(),
-                KeyCode::Char('c') => {
-                    if self.is_offline() {
-                        self.request_refresh();
-                    }
+                KeyCode::Char('c') if self.is_offline() => {
+                    self.request_refresh();
                 }
                 KeyCode::Esc => {
                     self.search_query.clear();
