@@ -11,6 +11,7 @@ mod test_harness {
         QueryDetailSource, QueryDetailState, QueryStats, RefreshPayload, Tab, clamp_selected_row,
         parse_rate_value,
     };
+    use crate::pg::client::ExplainMode;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::{
         fs,
@@ -274,7 +275,7 @@ mod test_harness {
     }
 
     #[test]
-    fn test_handle_key_event_does_not_explain_statement_query() {
+    fn test_handle_key_event_starts_safe_explain_for_statement_query() {
         let mut app = App::new(
             "postgres://localhost/postgres".to_string(),
             3000,
@@ -290,6 +291,8 @@ mod test_harness {
             query: "SELECT * FROM accounts WHERE id = $1".to_string(),
             database: "postgres".to_string(),
             source: QueryDetailSource::Statements,
+            explain_mode: ExplainMode::GenericEstimated,
+            explain_unavailable_reason: None,
             stats: Some(QueryStats {
                 total_time: "1".to_string(),
                 mean_time: "1".to_string(),
@@ -298,19 +301,21 @@ mod test_harness {
                 write_time: "0".to_string(),
             }),
             activity_detail: None,
+            auto_explain_summary: String::new(),
+            auto_explain_hint: None,
         });
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
 
-        assert!(app.notice_state.is_some());
-        assert!(app.query_detail.is_some());
-        assert!(app.loading_state.is_none());
-        assert!(app.pending_request.is_none());
+        assert!(app.notice_state.is_none());
+        assert!(app.query_detail.is_none());
+        assert!(app.loading_state.is_some());
+        assert!(app.pending_request.is_some());
         assert!(app.explain_plan.is_none());
     }
 
     #[test]
-    fn test_handle_key_event_does_not_explain_normalized_activity_query() {
+    fn test_handle_key_event_starts_generic_explain_for_normalized_activity_query() {
         let mut app = App::new(
             "postgres://localhost/postgres".to_string(),
             3000,
@@ -326,17 +331,79 @@ mod test_harness {
             query: "SELECT * FROM accounts WHERE id = $1".to_string(),
             database: "postgres".to_string(),
             source: QueryDetailSource::Activity,
+            explain_mode: ExplainMode::GenericEstimated,
+            explain_unavailable_reason: None,
             stats: None,
             activity_detail: None,
+            auto_explain_summary: "auto_explain: loading...".to_string(),
+            auto_explain_hint: None,
         });
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
 
-        assert!(app.notice_state.is_some());
-        assert!(app.query_detail.is_some());
+        assert!(app.notice_state.is_none());
+        assert!(app.query_detail.is_none());
+        assert!(app.loading_state.is_some());
+        assert!(app.pending_request.is_some());
+        assert!(app.explain_plan.is_none());
+    }
+
+    #[test]
+    fn test_handle_key_event_keeps_info_open_when_explain_is_unavailable() {
+        let mut app = App::new(
+            "postgres://localhost/postgres".to_string(),
+            3000,
+            None,
+            1000,
+            10,
+            "statements",
+            "total_time",
+            crate::config::Config::default(),
+        );
+
+        app.query_detail = Some(QueryDetailState {
+            query: "SELECT * FROM accounts WHERE id = $1".to_string(),
+            database: "postgres".to_string(),
+            source: QueryDetailSource::Statements,
+            explain_mode: ExplainMode::GenericEstimated,
+            explain_unavailable_reason: Some(
+                "Generic estimated plans require PostgreSQL 16+; this server is PostgreSQL 15."
+                    .to_string(),
+            ),
+            stats: None,
+            activity_detail: None,
+            auto_explain_summary: String::new(),
+            auto_explain_hint: None,
+        });
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
         assert!(app.loading_state.is_none());
         assert!(app.pending_request.is_none());
-        assert!(app.explain_plan.is_none());
+        assert!(app.query_detail.is_some());
+        assert!(app.notice_state.is_some());
+    }
+
+    #[test]
+    fn test_explain_state_for_query_marks_generic_plan_unavailable_on_postgresql_15() {
+        let (mode, reason) = super::super::explain_state_for_query(
+            "SELECT * FROM accounts WHERE id = $1",
+            Some(150_000),
+        );
+
+        assert_eq!(mode, ExplainMode::GenericEstimated);
+        let reason = reason.unwrap_or_default();
+        assert!(reason.contains("PostgreSQL 16+"));
+    }
+
+    #[test]
+    fn test_explain_state_for_query_rejects_multi_statement_input() {
+        let (mode, reason) =
+            super::super::explain_state_for_query("SELECT 1; DELETE FROM accounts", Some(160_000));
+
+        assert_eq!(mode, ExplainMode::Estimated);
+        let reason = reason.unwrap_or_default();
+        assert!(reason.contains("single SQL statement"));
     }
 
     #[test]
@@ -428,7 +495,14 @@ mod test_harness {
             rx,
             started_at: instant_secs_ago(2),
         });
-        let send_result = tx.send(Ok(RefreshPayload::Explain(vec!["Seq Scan".to_string()])));
+        let send_result = tx.send(Ok(RefreshPayload::Explain(
+            super::super::ExplainPlanState {
+                plan: vec!["Seq Scan".to_string()],
+                explain_mode: ExplainMode::Estimated,
+                auto_explain_summary: "auto_explain: enabled".to_string(),
+                auto_explain_hint: None,
+            },
+        )));
         assert!(send_result.is_ok());
 
         app.handle_refresh_result();
@@ -793,7 +867,7 @@ mod test_harness {
             section
                 .lines
                 .iter()
-                .any(|line| line.contains("Explain is intentionally unavailable"))
+                .any(|line| line.contains("generic estimated plan"))
         }));
     }
 

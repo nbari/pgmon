@@ -7,6 +7,8 @@
 
 A PostgreSQL monitoring TUI inspired by `pg_activity`.
 
+Supports PostgreSQL 14 and newer.
+
 <p align="center">
   <a href="./pgmon.png">
     <img src="./pgmon.png" alt="pgmon screenshot" width="800">
@@ -186,15 +188,17 @@ The report includes:
 
 `pgmon` has two query-inspection flows:
 
-- In `Statements`, press `i` on the selected row to open a detail modal with the database name, full SQL text, and aggregated timing counters from `pg_stat_statements`.
-- In `Activity`, press `i` on the selected session to inspect the current query text for that backend and optionally run `EXPLAIN (ANALYZE, BUFFERS)`.
+- In `Statements`, press `i` on the selected row to open an info modal with the database name, full SQL text, and aggregated timing counters from `pg_stat_statements`.
+- In `Activity`, press `i` on the selected session to open an info modal for that backend query and optionally run `EXPLAIN`.
 
-Inside the query detail modal:
+Inside the query info modal:
 
 - `Enter` saves the SQL text to `--query-output-dir` or the system temp directory.
-- `x` runs `EXPLAIN (ANALYZE, BUFFERS)` only for queries opened from `Activity`.
+- `x` runs safe `EXPLAIN` from both `Activity` and `Statements`.
+- `pgmon` also shows whether `auto_explain` is enabled and, when needed, how to enable it for real execution plans in PostgreSQL logs.
+- Unsupported SQL is refused before it reaches PostgreSQL; pgmon only explains single `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`MERGE` statements.
 
-### Normalized Query Limitation
+### Parameterized Query Limitation
 
 `pg_stat_statements` often stores normalized SQL such as:
 
@@ -202,21 +206,24 @@ Inside the query detail modal:
 SELECT * FROM accounts WHERE id = $1
 ```
 
-Those placeholders do not include actual runtime values, so `pgmon` cannot safely execute `EXPLAIN ANALYZE` for them.
+Those placeholders do not include actual runtime values, so `pgmon` cannot produce a value-specific plan for them.
 
-For that reason, `Statements` is now an inspect-only view for query text and aggregated timings. Its detail modal does not offer `EXPLAIN ANALYZE`, because the SQL usually represents a normalized statement shape rather than one executable statement with real values.
+On PostgreSQL 16+, placeholders use `EXPLAIN (GENERIC_PLAN, VERBOSE, SETTINGS)` instead of executing the statement. This is safe, but it is intentionally value-agnostic: real bind values can change row estimates and even the chosen plan nodes.
 
-When a normalized query is opened from `Activity`:
+On PostgreSQL 14 and 15, `GENERIC_PLAN` is not available yet, so pgmon leaves parameterized statements as info-only and shows a notice instead of attempting explain.
 
-- the modal shows a warning
-- the `x` action is marked as unavailable
-- pressing `x` keeps the modal open and shows a notice instead of sending the query to PostgreSQL
+When PostgreSQL cannot infer one or more parameter types for a generic plan:
 
-If you need an execution plan for a normalized statement, copy the SQL and replace `$1`, `$2`, and similar placeholders with real literal values in a separate session before running `EXPLAIN`.
+- `pgmon` shows an error instead of executing the query
+- add explicit casts in the SQL or replace placeholders with real literals outside `pgmon`
+
+`pgmon` also refuses multi-statement SQL in explain mode so trailing statements in a batch cannot execute accidentally.
+
+All plans shown by `pgmon` are estimated plans gathered from a fresh session. Session-local settings, temp objects, prepared statements, or different bind values can still make the real runtime plan differ.
 
 ## View Notes
 
 - In the Database view, press `Enter` on a selected database row to browse schemas and tables for that database, and press `Esc` to return to the summary view.
-- In the Activity view, use `a`, `w`, `b`, and `t` to switch between active, waiting, blocking, and idle-in-transaction session subviews.
+- In the Activity view, use `i` to open query info for the selected backend, and use `a`, `w`, `b`, and `t` to switch between active, waiting, blocking, and idle-in-transaction session subviews.
 - In the Activity view, press `m` to cycle the chart between Connections, TPS, DML/s, Temp Bytes/s, and Growth Bytes/s without triggering a refresh.
 - Press `?` in any main view to open contextual help with that view's shortcuts, important limitations, and brief metric explanations.

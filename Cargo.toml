@@ -1,6 +1,6 @@
 [package]
 name = "pgmon"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 authors = ["Nicolas Embriz <nbari@tequila.io>"]
 description = "A PostgreSQL monitoring TUI"
@@ -45,6 +45,7 @@ clap = { version = "4.6", features = ["color", "env", "string"] }
 chrono = "0.4"
 crossterm = { version = "0.29", features = ["events"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }
+pg_query = "6.1.1"
 ratatui = "0.30"
 thiserror = "2.0"
 tracing = "0.1"

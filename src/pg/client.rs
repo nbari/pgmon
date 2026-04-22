@@ -1,14 +1,18 @@
 use crate::pg::conninfo::describe_connection_target;
 use crate::pg::queries::{
     ACTIVITY_BLOCKING_QUERY, ACTIVITY_DETAIL_QUERY, ACTIVITY_LOCKS_QUERY, ACTIVITY_PROCESS_QUERY,
-    ACTIVITY_SESSIONS_QUERY, ACTIVITY_SUMMARY_QUERY, DATABASE_QUERY, DATABASE_TREE_QUERY, IO_QUERY,
-    LOCKS_QUERY, REPLICATION_RECEIVER_QUERY, REPLICATION_SENDERS_QUERY, REPLICATION_SLOTS_QUERY,
-    SETTINGS_QUERY,
+    ACTIVITY_SESSIONS_QUERY, ACTIVITY_SUMMARY_QUERY, AUTO_EXPLAIN_STATUS_QUERY, DATABASE_QUERY,
+    DATABASE_TREE_QUERY, IO_QUERY, LOCKS_QUERY, REPLICATION_RECEIVER_QUERY,
+    REPLICATION_SENDERS_QUERY, REPLICATION_SLOTS_QUERY, SETTINGS_QUERY,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use pg_query::NodeRef;
 use postgres::{Client, Config, NoTls};
 use std::time::Duration;
+
+pub(crate) const MIN_SUPPORTED_SERVER_VERSION_NUM: i32 = 140_000;
+const GENERIC_PLAN_MIN_SERVER_VERSION_NUM: i32 = 160_000;
 
 /// Availability state for optional `PostgreSQL` monitoring features.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -25,6 +29,32 @@ pub(crate) enum CapabilityStatus {
 impl CapabilityStatus {
     fn unavailable(reason: impl Into<String>) -> Self {
         Self::Unavailable(reason.into())
+    }
+}
+
+/// Safe in-app planning modes used by `pgmon` query diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExplainMode {
+    /// Use a regular estimated plan for executable SQL text.
+    Estimated,
+    /// Use `PostgreSQL`'s generic planner path for parameterized SQL with placeholders.
+    GenericEstimated,
+}
+
+impl ExplainMode {
+    /// Human-readable title shown by the explain modal.
+    pub(crate) const fn title(self) -> &'static str {
+        match self {
+            Self::Estimated => "Estimated Plan",
+            Self::GenericEstimated => "Generic Estimated Plan",
+        }
+    }
+
+    fn statement_prefix(self) -> &'static str {
+        match self {
+            Self::Estimated => "EXPLAIN (VERBOSE, SETTINGS)",
+            Self::GenericEstimated => "EXPLAIN (GENERIC_PLAN, VERBOSE, SETTINGS)",
+        }
     }
 }
 
@@ -108,6 +138,12 @@ pub(crate) struct ActivityDetail {
     pub(crate) locks: Vec<Vec<String>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AutoExplainInfo {
+    pub(crate) summary: String,
+    pub(crate) hint: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReplicationSnapshot {
     pub(crate) capability: CapabilityStatus,
@@ -145,6 +181,7 @@ pub(crate) struct ReplicationSlot {
 pub struct PgClient {
     client: Client,
     capability_cache: CapabilityCache,
+    server_version_num: i32,
 }
 
 #[derive(Debug, Default)]
@@ -176,6 +213,10 @@ impl PgClient {
     pub fn execute_admin_action(&mut self, query: &str) -> Result<()> {
         self.client.simple_query(query)?;
         Ok(())
+    }
+
+    pub(crate) const fn server_version_num(&self) -> i32 {
+        self.server_version_num
     }
 
     pub fn fetch_database_stats(&mut self) -> Result<Vec<Vec<String>>> {
@@ -283,19 +324,45 @@ impl PgClient {
             .collect()
     }
 
-    pub fn fetch_explain_plan(&mut self, query: &str) -> Result<Vec<String>> {
-        use postgres::SimpleQueryMessage;
-        // Simple query protocol is used here because it doesn't try to parse parameters ($1, $2)
-        // on the client side, allowing us to send the raw query string to Postgres.
-        let explain_query = format!("EXPLAIN (ANALYZE, BUFFERS) {query}");
-        let messages = self.client.simple_query(&explain_query)?;
-        let mut plan = Vec::new();
-        for msg in messages {
-            if let SimpleQueryMessage::Row(row) = msg {
-                plan.push(row.get(0).unwrap_or_default().to_string());
+    pub fn fetch_explain_plan(&mut self, query: &str, mode: ExplainMode) -> Result<Vec<String>> {
+        validate_explain_query(query, mode, Some(self.server_version_num))?;
+        let explain_query = format!("{} {query}", mode.statement_prefix());
+        match mode {
+            ExplainMode::Estimated => {
+                let rows = self.client.query(&explain_query, &[])?;
+                rows.into_iter()
+                    .map(|row| row.try_get::<_, String>(0).map_err(anyhow::Error::from))
+                    .collect()
+            }
+            ExplainMode::GenericEstimated => {
+                use postgres::SimpleQueryMessage;
+
+                // Simple query protocol is used here because it doesn't try to parse parameters
+                // ($1, $2) on the client side, allowing us to send the raw query string to
+                // Postgres after we have verified it contains only one statement.
+                let messages = match self.client.simple_query(&explain_query) {
+                    Ok(messages) => messages,
+                    Err(error)
+                        if error.to_string().contains("could not determine data type")
+                            || error
+                                .to_string()
+                                .contains("could not determine polymorphic type") =>
+                    {
+                        return Err(anyhow::anyhow!(
+                            "Generic estimated plan failed because PostgreSQL could not infer one or more parameter types. Add explicit casts or replace placeholders with real literals outside pgmon."
+                        ));
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let mut plan = Vec::new();
+                for msg in messages {
+                    if let SimpleQueryMessage::Row(row) = msg {
+                        plan.push(row.get(0).unwrap_or_default().to_string());
+                    }
+                }
+                Ok(plan)
             }
         }
-        Ok(plan)
     }
 
     pub fn fetch_table_definition(
@@ -548,6 +615,59 @@ impl PgClient {
         })
     }
 
+    pub(crate) fn fetch_auto_explain_info(&mut self) -> Result<AutoExplainInfo> {
+        let row = self.client.query_one(AUTO_EXPLAIN_STATUS_QUERY, &[])?;
+        let log_min_duration = row.try_get::<_, Option<String>>(0)?;
+        let log_analyze = row
+            .try_get::<_, Option<String>>(1)?
+            .unwrap_or_else(|| "off".to_string());
+        let log_buffers = row
+            .try_get::<_, Option<String>>(2)?
+            .unwrap_or_else(|| "off".to_string());
+        let log_format = row
+            .try_get::<_, Option<String>>(3)?
+            .unwrap_or_else(|| "text".to_string());
+
+        if let Some(log_min_duration) = log_min_duration {
+            if log_min_duration == "-1" {
+                return Ok(AutoExplainInfo {
+                    summary: "auto_explain: loaded but disabled (log_min_duration = -1)"
+                        .to_string(),
+                    hint: Some(
+                        "Set auto_explain.log_min_duration to 0ms or a threshold and consider auto_explain.log_analyze = on for real execution plans."
+                            .to_string(),
+                    ),
+                });
+            }
+
+            let mut hints = Vec::new();
+            if log_analyze != "on" {
+                hints.push(
+                    "Set auto_explain.log_analyze = on to capture real execution timing."
+                        .to_string(),
+                );
+            }
+            if log_format != "json" {
+                hints.push(format!("Current auto_explain.log_format is {log_format}."));
+            }
+
+            return Ok(AutoExplainInfo {
+                summary: format!(
+                    "auto_explain: enabled (log_min_duration = {log_min_duration}, log_analyze = {log_analyze}, log_buffers = {log_buffers}, log_format = {log_format})"
+                ),
+                hint: (!hints.is_empty()).then(|| hints.join(" ")),
+            });
+        }
+
+        Ok(AutoExplainInfo {
+            summary: "auto_explain: not loaded".to_string(),
+            hint: Some(
+                "A DBA can preload auto_explain for new sessions via session_preload_libraries or shared_preload_libraries, then set auto_explain.log_min_duration and optionally auto_explain.log_analyze = on."
+                    .to_string(),
+            ),
+        })
+    }
+
     pub fn fetch_database_tree(&mut self) -> Result<Vec<Vec<String>>> {
         let rows = self.client.query(DATABASE_TREE_QUERY, &[])?;
         rows.into_iter()
@@ -611,15 +731,27 @@ impl PgClient {
     }
 
     fn connect(config: &Config, dsn: &str) -> Result<Self> {
-        let client = config.connect(NoTls).with_context(|| {
+        let mut client = config.connect(NoTls).with_context(|| {
             format!(
                 "Failed to connect to Postgres using {}",
                 describe_connection_target(dsn)
             )
         })?;
+        let version_row = client.query_one(
+            "SELECT current_setting('server_version_num')::int, current_setting('server_version')",
+            &[],
+        )?;
+        let server_version_num = version_row.try_get::<_, i32>(0)?;
+        let server_version = version_row.try_get::<_, String>(1)?;
+        if server_version_num < MIN_SUPPORTED_SERVER_VERSION_NUM {
+            return Err(anyhow::anyhow!(
+                "pgmon requires PostgreSQL 14 or newer; connected server is PostgreSQL {server_version}."
+            ));
+        }
         Ok(Self {
             client,
             capability_cache: CapabilityCache::default(),
+            server_version_num,
         })
     }
 
@@ -781,9 +913,95 @@ LIMIT 500
     )
 }
 
+pub(crate) fn supports_generic_explain(server_version_num: i32) -> bool {
+    server_version_num >= GENERIC_PLAN_MIN_SERVER_VERSION_NUM
+}
+
+pub(crate) fn analyze_explain_query(
+    query: &str,
+    server_version_num: Option<i32>,
+) -> Result<ExplainMode> {
+    let parsed = pg_query::parse(query).map_err(|error| {
+        anyhow::anyhow!(
+            "Explain is only available for a single PostgreSQL statement that pgmon can parse safely: {error}"
+        )
+    })?;
+
+    if parsed.protobuf.stmts.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "Explain only supports a single SQL statement. Multiple statements are refused to avoid executing trailing SQL."
+        ));
+    }
+
+    let nodes = parsed.protobuf.nodes();
+    let Some((top_level_node, _, _, _)) = nodes.first() else {
+        return Err(anyhow::anyhow!(
+            "Explain is unavailable because PostgreSQL returned an empty parse tree for this statement."
+        ));
+    };
+
+    let explain_mode = match top_level_node {
+        NodeRef::SelectStmt(_)
+        | NodeRef::InsertStmt(_)
+        | NodeRef::UpdateStmt(_)
+        | NodeRef::DeleteStmt(_)
+        | NodeRef::MergeStmt(_) => {
+            if nodes
+                .iter()
+                .any(|(node, _, _, _)| matches!(node, NodeRef::ParamRef(_)))
+            {
+                ExplainMode::GenericEstimated
+            } else {
+                ExplainMode::Estimated
+            }
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Explain is only available for single SELECT, INSERT, UPDATE, DELETE, or MERGE statements."
+            ));
+        }
+    };
+
+    if explain_mode == ExplainMode::GenericEstimated
+        && let Some(server_version_num) = server_version_num
+        && !supports_generic_explain(server_version_num)
+    {
+        return Err(anyhow::anyhow!(
+            "Generic estimated plans require PostgreSQL 16+; this server is PostgreSQL {}.",
+            major_server_version(server_version_num)
+        ));
+    }
+
+    Ok(explain_mode)
+}
+
+pub(crate) fn validate_explain_query(
+    query: &str,
+    mode: ExplainMode,
+    server_version_num: Option<i32>,
+) -> Result<()> {
+    let actual_mode = analyze_explain_query(query, server_version_num)?;
+    if actual_mode != mode {
+        return Err(anyhow::anyhow!(
+            "Explain mode changed after parsing the SQL. Reopen the query info modal and try again."
+        ));
+    }
+    Ok(())
+}
+
+fn major_server_version(server_version_num: i32) -> i32 {
+    server_version_num / 10_000
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_statements_query, format_receiver_summary};
+    use super::{
+        ExplainMode, PgClient, analyze_explain_query, build_statements_query, config_from_dsn,
+        format_receiver_summary, supports_generic_explain, validate_explain_query,
+    };
+    use anyhow::Result;
+    use postgres::{Client, NoTls};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_build_statements_query_uses_exec_time_columns() {
@@ -818,5 +1036,281 @@ mod tests {
         let summary = format_receiver_summary("streaming", "replica", "5432", "", "");
 
         assert_eq!(summary, "Receiver: streaming | source=replica:5432");
+    }
+
+    #[test]
+    fn test_supports_generic_explain_requires_postgresql_16() {
+        assert!(!supports_generic_explain(150_000));
+        assert!(supports_generic_explain(160_000));
+    }
+
+    #[test]
+    fn test_analyze_explain_query_accepts_single_select() -> Result<()> {
+        let mode = analyze_explain_query("SELECT 1", Some(160_000))?;
+
+        assert_eq!(mode, ExplainMode::Estimated);
+        Ok(())
+    }
+
+    #[test]
+    fn test_analyze_explain_query_detects_placeholder_params_from_parse_tree() -> Result<()> {
+        let mode = analyze_explain_query("SELECT * FROM accounts WHERE id = $1", Some(160_000))?;
+
+        assert_eq!(mode, ExplainMode::GenericEstimated);
+        Ok(())
+    }
+
+    #[test]
+    fn test_analyze_explain_query_ignores_placeholder_text_in_literals_and_comments() -> Result<()>
+    {
+        let mode = analyze_explain_query(
+            "SELECT '$1' AS literal /* $2 */ -- $3\nFROM pg_catalog.pg_class",
+            Some(160_000),
+        )?;
+
+        assert_eq!(mode, ExplainMode::Estimated);
+        Ok(())
+    }
+
+    #[test]
+    fn test_analyze_explain_query_rejects_utility_statement() {
+        let result = analyze_explain_query("SET application_name = 'pgmon'", Some(160_000));
+
+        assert!(result.is_err());
+        let message = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("SELECT, INSERT, UPDATE, DELETE, or MERGE"));
+    }
+
+    #[test]
+    fn test_analyze_explain_query_rejects_nested_explain_statement() {
+        let result = analyze_explain_query("EXPLAIN SELECT 1", Some(160_000));
+
+        assert!(result.is_err());
+        let message = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("SELECT, INSERT, UPDATE, DELETE, or MERGE"));
+    }
+
+    #[test]
+    fn test_analyze_explain_query_rejects_create_table_as_statement() {
+        let result = analyze_explain_query(
+            "CREATE TABLE explain_review AS SELECT 1 AS id",
+            Some(160_000),
+        );
+
+        assert!(result.is_err());
+        let message = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("SELECT, INSERT, UPDATE, DELETE, or MERGE"));
+    }
+
+    #[test]
+    fn test_validate_explain_query_rejects_multiple_statements() {
+        let result = validate_explain_query(
+            "SELECT 1; DELETE FROM accounts",
+            ExplainMode::Estimated,
+            Some(160_000),
+        );
+
+        assert!(result.is_err());
+        let message = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("single SQL statement"));
+    }
+
+    #[test]
+    fn test_validate_explain_query_rejects_generic_plan_on_postgresql_15() {
+        let result = validate_explain_query(
+            "SELECT * FROM accounts WHERE id = $1",
+            ExplainMode::GenericEstimated,
+            Some(150_000),
+        );
+
+        assert!(result.is_err());
+        let message = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("PostgreSQL 16+"));
+    }
+
+    #[test]
+    fn test_validate_explain_query_rejects_mode_mismatch() {
+        let result = validate_explain_query(
+            "SELECT * FROM accounts WHERE id = $1",
+            ExplainMode::Estimated,
+            Some(160_000),
+        );
+
+        assert!(result.is_err());
+        let message = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("Explain mode changed"));
+    }
+
+    #[test]
+    fn test_explain_safety_live_insert_does_not_mutate_rows() -> Result<()> {
+        let Some(dsn) = live_test_dsn() else {
+            return Ok(());
+        };
+        let table_name = unique_test_table_name("insert");
+        let mut control_client = connect_test_client(&dsn)?;
+        control_client.batch_execute(&format!(
+            "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL);"
+        ))?;
+
+        let mut explain_client = PgClient::new(&dsn, 5_000)?;
+        let query = format!("INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10)");
+        let plan = explain_client.fetch_explain_plan(&query, ExplainMode::Estimated)?;
+
+        assert!(!plan.is_empty());
+        assert_eq!(table_row_count(&mut control_client, &table_name)?, 0);
+
+        control_client.batch_execute(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_explain_safety_live_update_does_not_mutate_rows() -> Result<()> {
+        let Some(dsn) = live_test_dsn() else {
+            return Ok(());
+        };
+        let table_name = unique_test_table_name("update");
+        let mut control_client = connect_test_client(&dsn)?;
+        control_client.batch_execute(&format!(
+            "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10);"
+        ))?;
+
+        let mut explain_client = PgClient::new(&dsn, 5_000)?;
+        let query = format!("UPDATE \"{table_name}\" SET value = 20 WHERE id = 1");
+        let plan = explain_client.fetch_explain_plan(&query, ExplainMode::Estimated)?;
+
+        assert!(!plan.is_empty());
+        assert_eq!(table_value(&mut control_client, &table_name, 1)?, 10);
+
+        control_client.batch_execute(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_explain_safety_live_delete_does_not_mutate_rows() -> Result<()> {
+        let Some(dsn) = live_test_dsn() else {
+            return Ok(());
+        };
+        let table_name = unique_test_table_name("delete");
+        let mut control_client = connect_test_client(&dsn)?;
+        control_client.batch_execute(&format!(
+            "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10);"
+        ))?;
+
+        let mut explain_client = PgClient::new(&dsn, 5_000)?;
+        let query = format!("DELETE FROM \"{table_name}\" WHERE id = 1");
+        let plan = explain_client.fetch_explain_plan(&query, ExplainMode::Estimated)?;
+
+        assert!(!plan.is_empty());
+        assert_eq!(table_row_count(&mut control_client, &table_name)?, 1);
+
+        control_client.batch_execute(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_explain_safety_live_modifying_cte_select_does_not_mutate_rows() -> Result<()> {
+        let Some(dsn) = live_test_dsn() else {
+            return Ok(());
+        };
+        let table_name = unique_test_table_name("cte");
+        let mut control_client = connect_test_client(&dsn)?;
+        control_client.batch_execute(&format!(
+            "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10);"
+        ))?;
+
+        let mut explain_client = PgClient::new(&dsn, 5_000)?;
+        let query = format!(
+            "WITH deleted AS (DELETE FROM \"{table_name}\" WHERE id = 1 RETURNING id) SELECT * FROM deleted"
+        );
+        let plan = explain_client.fetch_explain_plan(&query, ExplainMode::Estimated)?;
+
+        assert!(!plan.is_empty());
+        assert_eq!(table_row_count(&mut control_client, &table_name)?, 1);
+
+        control_client.batch_execute(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_explain_safety_live_generic_insert_does_not_mutate_rows() -> Result<()> {
+        let Some(dsn) = live_test_dsn() else {
+            return Ok(());
+        };
+        let mut control_client = connect_test_client(&dsn)?;
+        let server_version_num = current_server_version_num(&mut control_client)?;
+        if !supports_generic_explain(server_version_num) {
+            return Ok(());
+        }
+
+        let table_name = unique_test_table_name("generic");
+        control_client.batch_execute(&format!(
+            "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL);"
+        ))?;
+
+        let mut explain_client = PgClient::new(&dsn, 5_000)?;
+        let query =
+            format!("INSERT INTO \"{table_name}\" (id, value) VALUES ($1::integer, $2::integer)");
+        let plan = explain_client.fetch_explain_plan(&query, ExplainMode::GenericEstimated)?;
+
+        assert!(!plan.is_empty());
+        assert_eq!(table_row_count(&mut control_client, &table_name)?, 0);
+
+        control_client.batch_execute(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))?;
+        Ok(())
+    }
+
+    fn live_test_dsn() -> Option<String> {
+        std::env::var("PGMON_TEST_DSN")
+            .ok()
+            .filter(|dsn| !dsn.trim().is_empty())
+    }
+
+    fn unique_test_table_name(suffix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        format!("pgmon_explain_safety_{suffix}_{nanos}")
+    }
+
+    fn connect_test_client(dsn: &str) -> Result<Client> {
+        let config = config_from_dsn(dsn, 5_000)?;
+        Ok(config.connect(NoTls)?)
+    }
+
+    fn current_server_version_num(client: &mut Client) -> Result<i32> {
+        let row = client.query_one("SELECT current_setting('server_version_num')::int", &[])?;
+        Ok(row.try_get::<_, i32>(0)?)
+    }
+
+    fn table_row_count(client: &mut Client, table_name: &str) -> Result<i64> {
+        let row = client.query_one(&format!("SELECT COUNT(*) FROM \"{table_name}\""), &[])?;
+        Ok(row.try_get::<_, i64>(0)?)
+    }
+
+    fn table_value(client: &mut Client, table_name: &str, id: i32) -> Result<i32> {
+        let row = client.query_one(
+            &format!("SELECT value FROM \"{table_name}\" WHERE id = $1"),
+            &[&id],
+        )?;
+        Ok(row.try_get::<_, i32>(0)?)
     }
 }

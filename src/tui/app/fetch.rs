@@ -1,15 +1,21 @@
-use super::state::{ActivityDetail, DatabaseView, Tab};
-use crate::pg::client::{ActivitySnapshot, PgClient, ReplicationSnapshot};
+use super::state::{ActivityDetail, DatabaseView, ExplainPlanState, Tab};
+use crate::pg::client::{ActivitySnapshot, AutoExplainInfo, PgClient, ReplicationSnapshot};
 use anyhow::Result;
+
+#[derive(Debug)]
+pub(crate) struct ActivityInspectionPayload {
+    pub(crate) detail: ActivityDetail,
+    pub(crate) auto_explain: AutoExplainInfo,
+}
 
 #[derive(Debug)]
 pub enum RefreshPayload {
     Activity(Box<ActivitySnapshot>, PgClient),
     Replication(Box<ReplicationSnapshot>, PgClient),
     Table(Vec<Vec<String>>, PgClient),
-    Explain(Vec<String>),
+    Explain(ExplainPlanState),
     TableDefinition(String, String, Vec<Vec<String>>, Vec<String>),
-    ActivityDetail(ActivityDetail),
+    ActivityDetail(ActivityInspectionPayload),
 }
 
 pub fn load_refresh_payload(

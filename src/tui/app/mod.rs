@@ -8,7 +8,10 @@ mod tests;
 
 use crate::config::{Config, ExportFormat};
 use crate::pg::{
-    client::{ActivitySnapshot, CapabilityStatus, PgClient, ReplicationSnapshot},
+    client::{
+        ActivitySnapshot, CapabilityStatus, ExplainMode, PgClient, ReplicationSnapshot,
+        analyze_explain_query,
+    },
     conninfo::{describe_connection_target, describe_host},
 };
 use anyhow::{Context, Result};
@@ -31,8 +34,8 @@ use fetch::{RefreshPayload, load_refresh_payload};
 use format::{
     ActivityCounterSample, activity_state_cell, activity_wait_cell, build_activity_summary,
     count_sessions, filter_activity_sessions, format_activity_query, format_duration_hms,
-    is_fuzzy_match, is_normalized_query, limit_activity_sessions, limit_rows, sender_to_row,
-    sort_statement_rows, sorted_activity_sessions, table_header_cells,
+    is_fuzzy_match, limit_activity_sessions, limit_rows, sender_to_row, sort_statement_rows,
+    sorted_activity_sessions, table_header_cells,
 };
 pub use state::{
     ActivityChartMetric, ActivityDetail, ActivitySubview, CapabilitySummary, ConfirmActionState,
@@ -311,24 +314,16 @@ impl App {
                 KeyCode::Enter => {
                     self.save_selected_query();
                 }
-                KeyCode::Char('x') => match detail.source {
-                    QueryDetailSource::Statements => {
-                        self.notice_state = Some(NoticeState {
-                                message: "Explain Analyze is only available from the Activity view. Statements uses normalized pg_stat_statements SQL.".to_string(),
-                                created_at: Instant::now(),
-                            });
-                    }
-                    QueryDetailSource::Activity => {
-                        if is_normalized_query(detail.query.as_str()) {
-                            self.notice_state = Some(NoticeState {
-                                    message: "Explain Analyze is unavailable for normalized queries. Replace $1, $2, ... with literal values first.".to_string(),
-                                    created_at: Instant::now(),
-                                });
-                        } else {
-                            self.handle_explain_analyze(&detail);
-                        }
-                    }
-                },
+                KeyCode::Char('x') if detail.query.trim().is_empty() => {
+                    self.notice_state = Some(NoticeState {
+                        message: "Explain is unavailable because the selected query text is empty."
+                            .to_string(),
+                        created_at: Instant::now(),
+                    });
+                }
+                KeyCode::Char('x') => {
+                    self.handle_explain(&detail);
+                }
                 KeyCode::Char('K') => {
                     if let Some(act) = &detail.activity_detail {
                         self.confirm_action = Some(ConfirmActionState {
@@ -471,7 +466,7 @@ impl App {
                             .and_then(|i| self.dashboard.sessions.get(i))
                             && let Ok(pid) = session.pid.parse::<i32>()
                         {
-                            self.request_activity_detail(pid);
+                            self.request_activity_detail(pid, session.database.clone());
                             self.query_detail = self.selected_activity_detail();
                         }
                     }
@@ -777,7 +772,9 @@ impl App {
                 heading: "Activity".to_string(),
                 lines: vec![
                     "a/w/b/t switch between active, waiting, blocking, and idle-in-transaction sessions.".to_string(),
-                    "i inspects the selected backend query; x runs Explain only from the Activity query detail when the SQL is executable.".to_string(),
+                    "i opens info for the selected backend query; x runs safe Explain from that info modal.".to_string(),
+                    "On PostgreSQL 16+, parameterized SQL uses a generic estimated plan; on PostgreSQL 14/15 pgmon leaves those statements as info-only.".to_string(),
+                    "The info modal also shows whether auto_explain is enabled for real execution plans.".to_string(),
                     "Enter saves the selected query; e exports the current Activity table; m cycles the main chart metric.".to_string(),
                 ],
             },
@@ -797,11 +794,11 @@ impl App {
         HelpSection {
             heading: "Statements".to_string(),
             lines: vec![
-                "i opens the selected pg_stat_statements entry with aggregated timing details."
+                "i opens info for the selected pg_stat_statements entry with aggregated timings."
+                    .to_string(),
+                "x runs safe Explain from the info modal; normalized SQL uses a generic estimated plan on PostgreSQL 16+."
                     .to_string(),
                 "Enter saves the selected SQL text; e exports the current Statements table."
-                    .to_string(),
-                "Statements uses normalized pg_stat_statements SQL, so Explain is intentionally unavailable here."
                     .to_string(),
             ],
         }
@@ -923,31 +920,60 @@ impl App {
         }
     }
 
-    fn handle_explain_analyze(&mut self, detail: &QueryDetailState) {
+    fn handle_explain(&mut self, detail: &QueryDetailState) {
+        if let Some(reason) = detail.explain_unavailable_reason.as_ref() {
+            self.notice_state = Some(NoticeState {
+                message: reason.clone(),
+                created_at: Instant::now(),
+            });
+            return;
+        }
+
         let dsn = self.dsn.clone();
         let timeout = self.connect_timeout_ms;
         let database = detail.database.clone();
         let query = detail.query.clone();
+        let server_version_num = self.current_server_version_num();
+
+        let explain_mode = match analyze_explain_query(&query, server_version_num) {
+            Ok(mode) => mode,
+            Err(error) => {
+                self.notice_state = Some(NoticeState {
+                    message: error.to_string(),
+                    created_at: Instant::now(),
+                });
+                return;
+            }
+        };
 
         self.query_detail = None;
         self.loading_state = Some(LoadingState {
-            message: "Running EXPLAIN ANALYZE...".to_string(),
+            message: match explain_mode {
+                ExplainMode::Estimated => "Running EXPLAIN...".to_string(),
+                ExplainMode::GenericEstimated => "Running EXPLAIN (GENERIC_PLAN)...".to_string(),
+            },
             started_at: Instant::now(),
         });
 
-        self.start_explain_request(dsn, timeout, database, query);
+        self.start_explain_request(dsn, timeout, database, query, explain_mode);
     }
 
     fn selected_activity_detail(&self) -> Option<QueryDetailState> {
         let session = self
             .selected_row
             .and_then(|selected_row| self.dashboard.sessions.get(selected_row))?;
+        let (explain_mode, explain_unavailable_reason) =
+            explain_state_for_query(&session.query, self.current_server_version_num());
         Some(QueryDetailState {
             query: session.query.clone(),
             database: session.database.clone(),
             source: QueryDetailSource::Activity,
+            explain_mode,
+            explain_unavailable_reason,
             stats: None,
             activity_detail: None,
+            auto_explain_summary: "auto_explain: loading...".to_string(),
+            auto_explain_hint: None,
         })
     }
 
@@ -958,11 +984,15 @@ impl App {
 
         let db = row.first()?.clone();
         let query = row.get(1)?.clone();
+        let (explain_mode, explain_unavailable_reason) =
+            explain_state_for_query(&query, self.current_server_version_num());
 
         Some(QueryDetailState {
             query,
             database: db,
             source: QueryDetailSource::Statements,
+            explain_mode,
+            explain_unavailable_reason,
             stats: Some(QueryStats {
                 total_time: row.get(2)?.clone(),
                 mean_time: row.get(3)?.clone(),
@@ -971,6 +1001,8 @@ impl App {
                 write_time: row.get(6)?.clone(),
             }),
             activity_detail: None,
+            auto_explain_summary: String::new(),
+            auto_explain_hint: None,
         })
     }
 
@@ -1322,6 +1354,7 @@ impl App {
         timeout: u64,
         database: String,
         query: String,
+        explain_mode: ExplainMode,
     ) {
         self.request_refresh_worker(PendingRequestKind::Explain, move |tx| {
             let result = (|| -> Result<RefreshPayload> {
@@ -1330,40 +1363,63 @@ impl App {
                 } else {
                     PgClient::for_database(&dsn, timeout, &database)?
                 };
-                let plan = client.fetch_explain_plan(&query).context(
-                    "Explain Analyze failed. Note: normalized queries (with $1, $2) cannot be analyzed without actual values."
+                let plan = client.fetch_explain_plan(&query, explain_mode).context(
+                    match explain_mode {
+                        ExplainMode::Estimated => {
+                            "Explain failed. pgmon only collects a planner estimate and does not execute the query."
+                        }
+                        ExplainMode::GenericEstimated => {
+                            "Generic estimated plan failed. PostgreSQL may need explicit casts or real literals to infer placeholder types."
+                        }
+                    },
                 )?;
-                Ok(RefreshPayload::Explain(plan))
+                let auto_explain = client.fetch_auto_explain_info()?;
+                Ok(RefreshPayload::Explain(ExplainPlanState {
+                    plan,
+                    explain_mode,
+                    auto_explain_summary: auto_explain.summary,
+                    auto_explain_hint: auto_explain.hint,
+                }))
             })();
             let _ = tx.send(result);
         });
     }
 
-    fn request_activity_detail(&mut self, pid: i32) {
+    fn request_activity_detail(&mut self, pid: i32, database: String) {
         let dsn = self.dsn.clone();
         let timeout = self.connect_timeout_ms;
 
         self.request_refresh_worker(PendingRequestKind::ActivityDetail, move |tx| {
             let result = (|| -> Result<RefreshPayload> {
-                let mut client = PgClient::new(&dsn, timeout)?;
+                let mut client = if database.is_empty() {
+                    PgClient::new(&dsn, timeout)?
+                } else {
+                    PgClient::for_database(&dsn, timeout, &database)?
+                };
                 let detail = client.fetch_activity_detail(pid)?;
-                Ok(RefreshPayload::ActivityDetail(ActivityDetail {
-                    pid: detail.pid,
-                    usename: detail.usename,
-                    application_name: detail.application_name,
-                    client_addr: detail.client_addr,
-                    client_port: detail.client_port,
-                    backend_start: detail.backend_start,
-                    state: detail.state,
-                    wait_event_type: detail.wait_event_type,
-                    wait_event: detail.wait_event,
-                    xact_start: detail.xact_start,
-                    state_change: detail.state_change,
-                    query: detail.query,
-                    blocking_pids: detail.blocking_pids,
-                    blockers: detail.blockers,
-                    locks: detail.locks,
-                }))
+                let auto_explain = client.fetch_auto_explain_info()?;
+                Ok(RefreshPayload::ActivityDetail(
+                    fetch::ActivityInspectionPayload {
+                        detail: ActivityDetail {
+                            pid: detail.pid,
+                            usename: detail.usename,
+                            application_name: detail.application_name,
+                            client_addr: detail.client_addr,
+                            client_port: detail.client_port,
+                            backend_start: detail.backend_start,
+                            state: detail.state,
+                            wait_event_type: detail.wait_event_type,
+                            wait_event: detail.wait_event,
+                            xact_start: detail.xact_start,
+                            state_change: detail.state_change,
+                            query: detail.query,
+                            blocking_pids: detail.blocking_pids,
+                            blockers: detail.blockers,
+                            locks: detail.locks,
+                        },
+                        auto_explain,
+                    },
+                ))
             })();
             let _ = tx.send(result);
         });
@@ -1417,7 +1473,7 @@ impl App {
                 self.data = self.prepare_table_data(data);
             }
             RefreshPayload::Explain(plan) => {
-                self.explain_plan = Some(ExplainPlanState { plan });
+                self.explain_plan = Some(plan);
             }
             RefreshPayload::TableDefinition(schema, name, columns, indexes) => {
                 self.table_definition = Some(TableDefinitionState {
@@ -1427,9 +1483,11 @@ impl App {
                     indexes,
                 });
             }
-            RefreshPayload::ActivityDetail(detail) => {
+            RefreshPayload::ActivityDetail(payload) => {
                 if let Some(query_detail) = self.query_detail.as_mut() {
-                    query_detail.activity_detail = Some(detail);
+                    query_detail.activity_detail = Some(payload.detail);
+                    query_detail.auto_explain_summary = payload.auto_explain.summary;
+                    query_detail.auto_explain_hint = payload.auto_explain.hint;
                 }
             }
         }
@@ -1501,6 +1559,10 @@ impl App {
             &mut self.capabilities.replication,
             client.replication_capability(),
         );
+    }
+
+    fn current_server_version_num(&self) -> Option<i32> {
+        self.pg_client.as_ref().map(PgClient::server_version_num)
     }
 
     fn effective_refresh_interval(&self) -> Duration {
@@ -1836,6 +1898,17 @@ pub fn save_query_to_directory(tab: Tab, query: &str, directory: &Path) -> Resul
     fs::write(&path, contents)
         .with_context(|| format!("Failed to write query file at {}", path.display()))?;
     Ok(path)
+}
+
+fn explain_state_for_query(
+    query: &str,
+    server_version_num: Option<i32>,
+) -> (ExplainMode, Option<String>) {
+    let explain_mode = analyze_explain_query(query, None).unwrap_or(ExplainMode::Estimated);
+    let explain_unavailable_reason = analyze_explain_query(query, server_version_num)
+        .err()
+        .map(|error| error.to_string());
+    (explain_mode, explain_unavailable_reason)
 }
 
 fn query_output_path(tab: Tab, directory: &Path) -> Result<PathBuf> {

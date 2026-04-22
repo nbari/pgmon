@@ -85,6 +85,16 @@ coverage for:
 
 Use descriptive test names with the existing `test_*` pattern.
 
+For explain-safety changes, there is also an opt-in live PostgreSQL suite gated
+by `PGMON_TEST_DSN`. If the variable is unset, those tests skip themselves.
+
+With the local container from `.justfile`, you can run:
+
+```bash
+just up
+just test-explain-safety
+```
+
 ## Required Verification
 
 Before opening a PR, run:

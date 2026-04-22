@@ -1,4 +1,4 @@
-use crate::pg::client::{ActivityProcessSnapshot, ActivitySession, CapabilityStatus};
+use crate::pg::client::{ActivityProcessSnapshot, ActivitySession, CapabilityStatus, ExplainMode};
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -278,8 +278,16 @@ pub struct QueryDetailState {
     pub query: String,
     pub database: String,
     pub source: QueryDetailSource,
+    /// Safe explain mode selected for this query text.
+    pub explain_mode: ExplainMode,
+    /// Optional reason explain is currently unavailable for this query.
+    pub explain_unavailable_reason: Option<String>,
     pub stats: Option<QueryStats>,
     pub activity_detail: Option<ActivityDetail>,
+    /// Summary of the current `auto_explain` state for the selected backend database.
+    pub auto_explain_summary: String,
+    /// Optional hint that explains how to enable or improve `auto_explain`.
+    pub auto_explain_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +327,12 @@ pub struct QueryStats {
 #[derive(Debug, Clone)]
 pub struct ExplainPlanState {
     pub plan: Vec<String>,
+    /// Safe explain mode used to generate this plan.
+    pub explain_mode: ExplainMode,
+    /// Summary of the current `auto_explain` state for the inspected query.
+    pub auto_explain_summary: String,
+    /// Optional hint that explains how to enable or improve `auto_explain`.
+    pub auto_explain_hint: Option<String>,
 }
 
 #[derive(Debug, Clone)]

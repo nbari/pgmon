@@ -1,5 +1,8 @@
 use super::common::centered_rect;
-use crate::tui::app::{App, QueryDetailSource, TableDefinitionState, format::is_normalized_query};
+use crate::{
+    pg::client::ExplainMode,
+    tui::app::{App, QueryDetailSource, TableDefinitionState},
+};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Rect},
@@ -69,9 +72,7 @@ pub fn draw_query_detail_modal(f: &mut Frame, app: &App) {
     let inner_area = block.inner(area);
     f.render_widget(block, area);
 
-    let mut constraints = vec![
-        ratatui::layout::Constraint::Length(2), // Title + Warning
-    ];
+    let mut constraints = vec![ratatui::layout::Constraint::Length(5)];
 
     if let Some(act) = &detail.activity_detail {
         constraints.push(ratatui::layout::Constraint::Length(4)); // Basic Activity Info
@@ -105,30 +106,43 @@ pub fn draw_query_detail_modal(f: &mut Frame, app: &App) {
 
     // 1. Render Title/Header
     if let Some(area) = chunks.get(current_chunk) {
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    "Query Information",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                if detail.source == QueryDetailSource::Statements {
-                    Line::styled(
-                        "NOTE: Statements view uses normalized pg_stat_statements SQL. Explain is not available here.",
-                        Style::default().fg(Color::Magenta),
-                    )
-                } else if is_normalized_query(detail.query.as_str()) {
-                    Line::styled(
-                        "NOTE: Normalized query ($1). Explain is unavailable without actual values.",
-                        Style::default().fg(Color::Magenta),
-                    )
-                } else {
-                    Line::raw("")
-                },
-            ]),
-            *area,
-        );
+        let mut lines = vec![Line::styled(
+            "Query Information",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )];
+
+        let detail_notice = detail
+            .explain_unavailable_reason
+            .as_deref()
+            .unwrap_or_else(|| detail_mode_notice(detail.explain_mode));
+        let detail_notice_style = if detail.explain_unavailable_reason.is_some() {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Magenta)
+        };
+        lines.push(Line::styled(detail_notice, detail_notice_style));
+        lines.push(Line::styled(
+            "Plans are generated in a fresh session and can differ from the original backend.",
+            Style::default().fg(Color::DarkGray),
+        ));
+
+        if detail.source == QueryDetailSource::Activity {
+            lines.push(Line::styled(
+                detail.auto_explain_summary.as_str(),
+                auto_explain_style(&detail.auto_explain_summary),
+            ));
+            lines.push(Line::styled(
+                detail.auto_explain_hint.as_deref().unwrap_or(""),
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(""));
+        }
+
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), *area);
     }
     current_chunk += 1;
 
@@ -341,37 +355,29 @@ pub fn draw_query_detail_modal(f: &mut Frame, app: &App) {
 
     // 7. Render Footer
     if let Some(area) = chunks.last() {
-        let mut footer_spans = if detail.source == QueryDetailSource::Statements {
-            Vec::new()
-        } else if is_normalized_query(detail.query.as_str()) {
-            vec![
-                Span::styled(
-                    "x",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    ":Explain unavailable | ",
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]
+        let explain_label = if detail.explain_unavailable_reason.is_some() {
+            ":Explain unavailable | "
         } else {
-            vec![
-                Span::styled(
-                    "x",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(":Explain Analyze | ", Style::default().fg(Color::Cyan)),
+            ":Explain | "
+        };
+        let mut footer_spans = vec![
+            Span::styled(
+                "x",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(explain_label, Style::default().fg(Color::Cyan)),
+        ];
+        if detail.source == QueryDetailSource::Activity {
+            footer_spans.extend([
                 Span::styled(
                     "K",
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(":Terminate Session | ", Style::default().fg(Color::Cyan)),
-            ]
-        };
+            ]);
+        }
         footer_spans.extend([
             Span::styled(
                 "Enter",
@@ -406,7 +412,7 @@ pub fn draw_explain_modal(f: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Line::styled(
-            " Explain Analyze Plan ",
+            format!(" {} ", explain.explain_mode.title()),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
@@ -425,12 +431,38 @@ pub fn draw_explain_modal(f: &mut Frame, app: &App) {
     let chunks = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
+            ratatui::layout::Constraint::Length(5), // Guidance
             ratatui::layout::Constraint::Min(0),    // Plan
             ratatui::layout::Constraint::Length(1), // Footer
         ])
         .split(inner_area);
 
-    if let (Some(plan_area), Some(footer_area)) = (chunks.first(), chunks.get(1)) {
+    if let (Some(guidance_area), Some(plan_area), Some(footer_area)) =
+        (chunks.first(), chunks.get(1), chunks.get(2))
+    {
+        let guidance = vec![
+            Line::styled(
+                explain_mode_notice(explain.explain_mode),
+                Style::default().fg(Color::Yellow),
+            ),
+            Line::styled(
+                "The query was not executed; local settings or temp objects can still change the real plan.",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Line::styled(
+                explain.auto_explain_summary.as_str(),
+                auto_explain_style(&explain.auto_explain_summary),
+            ),
+            Line::styled(
+                explain.auto_explain_hint.as_deref().unwrap_or(""),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        f.render_widget(
+            Paragraph::new(guidance).wrap(Wrap { trim: true }),
+            *guidance_area,
+        );
+
         f.render_widget(
             Paragraph::new(plan_text).wrap(Wrap { trim: false }),
             *plan_area,
@@ -449,6 +481,36 @@ pub fn draw_explain_modal(f: &mut Frame, app: &App) {
             Paragraph::new(footer).alignment(Alignment::Right),
             *footer_area,
         );
+    }
+}
+
+fn detail_mode_notice(mode: ExplainMode) -> &'static str {
+    match mode {
+        ExplainMode::Estimated => {
+            "NOTE: Explain uses an estimated plan only; the query is not executed."
+        }
+        ExplainMode::GenericEstimated => {
+            "NOTE: Explain uses GENERIC_PLAN because this SQL contains placeholders."
+        }
+    }
+}
+
+fn explain_mode_notice(mode: ExplainMode) -> &'static str {
+    match mode {
+        ExplainMode::Estimated => "Estimated plan only; the query was not executed.",
+        ExplainMode::GenericEstimated => {
+            "Generic estimated plan only; actual bind values can change estimates and node choice."
+        }
+    }
+}
+
+fn auto_explain_style(summary: &str) -> Style {
+    if summary.contains("enabled") {
+        Style::default().fg(Color::Green)
+    } else if summary.contains("loading") {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::Yellow)
     }
 }
 

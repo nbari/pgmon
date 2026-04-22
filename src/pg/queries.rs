@@ -70,6 +70,14 @@ FROM pg_settings
 ORDER BY category, name
 ";
 
+pub const AUTO_EXPLAIN_STATUS_QUERY: &str = r"
+SELECT
+    current_setting('auto_explain.log_min_duration', true) as log_min_duration,
+    current_setting('auto_explain.log_analyze', true) as log_analyze,
+    current_setting('auto_explain.log_buffers', true) as log_buffers,
+    current_setting('auto_explain.log_format', true) as log_format
+";
+
 pub const REPLICATION_RECEIVER_QUERY: &str = r"
 SELECT
     COALESCE(status, '') as status,

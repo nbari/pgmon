@@ -15,7 +15,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs},
 };
 
-use crate::tui::app::format::format_activity_query;
 use activity::draw_dashboard;
 use common::truncate_str;
 use modals::{
@@ -25,6 +24,8 @@ use modals::{
 };
 use replication::draw_replication;
 use table::draw_table;
+
+const ERROR_CONTROLS: &str = "q:Quit | r:Retry";
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let show_controls = app.config.ui.show_controls;
@@ -170,40 +171,21 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Green),
         ));
     } else if app.error_state.is_some() {
-        footer_spans.extend(style_keybinding(
-            "q:Quit | r:Retry | 1-8:Switch Tab",
-            accent_color,
-        ));
+        footer_spans.extend(style_keybinding(ERROR_CONTROLS, accent_color));
     } else if matches!(
         app.current_view_capability(),
         Some(CapabilityStatus::Unavailable(_))
     ) {
-        footer_spans.extend(style_keybinding(
-            "q:Quit | hjkl:Navigate | 1-8:Tabs",
-            accent_color,
-        ));
+        footer_spans.extend(style_keybinding("q:Quit | hjkl:Navigate", accent_color));
     } else if app.current_tab == Tab::Activity {
-        if let Some(session) = app
+        if app
             .selected_row
             .and_then(|selected_row| app.dashboard.sessions.get(selected_row))
+            .is_some()
         {
-            footer_spans.extend(vec![
-                Span::styled("QUERY: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    truncate_str(&format_activity_query(session), 60),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-            ]);
-            footer_spans.extend(style_keybinding(
-                "e:Export | /:Search | Enter:Save Query | a/w/b/t:Subviews | m:Metric",
-                accent_color,
-            ));
+            footer_spans.extend(style_keybinding(activity_controls(true), accent_color));
         } else {
-            footer_spans.extend(style_keybinding(
-                "q:Quit | hjkl:Navigate | 1-8:Tabs | e:Export | /:Search | Enter:Save Query | a/w/b/t:Subviews | m:Metric",
-                accent_color,
-            ));
+            footer_spans.extend(style_keybinding(activity_controls(false), accent_color));
         }
     } else if app.current_tab == Tab::Replication {
         let receiver_summary = app
@@ -212,7 +194,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             .as_deref()
             .unwrap_or("Receiver: inactive");
         footer_spans.extend(style_keybinding(
-            "q:Quit | hjkl:Navigate | 1-8:Tabs | /:Search | n:Top",
+            "q:Quit | hjkl:Navigate | /:Search | n:Top",
             accent_color,
         ));
         footer_spans.extend(vec![
@@ -225,16 +207,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     {
         match app.current_tab {
             Tab::Statements => {
-                let query = row_data.first().map_or("", String::as_str);
-                footer_spans.extend(vec![
-                    Span::styled("QUERY: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(truncate_str(query, 60), Style::default().fg(Color::White)),
-                    Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-                ]);
-                footer_spans.extend(style_keybinding(
-                    "e:Export | Enter:Save Query | i:Details",
-                    accent_color,
-                ));
+                footer_spans.extend(style_keybinding(statements_controls(true), accent_color));
             }
             Tab::Database => match &app.database_view {
                 DatabaseView::Summary => {
@@ -263,65 +236,53 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             },
             Tab::Settings => {
                 footer_spans.extend(style_keybinding(
-                    "q:Quit | hjkl:Navigate | 1-8:Tabs | /:Search",
+                    "q:Quit | hjkl:Navigate | /:Search",
                     accent_color,
                 ));
             }
-            _ => footer_spans.extend(style_keybinding(
-                "q:Quit | hjkl:Navigate | 1-8:Tabs",
-                accent_color,
-            )),
+            _ => footer_spans.extend(style_keybinding("q:Quit | hjkl:Navigate", accent_color)),
         }
     } else {
         match app.current_tab {
             Tab::Activity => {
-                footer_spans.extend(style_keybinding(
-                    "q:Quit | hjkl:Navigate | 1-8:Tabs | e:Export | /:Search | Enter:Save Query | a/w/b/t:Subviews | m:Metric",
-                    accent_color,
-                ));
+                footer_spans.extend(style_keybinding(activity_controls(false), accent_color));
             }
             Tab::Replication => {
                 footer_spans.extend(style_keybinding(
-                    "q:Quit | hjkl:Navigate | 1-8:Tabs | /:Search | n:Top",
+                    "q:Quit | hjkl:Navigate | /:Search | n:Top",
                     accent_color,
                 ));
             }
             Tab::Statements => {
-                footer_spans.extend(style_keybinding(
-                    "q:Quit | hjkl:Navigate | 1-8:Tabs | e:Export | Enter:Save Query | i:Details",
-                    accent_color,
-                ));
+                footer_spans.extend(style_keybinding(statements_controls(false), accent_color));
             }
             Tab::Database => match &app.database_view {
                 DatabaseView::Summary => {
                     footer_spans.extend(style_keybinding(
-                        "q:Quit | hjkl:Navigate | 1-8:Tabs | Enter:Browse Tables",
+                        "q:Quit | hjkl:Navigate | Enter:Browse Tables",
                         accent_color,
                     ));
                 }
                 DatabaseView::Tables { .. } => {
                     footer_spans.extend(style_keybinding(
-                        "q:Quit | hjkl:Navigate | 1-8:Tabs | s:Show | v:Vacuum | R:Reindex | Esc:Back",
+                        "q:Quit | hjkl:Navigate | s:Show | v:Vacuum | R:Reindex | Esc:Back",
                         accent_color,
                     ));
                 }
             },
             Tab::Locks => {
                 footer_spans.extend(style_keybinding(
-                    "q:Quit | hjkl:Navigate | 1-8:Tabs | i:Visualizer",
+                    "q:Quit | hjkl:Navigate | i:Visualizer",
                     accent_color,
                 ));
             }
             Tab::Settings => {
                 footer_spans.extend(style_keybinding(
-                    "q:Quit | hjkl:Navigate | 1-8:Tabs | /:Search",
+                    "q:Quit | hjkl:Navigate | /:Search",
                     accent_color,
                 ));
             }
-            _ => footer_spans.extend(style_keybinding(
-                "q:Quit | hjkl:Navigate | 1-8:Tabs",
-                accent_color,
-            )),
+            _ => footer_spans.extend(style_keybinding("q:Quit | hjkl:Navigate", accent_color)),
         }
     }
 
@@ -338,6 +299,22 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(footer_color)),
     );
     f.render_widget(footer, area);
+}
+
+fn activity_controls(has_selection: bool) -> &'static str {
+    if has_selection {
+        "e:Export | /:Search | Enter:Save Query | i:Info | a/w/b/t:Subviews | m:Metric"
+    } else {
+        "q:Quit | hjkl:Navigate | e:Export | /:Search | Enter:Save Query | i:Info | a/w/b/t:Subviews | m:Metric"
+    }
+}
+
+fn statements_controls(has_selection: bool) -> &'static str {
+    if has_selection {
+        "e:Export | Enter:Save Query | i:Info"
+    } else {
+        "q:Quit | hjkl:Navigate | e:Export | Enter:Save Query | i:Info"
+    }
 }
 
 fn style_keybinding(text: &str, accent_color: Color) -> Vec<Span<'_>> {
@@ -450,4 +427,29 @@ fn append_link_state(footer_spans: &mut Vec<Span<'_>>, app: &App) {
     }
 
     footer_spans.push(Span::styled(link_state, style));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ERROR_CONTROLS, activity_controls, statements_controls};
+
+    #[test]
+    fn test_activity_controls_include_info_binding() {
+        assert!(activity_controls(true).contains("i:Info"));
+        assert!(activity_controls(false).contains("i:Info"));
+        assert!(!activity_controls(false).contains("1-8:Tabs"));
+    }
+
+    #[test]
+    fn test_statements_controls_include_info_binding() {
+        assert!(statements_controls(true).contains("i:Info"));
+        assert!(statements_controls(false).contains("i:Info"));
+        assert!(!statements_controls(false).contains("1-8:Tabs"));
+    }
+
+    #[test]
+    fn test_error_controls_remove_tab_switch_hint() {
+        assert_eq!(ERROR_CONTROLS, "q:Quit | r:Retry");
+        assert!(!ERROR_CONTROLS.contains("1-8:Switch Tab"));
+    }
 }

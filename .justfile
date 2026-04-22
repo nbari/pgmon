@@ -6,6 +6,9 @@ default: test
 test: clippy fmt
   cargo test --all-features
 
+test-explain-safety:
+    PGMON_TEST_DSN="{{PGMON_DSN}}" cargo test --all-features explain_safety
+
 clippy:
     cargo clippy --all-targets --all-features
 

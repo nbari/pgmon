@@ -168,10 +168,6 @@ pub(crate) fn slot_to_row(slot: &ReplicationSlot) -> Vec<String> {
     ]
 }
 
-pub(crate) fn is_normalized_query(query: &str) -> bool {
-    query.contains('$') && query.chars().any(|c| c.is_ascii_digit())
-}
-
 pub(crate) struct ActivityCounterSample {
     pub(crate) total_xacts: i64,
     pub(crate) total_inserts: i64,
