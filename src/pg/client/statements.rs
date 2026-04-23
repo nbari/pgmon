@@ -1,150 +1,211 @@
 //! Statement and capability fetchers for `PgClient`.
 
-use super::{CapabilityStatus, PgClient};
+use super::{CapabilityStatus, DbResult, PgClient, PgClientConnection};
 use crate::pg::queries::IO_QUERY;
-use anyhow::Result;
+use sqlx::Row;
 
 impl PgClient {
-    pub fn fetch_io_stats(&mut self) -> Result<Vec<Vec<String>>> {
-        if let CapabilityStatus::Unavailable(_) = self.ensure_io_capability()? {
+    pub(crate) async fn fetch_io_stats(
+        &self,
+        connection: &mut PgClientConnection,
+    ) -> DbResult<Vec<Vec<String>>> {
+        if let Err(super::DbError::CapabilityMissing(_)) =
+            self.ensure_io_capability(connection).await
+        {
             return Ok(Vec::new());
         }
-        let rows = self.client.query(IO_QUERY, &[])?;
+
+        let rows = sqlx::query(IO_QUERY)
+            .fetch_all(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
         rows.into_iter()
             .map(|row| {
                 Ok(vec![
-                    row.try_get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    row.try_get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    row.try_get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    row.try_get::<_, i64>(3)?.to_string(),
-                    row.try_get::<_, i64>(4)?.to_string(),
-                    row.try_get::<_, f64>(5)?.to_string(),
-                    row.try_get::<_, f64>(6)?.to_string(),
+                    row.try_get::<Option<String>, _>(0)?.unwrap_or_default(),
+                    row.try_get::<Option<String>, _>(1)?.unwrap_or_default(),
+                    row.try_get::<Option<String>, _>(2)?.unwrap_or_default(),
+                    row.try_get::<i64, _>(3)?.to_string(),
+                    row.try_get::<i64, _>(4)?.to_string(),
+                    row.try_get::<f64, _>(5)?.to_string(),
+                    row.try_get::<f64, _>(6)?.to_string(),
                 ])
             })
-            .collect()
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(super::connect::classify_query_error)
     }
 
-    pub fn fetch_statements(&mut self) -> Result<Vec<Vec<String>>> {
-        let Some(query) = self.ensure_statements_query()? else {
-            return Ok(Vec::new());
+    pub(crate) async fn fetch_statements(
+        &self,
+        connection: &mut PgClientConnection,
+    ) -> DbResult<Vec<Vec<String>>> {
+        let query = match self.ensure_statements_query(connection).await {
+            Ok(Some(query)) => query,
+            Ok(None) | Err(super::DbError::CapabilityMissing(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
         };
 
-        let rows = match self.client.query(query.as_str(), &[]) {
-            Ok(r) => r,
-            Err(e) => {
-                if e.to_string().contains("shared_preload_libraries") {
-                    self.capability_cache.statements = Some(CapabilityStatus::unavailable(
+        let rows = match sqlx::query(&query).fetch_all(connection.as_mut()).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                if error.to_string().contains("shared_preload_libraries") {
+                    let mut state = self.state();
+                    state.capability_cache.statements = Some(CapabilityStatus::unavailable(
                         "pg_stat_statements extension exists, but shared_preload_libraries does not load it.",
                     ));
-                    self.capability_cache.statements_query = None;
+                    state.capability_cache.statements_query = None;
                     return Ok(Vec::new());
                 }
-                return Err(e.into());
+                return Err(super::connect::classify_query_error(error));
             }
         };
+
         rows.into_iter()
             .map(|row| {
                 Ok(vec![
-                    row.try_get::<_, String>(6)?,
-                    row.try_get::<_, String>(0)?,
-                    row.try_get::<_, f64>(1)?.to_string(),
-                    row.try_get::<_, f64>(2)?.to_string(),
-                    row.try_get::<_, i64>(3)?.to_string(),
-                    row.try_get::<_, f64>(4)?.to_string(),
-                    row.try_get::<_, f64>(5)?.to_string(),
+                    row.try_get::<String, _>(6)?,
+                    row.try_get::<String, _>(0)?,
+                    row.try_get::<f64, _>(1)?.to_string(),
+                    row.try_get::<f64, _>(2)?.to_string(),
+                    row.try_get::<i64, _>(3)?.to_string(),
+                    row.try_get::<f64, _>(4)?.to_string(),
+                    row.try_get::<f64, _>(5)?.to_string(),
                 ])
             })
-            .collect()
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(super::connect::classify_query_error)
     }
 
-    pub(crate) fn io_capability(&self) -> CapabilityStatus {
-        self.capability_cache.io.clone().unwrap_or_default()
-    }
-
-    pub(crate) fn statements_capability(&self) -> CapabilityStatus {
-        self.capability_cache.statements.clone().unwrap_or_default()
-    }
-
-    fn extension_exists(&mut self, name: &str) -> Result<bool> {
-        let row = self
-            .client
-            .query_opt("SELECT 1 FROM pg_extension WHERE extname = $1", &[&name])?;
+    async fn extension_exists(
+        &self,
+        connection: &mut PgClientConnection,
+        name: &str,
+    ) -> DbResult<bool> {
+        let row = sqlx::query("SELECT 1 FROM pg_extension WHERE extname = $1")
+            .bind(name)
+            .fetch_optional(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
         Ok(row.is_some())
     }
 
-    fn view_exists(&mut self, name: &str) -> Result<bool> {
-        let row = self
-            .client
-            .query_opt("SELECT 1 FROM pg_views WHERE viewname = $1", &[&name])?;
+    async fn view_exists(&self, connection: &mut PgClientConnection, name: &str) -> DbResult<bool> {
+        let row = sqlx::query("SELECT 1 FROM pg_views WHERE viewname = $1")
+            .bind(name)
+            .fetch_optional(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
         Ok(row.is_some())
     }
 
-    fn column_exists(&mut self, table_name: &str, column_name: &str) -> Result<bool> {
-        let row = self.client.query_opt(
+    async fn column_exists(
+        &self,
+        connection: &mut PgClientConnection,
+        table_name: &str,
+        column_name: &str,
+    ) -> DbResult<bool> {
+        let row = sqlx::query(
             "SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2",
-            &[&table_name, &column_name],
-        )?;
+        )
+        .bind(table_name)
+        .bind(column_name)
+        .fetch_optional(connection.as_mut())
+        .await
+        .map_err(super::connect::classify_query_error)?;
         Ok(row.is_some())
     }
 
-    fn ensure_io_capability(&mut self) -> Result<CapabilityStatus> {
-        if let Some(status) = self.capability_cache.io.as_ref() {
-            return Ok(status.clone());
+    async fn ensure_io_capability(
+        &self,
+        connection: &mut PgClientConnection,
+    ) -> DbResult<CapabilityStatus> {
+        if let Some(status) = self.state().capability_cache.io.clone() {
+            return match status {
+                CapabilityStatus::Unavailable(_) => Err(super::DbError::CapabilityMissing(
+                    "pg_stat_io is not available on this server (PostgreSQL 16+ required).",
+                )),
+                other => Ok(other),
+            };
         }
 
-        let status = if self.view_exists("pg_stat_io")? {
+        let status = if self.view_exists(connection, "pg_stat_io").await? {
             CapabilityStatus::Available
         } else {
             CapabilityStatus::unavailable(
                 "pg_stat_io is not available on this server (PostgreSQL 16+ required).",
             )
         };
-        self.capability_cache.io = Some(status.clone());
-        Ok(status)
+        self.state().capability_cache.io = Some(status.clone());
+        match status {
+            CapabilityStatus::Unavailable(_) => Err(super::DbError::CapabilityMissing(
+                "pg_stat_io is not available on this server (PostgreSQL 16+ required).",
+            )),
+            other => Ok(other),
+        }
     }
 
-    fn ensure_statements_query(&mut self) -> Result<Option<String>> {
-        if let Some(status) = self.capability_cache.statements.as_ref()
-            && matches!(status, CapabilityStatus::Unavailable(_))
+    async fn ensure_statements_query(
+        &self,
+        connection: &mut PgClientConnection,
+    ) -> DbResult<Option<String>> {
         {
-            return Ok(None);
+            let state = self.state();
+            if let Some(status) = state.capability_cache.statements.as_ref()
+                && matches!(status, CapabilityStatus::Unavailable(_))
+            {
+                return Err(super::DbError::CapabilityMissing(
+                    "pg_stat_statements is not installed in the current database.",
+                ));
+            }
+            if let Some(query) = state.capability_cache.statements_query.as_ref() {
+                return Ok(Some(query.clone()));
+            }
         }
 
-        if let Some(query) = self.capability_cache.statements_query.as_ref() {
-            self.capability_cache.statements = Some(CapabilityStatus::Available);
-            return Ok(Some(query.clone()));
-        }
-
-        if !self.extension_exists("pg_stat_statements")? {
-            self.capability_cache.statements = Some(CapabilityStatus::unavailable(
+        if !self
+            .extension_exists(connection, "pg_stat_statements")
+            .await?
+        {
+            self.state().capability_cache.statements = Some(CapabilityStatus::unavailable(
                 "pg_stat_statements is not installed in the current database.",
             ));
-            return Ok(None);
+            return Err(super::DbError::CapabilityMissing(
+                "pg_stat_statements is not installed in the current database.",
+            ));
         }
 
-        let total_time_column = if self.column_exists("pg_stat_statements", "total_exec_time")? {
+        let total_time_column = if self
+            .column_exists(connection, "pg_stat_statements", "total_exec_time")
+            .await?
+        {
             "total_exec_time"
         } else {
             "total_time"
         };
-        let mean_time_column = if self.column_exists("pg_stat_statements", "mean_exec_time")? {
+        let mean_time_column = if self
+            .column_exists(connection, "pg_stat_statements", "mean_exec_time")
+            .await?
+        {
             "mean_exec_time"
         } else {
             "mean_time"
         };
-        let blk_read_time_expr =
-            if self.column_exists("pg_stat_statements", "shared_blk_read_time")? {
-                "COALESCE(s.shared_blk_read_time, 0)::float8"
-            } else {
-                "0::float8"
-            };
-        let blk_write_time_expr =
-            if self.column_exists("pg_stat_statements", "shared_blk_write_time")? {
-                "COALESCE(s.shared_blk_write_time, 0)::float8"
-            } else {
-                "0::float8"
-            };
+        let blk_read_time_expr = if self
+            .column_exists(connection, "pg_stat_statements", "shared_blk_read_time")
+            .await?
+        {
+            "COALESCE(s.shared_blk_read_time, 0)::float8"
+        } else {
+            "0::float8"
+        };
+        let blk_write_time_expr = if self
+            .column_exists(connection, "pg_stat_statements", "shared_blk_write_time")
+            .await?
+        {
+            "COALESCE(s.shared_blk_write_time, 0)::float8"
+        } else {
+            "0::float8"
+        };
 
         let query = build_statements_query(
             total_time_column,
@@ -152,8 +213,9 @@ impl PgClient {
             blk_read_time_expr,
             blk_write_time_expr,
         );
-        self.capability_cache.statements_query = Some(query.clone());
-        self.capability_cache.statements = Some(CapabilityStatus::Available);
+        let mut state = self.state();
+        state.capability_cache.statements_query = Some(query.clone());
+        state.capability_cache.statements = Some(CapabilityStatus::Available);
         Ok(Some(query))
     }
 }

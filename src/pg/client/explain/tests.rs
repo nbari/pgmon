@@ -1,8 +1,8 @@
 use super::parse::{supports_generic_explain, validate_explain_query};
-use super::{ExplainMode, PgClient, analyze_explain_query};
-use crate::pg::client::connect::config_from_dsn;
-use anyhow::Result;
-use postgres::{Client, NoTls};
+use super::{ExplainMode, analyze_explain_query};
+use crate::pg::client::{DbRuntime, PgClient, PgClientConnection};
+use anyhow::{Result, anyhow};
+use sqlx::Row;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -131,20 +131,32 @@ fn test_explain_safety_live_insert_does_not_mutate_rows() -> Result<()> {
         return Ok(());
     };
     let table_name = unique_test_table_name("insert");
-    let mut control_client = connect_test_client(&dsn)?;
-    control_client.batch_execute(&format!(
-        "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL);"
-    ))?;
+    with_live_clients(&dsn, |control_client, explain_client| async move {
+        let mut control_connection = control_client.acquire().await.map_err(db_error)?;
+        let mut explain_connection = explain_client.acquire().await.map_err(db_error)?;
+        sqlx::raw_sql(&format!(
+            "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL);"
+        ))
+        .execute(control_connection.as_mut())
+        .await?;
 
-    let mut explain_client = PgClient::new(&dsn, 5_000)?;
-    let query = format!("INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10)");
-    let plan = explain_client.fetch_explain_plan(&query, ExplainMode::Estimated)?;
+        let query = format!("INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10)");
+        let plan = explain_client
+            .fetch_explain_plan(&mut explain_connection, &query, ExplainMode::Estimated)
+            .await
+            .map_err(db_error)?;
 
-    assert!(!plan.is_empty());
-    assert_eq!(table_row_count(&mut control_client, &table_name)?, 0);
+        assert!(!plan.is_empty());
+        assert_eq!(
+            table_row_count(&mut control_connection, &table_name).await?,
+            0
+        );
 
-    control_client.batch_execute(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))?;
-    Ok(())
+        sqlx::raw_sql(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))
+            .execute(control_connection.as_mut())
+            .await?;
+        Ok(())
+    })
 }
 
 #[test]
@@ -153,20 +165,32 @@ fn test_explain_safety_live_update_does_not_mutate_rows() -> Result<()> {
         return Ok(());
     };
     let table_name = unique_test_table_name("update");
-    let mut control_client = connect_test_client(&dsn)?;
-    control_client.batch_execute(&format!(
-        "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10);"
-    ))?;
+    with_live_clients(&dsn, |control_client, explain_client| async move {
+        let mut control_connection = control_client.acquire().await.map_err(db_error)?;
+        let mut explain_connection = explain_client.acquire().await.map_err(db_error)?;
+        sqlx::raw_sql(&format!(
+            "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10);"
+        ))
+        .execute(control_connection.as_mut())
+        .await?;
 
-    let mut explain_client = PgClient::new(&dsn, 5_000)?;
-    let query = format!("UPDATE \"{table_name}\" SET value = 20 WHERE id = 1");
-    let plan = explain_client.fetch_explain_plan(&query, ExplainMode::Estimated)?;
+        let query = format!("UPDATE \"{table_name}\" SET value = 20 WHERE id = 1");
+        let plan = explain_client
+            .fetch_explain_plan(&mut explain_connection, &query, ExplainMode::Estimated)
+            .await
+            .map_err(db_error)?;
 
-    assert!(!plan.is_empty());
-    assert_eq!(table_value(&mut control_client, &table_name, 1)?, 10);
+        assert!(!plan.is_empty());
+        assert_eq!(
+            table_value(&mut control_connection, &table_name, 1).await?,
+            10
+        );
 
-    control_client.batch_execute(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))?;
-    Ok(())
+        sqlx::raw_sql(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))
+            .execute(control_connection.as_mut())
+            .await?;
+        Ok(())
+    })
 }
 
 #[test]
@@ -175,20 +199,32 @@ fn test_explain_safety_live_delete_does_not_mutate_rows() -> Result<()> {
         return Ok(());
     };
     let table_name = unique_test_table_name("delete");
-    let mut control_client = connect_test_client(&dsn)?;
-    control_client.batch_execute(&format!(
-        "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10);"
-    ))?;
+    with_live_clients(&dsn, |control_client, explain_client| async move {
+        let mut control_connection = control_client.acquire().await.map_err(db_error)?;
+        let mut explain_connection = explain_client.acquire().await.map_err(db_error)?;
+        sqlx::raw_sql(&format!(
+            "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10);"
+        ))
+        .execute(control_connection.as_mut())
+        .await?;
 
-    let mut explain_client = PgClient::new(&dsn, 5_000)?;
-    let query = format!("DELETE FROM \"{table_name}\" WHERE id = 1");
-    let plan = explain_client.fetch_explain_plan(&query, ExplainMode::Estimated)?;
+        let query = format!("DELETE FROM \"{table_name}\" WHERE id = 1");
+        let plan = explain_client
+            .fetch_explain_plan(&mut explain_connection, &query, ExplainMode::Estimated)
+            .await
+            .map_err(db_error)?;
 
-    assert!(!plan.is_empty());
-    assert_eq!(table_row_count(&mut control_client, &table_name)?, 1);
+        assert!(!plan.is_empty());
+        assert_eq!(
+            table_row_count(&mut control_connection, &table_name).await?,
+            1
+        );
 
-    control_client.batch_execute(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))?;
-    Ok(())
+        sqlx::raw_sql(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))
+            .execute(control_connection.as_mut())
+            .await?;
+        Ok(())
+    })
 }
 
 #[test]
@@ -197,22 +233,34 @@ fn test_explain_safety_live_modifying_cte_select_does_not_mutate_rows() -> Resul
         return Ok(());
     };
     let table_name = unique_test_table_name("cte");
-    let mut control_client = connect_test_client(&dsn)?;
-    control_client.batch_execute(&format!(
-        "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10);"
-    ))?;
+    with_live_clients(&dsn, |control_client, explain_client| async move {
+        let mut control_connection = control_client.acquire().await.map_err(db_error)?;
+        let mut explain_connection = explain_client.acquire().await.map_err(db_error)?;
+        sqlx::raw_sql(&format!(
+            "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10);"
+        ))
+        .execute(control_connection.as_mut())
+        .await?;
 
-    let mut explain_client = PgClient::new(&dsn, 5_000)?;
-    let query = format!(
-        "WITH deleted AS (DELETE FROM \"{table_name}\" WHERE id = 1 RETURNING id) SELECT * FROM deleted"
-    );
-    let plan = explain_client.fetch_explain_plan(&query, ExplainMode::Estimated)?;
+        let query = format!(
+            "WITH deleted AS (DELETE FROM \"{table_name}\" WHERE id = 1 RETURNING id) SELECT * FROM deleted"
+        );
+        let plan = explain_client
+            .fetch_explain_plan(&mut explain_connection, &query, ExplainMode::Estimated)
+            .await
+            .map_err(db_error)?;
 
-    assert!(!plan.is_empty());
-    assert_eq!(table_row_count(&mut control_client, &table_name)?, 1);
+        assert!(!plan.is_empty());
+        assert_eq!(
+            table_row_count(&mut control_connection, &table_name).await?,
+            1
+        );
 
-    control_client.batch_execute(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))?;
-    Ok(())
+        sqlx::raw_sql(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))
+            .execute(control_connection.as_mut())
+            .await?;
+        Ok(())
+    })
 }
 
 #[test]
@@ -220,27 +268,43 @@ fn test_explain_safety_live_generic_insert_does_not_mutate_rows() -> Result<()> 
     let Some(dsn) = live_test_dsn() else {
         return Ok(());
     };
-    let mut control_client = connect_test_client(&dsn)?;
-    let server_version_num = current_server_version_num(&mut control_client)?;
-    if !supports_generic_explain(server_version_num) {
-        return Ok(());
-    }
-
     let table_name = unique_test_table_name("generic");
-    control_client.batch_execute(&format!(
-        "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL);"
-    ))?;
+    with_live_clients(&dsn, |control_client, explain_client| async move {
+        let mut control_connection = control_client.acquire().await.map_err(db_error)?;
+        let mut explain_connection = explain_client.acquire().await.map_err(db_error)?;
+        let server_version_num = current_server_version_num(&mut control_connection).await?;
+        if !supports_generic_explain(server_version_num) {
+            return Ok(());
+        }
 
-    let mut explain_client = PgClient::new(&dsn, 5_000)?;
-    let query =
-        format!("INSERT INTO \"{table_name}\" (id, value) VALUES ($1::integer, $2::integer)");
-    let plan = explain_client.fetch_explain_plan(&query, ExplainMode::GenericEstimated)?;
+        sqlx::raw_sql(&format!(
+            "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL);"
+        ))
+        .execute(control_connection.as_mut())
+        .await?;
 
-    assert!(!plan.is_empty());
-    assert_eq!(table_row_count(&mut control_client, &table_name)?, 0);
+        let query =
+            format!("INSERT INTO \"{table_name}\" (id, value) VALUES ($1::integer, $2::integer)");
+        let plan = explain_client
+            .fetch_explain_plan(
+                &mut explain_connection,
+                &query,
+                ExplainMode::GenericEstimated,
+            )
+            .await
+            .map_err(db_error)?;
 
-    control_client.batch_execute(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))?;
-    Ok(())
+        assert!(!plan.is_empty());
+        assert_eq!(
+            table_row_count(&mut control_connection, &table_name).await?,
+            0
+        );
+
+        sqlx::raw_sql(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))
+            .execute(control_connection.as_mut())
+            .await?;
+        Ok(())
+    })
 }
 
 fn live_test_dsn() -> Option<String> {
@@ -257,25 +321,50 @@ fn unique_test_table_name(suffix: &str) -> String {
     format!("pgmon_explain_safety_{suffix}_{nanos}")
 }
 
-fn connect_test_client(dsn: &str) -> Result<Client> {
-    let config = config_from_dsn(dsn, 5_000)?;
-    Ok(config.connect(NoTls)?)
+fn with_live_clients<F, Fut>(dsn: &str, test: F) -> Result<()>
+where
+    F: FnOnce(PgClient, PgClient) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let runtime = DbRuntime::new()?;
+    let executor = runtime.executor();
+    runtime.block_on(async move {
+        let control_client = executor
+            .clone()
+            .client(dsn, 5_000)
+            .await
+            .map_err(db_error)?;
+        let explain_client = executor.client(dsn, 5_000).await.map_err(db_error)?;
+        test(control_client, explain_client).await
+    })
 }
 
-fn current_server_version_num(client: &mut Client) -> Result<i32> {
-    let row = client.query_one("SELECT current_setting('server_version_num')::int", &[])?;
-    Ok(row.try_get::<_, i32>(0)?)
+async fn current_server_version_num(connection: &mut PgClientConnection) -> Result<i32> {
+    let row = sqlx::query("SELECT current_setting('server_version_num')::int")
+        .fetch_one(connection.as_mut())
+        .await?;
+    row.try_get::<i32, _>(0).map_err(Into::into)
 }
 
-fn table_row_count(client: &mut Client, table_name: &str) -> Result<i64> {
-    let row = client.query_one(&format!("SELECT COUNT(*) FROM \"{table_name}\""), &[])?;
-    Ok(row.try_get::<_, i64>(0)?)
+async fn table_row_count(connection: &mut PgClientConnection, table_name: &str) -> Result<i64> {
+    let row = sqlx::query(&format!("SELECT COUNT(*) FROM \"{table_name}\""))
+        .fetch_one(connection.as_mut())
+        .await?;
+    row.try_get::<i64, _>(0).map_err(Into::into)
 }
 
-fn table_value(client: &mut Client, table_name: &str, id: i32) -> Result<i32> {
-    let row = client.query_one(
-        &format!("SELECT value FROM \"{table_name}\" WHERE id = $1"),
-        &[&id],
-    )?;
-    Ok(row.try_get::<_, i32>(0)?)
+async fn table_value(
+    connection: &mut PgClientConnection,
+    table_name: &str,
+    id: i32,
+) -> Result<i32> {
+    let row = sqlx::query(&format!("SELECT value FROM \"{table_name}\" WHERE id = $1"))
+        .bind(id)
+        .fetch_one(connection.as_mut())
+        .await?;
+    row.try_get::<i32, _>(0).map_err(Into::into)
+}
+
+fn db_error(error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!("{error}")
 }

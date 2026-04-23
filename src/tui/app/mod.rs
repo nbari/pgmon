@@ -9,8 +9,8 @@ mod tests;
 use crate::config::{Config, ExportFormat};
 use crate::pg::{
     client::{
-        ActivitySnapshot, CapabilityStatus, ExplainMode, PgClient, ReplicationSnapshot,
-        analyze_explain_query,
+        ActivitySnapshot, CapabilityStatus, ConnectionMeta, DbError, DbExecutor, DbRuntime,
+        ExplainMode, ReplicationSnapshot, analyze_explain_query,
     },
     conninfo::{describe_connection_target, describe_host},
 };
@@ -25,7 +25,6 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::mpsc,
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -38,7 +37,7 @@ use format::{
     sorted_activity_sessions, table_header_cells,
 };
 pub use state::{
-    ActivityChartMetric, ActivityDetail, ActivitySubview, CapabilitySummary, ConfirmActionState,
+    ActivityChartMetric, ActivitySubview, CapabilitySummary, ConfirmActionState,
     ConnectionHealthState, ConnectionStatus, DashboardStats, DatabaseView, DeadlockGraphState,
     ErrorState, ExplainPlanState, HelpSection, HelpState, InputMode, LoadingState, NoticeState,
     OfflineState, QueryDetailSource, QueryDetailState, QueryStats, RefreshIntervalState, Tab,
@@ -67,7 +66,7 @@ enum PendingRequestKind {
 
 struct PendingRequest {
     kind: PendingRequestKind,
-    rx: mpsc::Receiver<Result<RefreshPayload>>,
+    rx: mpsc::Receiver<crate::pg::client::DbResult<RefreshPayload>>,
     started_at: Instant,
 }
 
@@ -108,10 +107,11 @@ pub struct App {
     pub(crate) connection_health: ConnectionHealthState,
     pub(crate) config: Config,
     pub(crate) connection_status: ConnectionStatus,
-    pg_client: Option<PgClient>,
+    connection_meta: Option<ConnectionMeta>,
     activity_sessions: Vec<ActivitySession>,
     previous_activity_sample: Option<ActivityCounterSample>,
     pending_request: Option<PendingRequest>,
+    db_runtime: DbRuntime,
 }
 
 impl App {
@@ -125,14 +125,15 @@ impl App {
         home_view: &str,
         sort: &str,
         config: Config,
-    ) -> Self {
+    ) -> Result<Self> {
         let current_tab = match home_view {
             "statements" => Tab::Statements,
             _ => Tab::Activity,
         };
         let connection_target = describe_host(&dsn);
+        let db_runtime = DbRuntime::new()?;
 
-        Self {
+        Ok(Self {
             dsn,
             connect_timeout_ms,
             query_output_dir: query_output_dir.unwrap_or_else(std::env::temp_dir),
@@ -175,10 +176,39 @@ impl App {
             },
             config,
             connection_status: ConnectionStatus::Online,
-            pg_client: None,
+            connection_meta: None,
             activity_sessions: Vec::new(),
             previous_activity_sample: None,
             pending_request: None,
+            db_runtime,
+        })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::panic)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_test(
+        dsn: String,
+        connect_timeout_ms: u64,
+        query_output_dir: Option<PathBuf>,
+        refresh_ms: u64,
+        top_n: u32,
+        home_view: &str,
+        sort: &str,
+        config: Config,
+    ) -> Self {
+        match Self::new(
+            dsn,
+            connect_timeout_ms,
+            query_output_dir,
+            refresh_ms,
+            top_n,
+            home_view,
+            sort,
+            config,
+        ) {
+            Ok(app) => app,
+            Err(error) => panic!("test app should initialize: {error:#}"),
         }
     }
 
@@ -639,18 +669,23 @@ impl App {
 
         let dsn = self.dsn.clone();
         let timeout = self.connect_timeout_ms;
+        let refresh_ms = self.refresh_ms;
         let tab = self.current_tab;
         let database_view = self.database_view.clone();
-        let pg_client = if self.is_offline() {
-            self.pg_client = None;
-            None
-        } else {
-            self.pg_client.take()
-        };
-
-        thread::spawn(move || {
-            let result = load_refresh_payload(pg_client, &dsn, timeout, tab, &database_view);
-            let _ = tx.send(result);
+        if self.is_offline() {
+            self.connection_meta = None;
+        }
+        let executor = self.db_executor();
+        let request_executor = executor.clone();
+        executor.spawn_request(tx, move || {
+            request_executor.block_on(load_refresh_payload(
+                request_executor.clone(),
+                &dsn,
+                timeout,
+                refresh_ms,
+                tab,
+                &database_view,
+            ))
         });
     }
 
@@ -1196,8 +1231,8 @@ impl App {
                 match result {
                     Ok(payload) => {
                         let completed_at = Instant::now();
-                        self.last_refresh = completed_at;
                         if pending_kind == PendingRequestKind::Refresh {
+                            self.last_refresh = completed_at;
                             self.connection_health.last_refresh_at = Some(completed_at);
                             self.connection_health.last_refresh_duration =
                                 Some(completed_at.saturating_duration_since(request_started_at));
@@ -1208,7 +1243,7 @@ impl App {
                         self.has_loaded_once = true;
                     }
                     Err(error) => {
-                        self.handle_request_failure(pending_kind, format!("{error:#}"));
+                        self.handle_request_failure(pending_kind, &error);
                     }
                 }
             }
@@ -1218,18 +1253,25 @@ impl App {
                 self.loading_state = None;
                 self.handle_request_failure(
                     pending_kind,
-                    "Background refresh worker disconnected".to_string(),
+                    &DbError::transient("Background refresh worker disconnected"),
                 );
             }
         }
     }
 
-    fn handle_request_failure(&mut self, kind: PendingRequestKind, details: String) {
+    fn handle_request_failure(&mut self, kind: PendingRequestKind, error: &DbError) {
+        if kind == PendingRequestKind::Refresh && error == &DbError::Timeout {
+            self.connection_health.last_error = Some("Refresh timed out".to_string());
+            self.connection_health.last_error_at = Some(Instant::now());
+            return;
+        }
+
+        let details = format!("{error}");
         if kind == PendingRequestKind::Refresh {
             let summary = summarize_error(&details);
             self.connection_health.last_error = Some(summary.clone());
             self.connection_health.last_error_at = Some(Instant::now());
-            self.pg_client = None;
+            self.connection_meta = None;
             if self.has_loaded_once {
                 let failed_attempts = self
                     .offline_state()
@@ -1334,10 +1376,14 @@ impl App {
         self.connection_status = ConnectionStatus::Online;
     }
 
+    fn db_executor(&self) -> DbExecutor {
+        self.db_runtime.executor()
+    }
+
     fn request_refresh_worker(
         &mut self,
         kind: PendingRequestKind,
-        worker: impl FnOnce(mpsc::Sender<Result<RefreshPayload>>) + Send + 'static,
+        request: impl FnOnce() -> crate::pg::client::DbResult<RefreshPayload> + Send + 'static,
     ) {
         let (tx, rx) = mpsc::channel();
         self.pending_request = Some(PendingRequest {
@@ -1345,7 +1391,7 @@ impl App {
             rx,
             started_at: Instant::now(),
         });
-        thread::spawn(move || worker(tx));
+        self.db_executor().spawn_request(tx, request);
     }
 
     fn start_explain_request(
@@ -1356,83 +1402,44 @@ impl App {
         query: String,
         explain_mode: ExplainMode,
     ) {
-        self.request_refresh_worker(PendingRequestKind::Explain, move |tx| {
-            let result = (|| -> Result<RefreshPayload> {
-                let mut client = if database.is_empty() {
-                    PgClient::new(&dsn, timeout)?
-                } else {
-                    PgClient::for_database(&dsn, timeout, &database)?
-                };
-                let plan = client.fetch_explain_plan(&query, explain_mode).context(
-                    match explain_mode {
-                        ExplainMode::Estimated => {
-                            "Explain failed. pgmon only collects a planner estimate and does not execute the query."
-                        }
-                        ExplainMode::GenericEstimated => {
-                            "Generic estimated plan failed. PostgreSQL may need explicit casts or real literals to infer placeholder types."
-                        }
-                    },
-                )?;
-                let auto_explain = client.fetch_auto_explain_info()?;
-                Ok(RefreshPayload::Explain(ExplainPlanState {
-                    plan,
-                    explain_mode,
-                    auto_explain_summary: auto_explain.summary,
-                    auto_explain_hint: auto_explain.hint,
-                }))
-            })();
-            let _ = tx.send(result);
+        let executor = self.db_executor();
+        self.request_refresh_worker(PendingRequestKind::Explain, move || {
+            executor.block_on(fetch::load_explain_payload(
+                executor.clone(),
+                dsn,
+                timeout,
+                database,
+                query,
+                explain_mode,
+            ))
         });
     }
 
     fn request_activity_detail(&mut self, pid: i32, database: String) {
         let dsn = self.dsn.clone();
         let timeout = self.connect_timeout_ms;
+        let executor = self.db_executor();
 
-        self.request_refresh_worker(PendingRequestKind::ActivityDetail, move |tx| {
-            let result = (|| -> Result<RefreshPayload> {
-                let mut client = if database.is_empty() {
-                    PgClient::new(&dsn, timeout)?
-                } else {
-                    PgClient::for_database(&dsn, timeout, &database)?
-                };
-                let detail = client.fetch_activity_detail(pid)?;
-                let auto_explain = client.fetch_auto_explain_info()?;
-                Ok(RefreshPayload::ActivityDetail(
-                    fetch::ActivityInspectionPayload {
-                        detail: ActivityDetail {
-                            pid: detail.pid,
-                            usename: detail.usename,
-                            application_name: detail.application_name,
-                            client_addr: detail.client_addr,
-                            client_port: detail.client_port,
-                            backend_start: detail.backend_start,
-                            state: detail.state,
-                            wait_event_type: detail.wait_event_type,
-                            wait_event: detail.wait_event,
-                            xact_start: detail.xact_start,
-                            state_change: detail.state_change,
-                            query: detail.query,
-                            blocking_pids: detail.blocking_pids,
-                            blockers: detail.blockers,
-                            locks: detail.locks,
-                        },
-                        auto_explain,
-                    },
-                ))
-            })();
-            let _ = tx.send(result);
+        self.request_refresh_worker(PendingRequestKind::ActivityDetail, move || {
+            executor.block_on(fetch::load_activity_detail_payload(
+                executor.clone(),
+                dsn,
+                timeout,
+                database,
+                pid,
+            ))
         });
     }
 
     fn start_admin_action_request(&mut self, dsn: String, timeout: u64, query: String) {
-        self.request_refresh_worker(PendingRequestKind::AdminAction, move |tx| {
-            let result = (|| -> Result<RefreshPayload> {
-                let mut client = PgClient::new(&dsn, timeout)?;
-                client.execute_admin_action(&query)?;
-                Ok(RefreshPayload::Table(Vec::new(), client))
-            })();
-            let _ = tx.send(result);
+        let executor = self.db_executor();
+        self.request_refresh_worker(PendingRequestKind::AdminAction, move || {
+            executor.block_on(fetch::execute_admin_action_payload(
+                executor.clone(),
+                dsn,
+                timeout,
+                query,
+            ))
         });
     }
 
@@ -1440,36 +1447,38 @@ impl App {
         &mut self,
         dsn: String,
         timeout: u64,
+        database: String,
         schema: String,
         table: String,
     ) {
-        self.request_refresh_worker(PendingRequestKind::TableDefinition, move |tx| {
-            let result = (|| -> Result<RefreshPayload> {
-                let mut client = PgClient::new(&dsn, timeout)?;
-                let (columns, indexes) = client.fetch_table_definition(&schema, &table)?;
-                Ok(RefreshPayload::TableDefinition(
-                    schema, table, columns, indexes,
-                ))
-            })();
-            let _ = tx.send(result);
+        let executor = self.db_executor();
+        self.request_refresh_worker(PendingRequestKind::TableDefinition, move || {
+            executor.block_on(fetch::load_table_definition_payload(
+                executor.clone(),
+                dsn,
+                timeout,
+                database,
+                schema,
+                table,
+            ))
         });
     }
 
     fn apply_refresh_payload(&mut self, payload: RefreshPayload) {
         match payload {
-            RefreshPayload::Activity(activity, client) => {
-                self.sync_capabilities_from_client(&client);
-                self.pg_client = Some(client);
+            RefreshPayload::Activity(activity, connection_meta) => {
+                self.sync_capabilities_from_meta(&connection_meta);
+                self.connection_meta = Some(connection_meta);
                 self.apply_activity_snapshot(*activity);
             }
-            RefreshPayload::Replication(replication, client) => {
-                self.sync_capabilities_from_client(&client);
-                self.pg_client = Some(client);
+            RefreshPayload::Replication(replication, connection_meta) => {
+                self.sync_capabilities_from_meta(&connection_meta);
+                self.connection_meta = Some(connection_meta);
                 self.apply_replication_snapshot(*replication);
             }
-            RefreshPayload::Table(data, client) => {
-                self.sync_capabilities_from_client(&client);
-                self.pg_client = Some(client);
+            RefreshPayload::Table(data, connection_meta) => {
+                self.sync_capabilities_from_meta(&connection_meta);
+                self.connection_meta = Some(connection_meta);
                 self.data = self.prepare_table_data(data);
             }
             RefreshPayload::Explain(plan) => {
@@ -1484,6 +1493,7 @@ impl App {
                 });
             }
             RefreshPayload::ActivityDetail(payload) => {
+                let payload = *payload;
                 if let Some(query_detail) = self.query_detail.as_mut() {
                     query_detail.activity_detail = Some(payload.detail);
                     query_detail.auto_explain_summary = payload.auto_explain.summary;
@@ -1549,20 +1559,22 @@ impl App {
         self.data.clear();
     }
 
-    fn sync_capabilities_from_client(&mut self, client: &PgClient) {
-        merge_capability_status(&mut self.capabilities.io, client.io_capability());
+    fn sync_capabilities_from_meta(&mut self, meta: &ConnectionMeta) {
+        merge_capability_status(&mut self.capabilities.io, meta.io_capability.clone());
         merge_capability_status(
             &mut self.capabilities.statements,
-            client.statements_capability(),
+            meta.statements_capability.clone(),
         );
         merge_capability_status(
             &mut self.capabilities.replication,
-            client.replication_capability(),
+            meta.replication_capability.clone(),
         );
     }
 
     fn current_server_version_num(&self) -> Option<i32> {
-        self.pg_client.as_ref().map(PgClient::server_version_num)
+        self.connection_meta
+            .as_ref()
+            .map(|meta| meta.server_version_num)
     }
 
     fn effective_refresh_interval(&self) -> Duration {
@@ -1787,23 +1799,34 @@ impl App {
     }
 
     fn handle_show_table_definition(&mut self) {
-        if let Some(row) = self.selected_row.and_then(|idx| self.data.get(idx)) {
-            let schema = row.get(4).cloned().unwrap_or_default();
-            let table = row.get(5).cloned().unwrap_or_default();
-            let depth = row.get(6).and_then(|d| d.parse::<i32>().ok()).unwrap_or(0);
+        if let Some((database, schema, table)) = self.selected_table_definition_target() {
+            let dsn = self.dsn.clone();
+            let timeout = self.connect_timeout_ms;
 
-            if depth == 1 {
-                let dsn = self.dsn.clone();
-                let timeout = self.connect_timeout_ms;
+            self.loading_state = Some(LoadingState {
+                message: format!("Fetching definition for {schema}.{table}..."),
+                started_at: Instant::now(),
+            });
 
-                self.loading_state = Some(LoadingState {
-                    message: format!("Fetching definition for {schema}.{table}..."),
-                    started_at: Instant::now(),
-                });
-
-                self.start_table_definition_request(dsn, timeout, schema, table);
-            }
+            self.start_table_definition_request(dsn, timeout, database, schema, table);
         }
+    }
+
+    fn selected_table_definition_target(&self) -> Option<(String, String, String)> {
+        let DatabaseView::Tables { database } = &self.database_view else {
+            return None;
+        };
+        let row = self.selected_row.and_then(|idx| self.data.get(idx))?;
+        let depth = row.get(6).and_then(|d| d.parse::<i32>().ok()).unwrap_or(0);
+        if depth != 1 {
+            return None;
+        }
+
+        Some((
+            database.clone(),
+            row.get(4).cloned().unwrap_or_default(),
+            row.get(5).cloned().unwrap_or_default(),
+        ))
     }
 }
 

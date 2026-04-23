@@ -39,6 +39,15 @@ impl ExplainMode {
     }
 }
 
+/// Connection-scoped capabilities and server metadata needed by the TUI.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConnectionMeta {
+    pub(crate) server_version_num: i32,
+    pub(crate) io_capability: CapabilityStatus,
+    pub(crate) statements_capability: CapabilityStatus,
+    pub(crate) replication_capability: CapabilityStatus,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ActivitySnapshot {
     pub(crate) summary: ActivitySummarySnapshot,

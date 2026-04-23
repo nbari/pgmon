@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_sender_rows_empty_state_uses_first_column() {
-        let app = App::new(
+        let app = App::new_for_test(
             String::new(),
             0,
             None,

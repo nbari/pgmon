@@ -8,16 +8,19 @@ All notable changes to this project will be documented in this file.
 - **Safe Explain From Both Query Info Flows**: `x` now runs planner-only explain from both `Activity` and `Statements`, with generic estimated plans for normalized `pg_stat_statements` SQL on PostgreSQL 16+.
 - **`auto_explain` Guidance**: Query info and explain modals now show whether `auto_explain` is loaded or enabled for the inspected database, plus concise guidance for collecting real execution plans in PostgreSQL logs.
 - **Explain Safety Test Hook**: Added opt-in live PostgreSQL explain-safety tests via `PGMON_TEST_DSN` / `just test-explain-safety`.
+- **Explain Safety CI Coverage**: Added GitHub Actions coverage for the live explain-safety path against PostgreSQL 16+ so generic-plan validation is exercised outside local container setups.
 - **Missing-Index Demo Workload**: `pgload.py` now creates larger `pgload_accounts`, `pgload_orders`, and `pgload_audit_log` tables, periodically reports whether the expected demo indexes are actually present or missing, and emits a few tagged long SQL samples for layout testing.
 
 ### Fixed
 - **Non-Executing Diagnosis**: Replaced in-app `EXPLAIN ANALYZE` with safe estimated planning modes so query diagnosis no longer executes the inspected SQL.
 - **Explain Safety Guardrails**: Explain now uses PostgreSQL-parser validation to only accept single `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`MERGE` statements, rejects utility/session statements before they reach PostgreSQL, and avoids `GENERIC_PLAN` on PostgreSQL 14/15.
+- **Parameterized INSERT Classification**: Fixed explain-mode detection for `INSERT ... VALUES ($1, $2)` and similar parameterized DML so PostgreSQL 16+ uses `GENERIC_PLAN` instead of failing validation after parsing.
 - **Footer Controls**: Standardized the `i:Info` label, removed redundant `1-8:Tabs` hints, and dropped the inline query preview so the `Controls` footer stays consistent while navigating rows.
 - **`pgload.py` Stability**: Fixed setup SQL placeholder parsing with psycopg2, scratch-table sequence collisions, and deadlock cleanup so the demo loader starts cleanly and runs without accumulating errors.
 
 ### Changed
 - **PostgreSQL Support Floor**: pgmon now explicitly targets PostgreSQL 14+.
+- **Database Layer**: Replaced the synchronous `postgres` client path with a shared `tokio` + `sqlx` runtime and pooled connection handling to align the codebase with the project's newer Rust/PostgreSQL stack.
 - **Query Inspection UX**: Updated the query modals and README to emphasize planner-only diagnosis, parameterized-query caveats, version-aware generic-plan limits, and the fresh-session limitations of in-app explain output.
 
 ## [0.5.1] - 2026-04-17

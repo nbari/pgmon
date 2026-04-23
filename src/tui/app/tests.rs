@@ -6,12 +6,12 @@ mod test_harness {
         sorted_activity_sessions,
     };
     use super::super::{
-        ActivityChartMetric, ActivitySession, ActivitySubview, App, CapabilityStatus,
-        ConnectionStatus, InputMode, OfflineState, PendingRequest, PendingRequestKind,
-        QueryDetailSource, QueryDetailState, QueryStats, RefreshPayload, Tab, clamp_selected_row,
-        parse_rate_value,
+        ActivityChartMetric, ActivitySession, ActivitySubview, App as RawApp, CapabilityStatus,
+        ConnectionStatus, DatabaseView, InputMode, OfflineState, PendingRequest,
+        PendingRequestKind, QueryDetailSource, QueryDetailState, QueryStats, RefreshPayload, Tab,
+        clamp_selected_row, parse_rate_value,
     };
-    use crate::pg::client::ExplainMode;
+    use crate::pg::client::{DbResult, ExplainMode};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::{
         fs,
@@ -45,6 +45,33 @@ mod test_harness {
             panic!("theme config should load");
         };
         config
+    }
+
+    struct App;
+
+    impl App {
+        #[allow(clippy::new_ret_no_self, clippy::too_many_arguments)]
+        fn new(
+            dsn: String,
+            connect_timeout_ms: u64,
+            query_output_dir: Option<std::path::PathBuf>,
+            refresh_ms: u64,
+            top_n: u32,
+            home_view: &str,
+            sort: &str,
+            config: crate::config::Config,
+        ) -> RawApp {
+            RawApp::new_for_test(
+                dsn,
+                connect_timeout_ms,
+                query_output_dir,
+                refresh_ms,
+                top_n,
+                home_view,
+                sort,
+                config,
+            )
+        }
     }
 
     #[test]
@@ -156,7 +183,6 @@ mod test_harness {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn test_prepare_table_data_statements_sorting() {
-        use super::super::App;
         let app = App::new(
             String::new(),
             0,
@@ -177,7 +203,6 @@ mod test_harness {
 
     #[test]
     fn test_prepare_table_data_handles_all_tabs() {
-        use super::super::App;
         let app = App::new(
             String::new(),
             0,
@@ -192,6 +217,44 @@ mod test_harness {
         let data = vec![vec!["row".into()]];
         let processed = app.prepare_table_data(data.clone());
         assert_eq!(processed.len(), 1);
+    }
+
+    #[test]
+    fn test_selected_table_definition_target_uses_current_database_view() {
+        let mut app = App::new(
+            "postgres://localhost/postgres".to_string(),
+            3000,
+            None,
+            1000,
+            10,
+            "activity",
+            "total_time",
+            crate::config::Config::default(),
+        );
+        app.database_view = DatabaseView::Tables {
+            database: "analytics".to_string(),
+        };
+        app.data = vec![vec![
+            "  orders".to_string(),
+            "table".to_string(),
+            "123".to_string(),
+            "32 kB".to_string(),
+            "public".to_string(),
+            "orders".to_string(),
+            "1".to_string(),
+        ]];
+        app.selected_row = Some(0);
+
+        let target = app.selected_table_definition_target();
+
+        assert_eq!(
+            target,
+            Some((
+                "analytics".to_string(),
+                "public".to_string(),
+                "orders".to_string()
+            ))
+        );
     }
 
     #[test]
@@ -428,8 +491,8 @@ mod test_harness {
             rx,
             started_at: Instant::now(),
         });
-        let send_result = tx.send(Err(anyhow::anyhow!(
-            "connection lost while refreshing activity"
+        let send_result = tx.send(Err(crate::pg::client::DbError::transient(
+            "connection lost while refreshing activity",
         )));
         assert!(send_result.is_ok());
 
@@ -460,7 +523,9 @@ mod test_harness {
             rx,
             started_at: Instant::now(),
         });
-        let send_result = tx.send(Err(anyhow::anyhow!("startup connect failed")));
+        let send_result = tx.send(Err(crate::pg::client::DbError::transient(
+            "startup connect failed",
+        )));
         assert!(send_result.is_ok());
 
         app.handle_refresh_result();
@@ -527,7 +592,7 @@ mod test_harness {
         app.has_loaded_once = true;
         app.last_refresh = instant_secs_ago(2);
 
-        let (tx, rx) = mpsc::channel::<anyhow::Result<RefreshPayload>>();
+        let (tx, rx) = mpsc::channel::<DbResult<RefreshPayload>>();
         drop(tx);
         app.pending_request = Some(PendingRequest {
             kind: PendingRequestKind::Refresh,
@@ -916,7 +981,7 @@ mod test_harness {
 
         app.handle_request_failure(
             PendingRequestKind::Refresh,
-            "connection lost\nwith extra detail".to_string(),
+            &crate::pg::client::DbError::transient("connection lost\nwith extra detail"),
         );
 
         let Some(offline) = app.offline_state() else {
@@ -926,7 +991,37 @@ mod test_harness {
         assert_eq!(offline.failed_attempts, 1);
         assert!(offline.next_retry_at > Instant::now());
         assert!(app.connection_health.last_error.is_some());
-        assert!(app.pg_client.is_none());
+        assert!(app.connection_meta.is_none());
+    }
+
+    #[test]
+    fn test_handle_request_failure_refresh_timeout_keeps_stale_state() {
+        let mut app = App::new(
+            "postgres://localhost/postgres".to_string(),
+            3000,
+            None,
+            1000,
+            10,
+            "activity",
+            "total_time",
+            crate::config::Config::default(),
+        );
+        app.has_loaded_once = true;
+        app.last_refresh = instant_secs_ago(4);
+        app.data = vec![vec!["existing".to_string()]];
+
+        app.handle_request_failure(
+            PendingRequestKind::Refresh,
+            &crate::pg::client::DbError::Timeout,
+        );
+
+        assert!(!app.is_offline());
+        assert!(app.error_state.is_none());
+        assert_eq!(app.data, vec![vec!["existing".to_string()]]);
+        assert_eq!(
+            app.connection_health.last_error,
+            Some("Refresh timed out".to_string())
+        );
     }
 
     #[test]

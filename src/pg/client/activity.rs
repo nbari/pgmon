@@ -2,141 +2,159 @@
 
 use super::{
     ActivityDetail, ActivityProcessSnapshot, ActivitySession, ActivitySnapshot,
-    ActivitySummarySnapshot, AutoExplainInfo, PgClient,
+    ActivitySummarySnapshot, AutoExplainInfo, DbResult, PgClient, PgClientConnection,
 };
 use crate::pg::queries::{
     ACTIVITY_BLOCKING_QUERY, ACTIVITY_DETAIL_QUERY, ACTIVITY_LOCKS_QUERY, ACTIVITY_PROCESS_QUERY,
     ACTIVITY_SESSIONS_QUERY, ACTIVITY_SUMMARY_QUERY, AUTO_EXPLAIN_STATUS_QUERY,
 };
-use anyhow::Result;
 use chrono::{DateTime, Utc};
+use sqlx::Row;
 
 impl PgClient {
-    pub fn fetch_activity_snapshot(&mut self) -> Result<ActivitySnapshot> {
-        let summary_row = self.client.query_one(ACTIVITY_SUMMARY_QUERY, &[])?;
-        let process_row = self.client.query_one(ACTIVITY_PROCESS_QUERY, &[])?;
-        let session_rows = self.client.query(ACTIVITY_SESSIONS_QUERY, &[])?;
+    pub(crate) async fn fetch_activity_snapshot(
+        &self,
+        connection: &mut PgClientConnection,
+    ) -> DbResult<ActivitySnapshot> {
+        let summary_row = sqlx::query(ACTIVITY_SUMMARY_QUERY)
+            .fetch_one(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
+        let process_row = sqlx::query(ACTIVITY_PROCESS_QUERY)
+            .fetch_one(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
+        let session_rows = sqlx::query(ACTIVITY_SESSIONS_QUERY)
+            .fetch_all(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
 
         let sessions = session_rows
-            .into_iter()
-            .map(|row| {
-                Ok(ActivitySession {
-                    pid: row.try_get::<_, String>(0)?,
-                    backend_type: row.try_get::<_, String>(1)?,
-                    xmin: row.try_get::<_, String>(2)?,
-                    database: row.try_get::<_, String>(3)?,
-                    application: row.try_get::<_, String>(4)?,
-                    user: row.try_get::<_, String>(5)?,
-                    client: row.try_get::<_, String>(6)?,
-                    duration_seconds: row.try_get::<_, i64>(7)?.max(0),
-                    wait_info: row.try_get::<_, String>(8)?,
-                    state: row.try_get::<_, String>(9)?,
-                    query: row.try_get::<_, String>(10)?,
-                    blocked_by_count: row.try_get::<_, i64>(11)?,
-                    blocked_count: row.try_get::<_, i64>(12)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .iter()
+            .map(map_activity_session)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(super::connect::classify_query_error)?;
 
         Ok(ActivitySnapshot {
-            summary: ActivitySummarySnapshot {
-                server_version: summary_row.try_get::<_, String>(0)?,
-                postmaster_start: summary_row.try_get::<_, DateTime<Utc>>(1)?,
-                database_count: summary_row.try_get::<_, i64>(2)?,
-                total_database_bytes: summary_row.try_get::<_, i64>(3)?,
-                cache_hit_pct: summary_row.try_get::<_, f64>(4)?,
-                rollback_pct: summary_row.try_get::<_, f64>(5)?,
-                total_commits: summary_row.try_get::<_, i64>(6)?,
-                total_rollbacks: summary_row.try_get::<_, i64>(7)?,
-                total_xacts: summary_row.try_get::<_, i64>(8)?,
-                total_inserts: summary_row.try_get::<_, i64>(9)?,
-                total_updates: summary_row.try_get::<_, i64>(10)?,
-                total_deletes: summary_row.try_get::<_, i64>(11)?,
-                total_returned: summary_row.try_get::<_, i64>(12)?,
-                total_temp_files: summary_row.try_get::<_, i64>(13)?,
-                total_temp_bytes: summary_row.try_get::<_, i64>(14)?,
-                max_connections: summary_row.try_get::<_, i64>(15)?,
-            },
-            process: ActivityProcessSnapshot {
-                worker_total: process_row.try_get::<_, i64>(0)?,
-                max_worker_processes: process_row.try_get::<_, i64>(1)?,
-                logical_workers: process_row.try_get::<_, i64>(2)?,
-                max_logical_workers: process_row.try_get::<_, i64>(3)?,
-                parallel_workers: process_row.try_get::<_, i64>(4)?,
-                max_parallel_workers: process_row.try_get::<_, i64>(5)?,
-                autovacuum_workers: process_row.try_get::<_, i64>(6)?,
-                max_autovacuum_workers: process_row.try_get::<_, i64>(7)?,
-                wal_senders: process_row.try_get::<_, i64>(8)?,
-                max_wal_senders: process_row.try_get::<_, i64>(9)?,
-                wal_receivers: process_row.try_get::<_, i64>(10)?,
-                replication_slots: process_row.try_get::<_, i64>(11)?,
-                max_replication_slots: process_row.try_get::<_, i64>(12)?,
-            },
+            summary: map_activity_summary(&summary_row)
+                .map_err(super::connect::classify_query_error)?,
+            process: map_activity_process(&process_row)
+                .map_err(super::connect::classify_query_error)?,
             sessions,
         })
     }
 
-    pub fn fetch_activity_detail(&mut self, pid: i32) -> Result<ActivityDetail> {
-        let row = self.client.query_one(ACTIVITY_DETAIL_QUERY, &[&pid])?;
-        let blockers = self
-            .client
-            .query(ACTIVITY_BLOCKING_QUERY, &[&pid])?
+    pub(crate) async fn fetch_activity_detail(
+        &self,
+        connection: &mut PgClientConnection,
+        pid: i32,
+    ) -> DbResult<ActivityDetail> {
+        let row = sqlx::query(ACTIVITY_DETAIL_QUERY)
+            .bind(pid)
+            .fetch_one(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
+        let blockers = sqlx::query(ACTIVITY_BLOCKING_QUERY)
+            .bind(pid)
+            .fetch_all(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?
             .into_iter()
             .map(|row| {
                 Ok(vec![
-                    row.try_get::<_, String>(0)?,
-                    row.try_get::<_, String>(1)?,
-                    row.try_get::<_, String>(2)?,
-                    row.try_get::<_, String>(3)?,
-                    row.try_get::<_, String>(4)?,
+                    row.try_get::<String, _>(0)?,
+                    row.try_get::<String, _>(1)?,
+                    row.try_get::<String, _>(2)?,
+                    row.try_get::<String, _>(3)?,
+                    row.try_get::<String, _>(4)?,
                 ])
             })
-            .collect::<Result<Vec<_>>>()?;
-
-        let locks = self
-            .client
-            .query(ACTIVITY_LOCKS_QUERY, &[&pid])?
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(super::connect::classify_query_error)?;
+        let locks = sqlx::query(ACTIVITY_LOCKS_QUERY)
+            .bind(pid)
+            .fetch_all(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?
             .into_iter()
             .map(|row| {
                 Ok(vec![
-                    row.try_get::<_, String>(0)?,
-                    row.try_get::<_, String>(1)?,
-                    row.try_get::<_, String>(2)?,
-                    row.try_get::<_, String>(3)?,
+                    row.try_get::<String, _>(0)?,
+                    row.try_get::<String, _>(1)?,
+                    row.try_get::<String, _>(2)?,
+                    row.try_get::<String, _>(3)?,
                 ])
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(super::connect::classify_query_error)?;
 
         Ok(ActivityDetail {
-            pid: row.try_get::<_, String>(0)?,
-            usename: row.try_get::<_, String>(1)?,
-            application_name: row.try_get::<_, String>(2)?,
-            client_addr: row.try_get::<_, String>(3)?,
-            client_port: row.try_get::<_, String>(4)?,
-            backend_start: row.try_get::<_, String>(5)?,
-            state: row.try_get::<_, String>(6)?,
-            wait_event_type: row.try_get::<_, String>(7)?,
-            wait_event: row.try_get::<_, String>(8)?,
-            xact_start: row.try_get::<_, String>(9)?,
-            state_change: row.try_get::<_, String>(10)?,
-            query: row.try_get::<_, String>(11)?,
-            blocking_pids: row.try_get::<_, String>(12)?,
+            pid: row
+                .try_get::<String, _>(0)
+                .map_err(super::connect::classify_query_error)?,
+            usename: row
+                .try_get::<String, _>(1)
+                .map_err(super::connect::classify_query_error)?,
+            application_name: row
+                .try_get::<String, _>(2)
+                .map_err(super::connect::classify_query_error)?,
+            client_addr: row
+                .try_get::<String, _>(3)
+                .map_err(super::connect::classify_query_error)?,
+            client_port: row
+                .try_get::<String, _>(4)
+                .map_err(super::connect::classify_query_error)?,
+            backend_start: row
+                .try_get::<String, _>(5)
+                .map_err(super::connect::classify_query_error)?,
+            state: row
+                .try_get::<String, _>(6)
+                .map_err(super::connect::classify_query_error)?,
+            wait_event_type: row
+                .try_get::<String, _>(7)
+                .map_err(super::connect::classify_query_error)?,
+            wait_event: row
+                .try_get::<String, _>(8)
+                .map_err(super::connect::classify_query_error)?,
+            xact_start: row
+                .try_get::<String, _>(9)
+                .map_err(super::connect::classify_query_error)?,
+            state_change: row
+                .try_get::<String, _>(10)
+                .map_err(super::connect::classify_query_error)?,
+            query: row
+                .try_get::<String, _>(11)
+                .map_err(super::connect::classify_query_error)?,
+            blocking_pids: row
+                .try_get::<String, _>(12)
+                .map_err(super::connect::classify_query_error)?,
             blockers,
             locks,
         })
     }
 
-    pub(crate) fn fetch_auto_explain_info(&mut self) -> Result<AutoExplainInfo> {
-        let row = self.client.query_one(AUTO_EXPLAIN_STATUS_QUERY, &[])?;
-        let log_min_duration = row.try_get::<_, Option<String>>(0)?;
+    pub(crate) async fn fetch_auto_explain_info(
+        &self,
+        connection: &mut PgClientConnection,
+    ) -> DbResult<AutoExplainInfo> {
+        let row = sqlx::query(AUTO_EXPLAIN_STATUS_QUERY)
+            .fetch_one(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
+        let log_min_duration = row
+            .try_get::<Option<String>, _>(0)
+            .map_err(super::connect::classify_query_error)?;
         let log_analyze = row
-            .try_get::<_, Option<String>>(1)?
+            .try_get::<Option<String>, _>(1)
+            .map_err(super::connect::classify_query_error)?
             .unwrap_or_else(|| "off".to_string());
         let log_buffers = row
-            .try_get::<_, Option<String>>(2)?
+            .try_get::<Option<String>, _>(2)
+            .map_err(super::connect::classify_query_error)?
             .unwrap_or_else(|| "off".to_string());
         let log_format = row
-            .try_get::<_, Option<String>>(3)?
+            .try_get::<Option<String>, _>(3)
+            .map_err(super::connect::classify_query_error)?
             .unwrap_or_else(|| "text".to_string());
 
         if let Some(log_min_duration) = log_min_duration {
@@ -178,4 +196,65 @@ impl PgClient {
             ),
         })
     }
+}
+
+fn map_activity_session(row: &sqlx::postgres::PgRow) -> Result<ActivitySession, sqlx::Error> {
+    Ok(ActivitySession {
+        pid: row.try_get::<String, _>(0)?,
+        backend_type: row.try_get::<String, _>(1)?,
+        xmin: row.try_get::<String, _>(2)?,
+        database: row.try_get::<String, _>(3)?,
+        application: row.try_get::<String, _>(4)?,
+        user: row.try_get::<String, _>(5)?,
+        client: row.try_get::<String, _>(6)?,
+        duration_seconds: row.try_get::<i64, _>(7)?.max(0),
+        wait_info: row.try_get::<String, _>(8)?,
+        state: row.try_get::<String, _>(9)?,
+        query: row.try_get::<String, _>(10)?,
+        blocked_by_count: row.try_get::<i64, _>(11)?,
+        blocked_count: row.try_get::<i64, _>(12)?,
+    })
+}
+
+fn map_activity_summary(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ActivitySummarySnapshot, sqlx::Error> {
+    Ok(ActivitySummarySnapshot {
+        server_version: row.try_get::<String, _>(0)?,
+        postmaster_start: row.try_get::<DateTime<Utc>, _>(1)?,
+        database_count: row.try_get::<i64, _>(2)?,
+        total_database_bytes: row.try_get::<i64, _>(3)?,
+        cache_hit_pct: row.try_get::<f64, _>(4)?,
+        rollback_pct: row.try_get::<f64, _>(5)?,
+        total_commits: row.try_get::<i64, _>(6)?,
+        total_rollbacks: row.try_get::<i64, _>(7)?,
+        total_xacts: row.try_get::<i64, _>(8)?,
+        total_inserts: row.try_get::<i64, _>(9)?,
+        total_updates: row.try_get::<i64, _>(10)?,
+        total_deletes: row.try_get::<i64, _>(11)?,
+        total_returned: row.try_get::<i64, _>(12)?,
+        total_temp_files: row.try_get::<i64, _>(13)?,
+        total_temp_bytes: row.try_get::<i64, _>(14)?,
+        max_connections: row.try_get::<i64, _>(15)?,
+    })
+}
+
+fn map_activity_process(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ActivityProcessSnapshot, sqlx::Error> {
+    Ok(ActivityProcessSnapshot {
+        worker_total: row.try_get::<i64, _>(0)?,
+        max_worker_processes: row.try_get::<i64, _>(1)?,
+        logical_workers: row.try_get::<i64, _>(2)?,
+        max_logical_workers: row.try_get::<i64, _>(3)?,
+        parallel_workers: row.try_get::<i64, _>(4)?,
+        max_parallel_workers: row.try_get::<i64, _>(5)?,
+        autovacuum_workers: row.try_get::<i64, _>(6)?,
+        max_autovacuum_workers: row.try_get::<i64, _>(7)?,
+        wal_senders: row.try_get::<i64, _>(8)?,
+        max_wal_senders: row.try_get::<i64, _>(9)?,
+        wal_receivers: row.try_get::<i64, _>(10)?,
+        replication_slots: row.try_get::<i64, _>(11)?,
+        max_replication_slots: row.try_get::<i64, _>(12)?,
+    })
 }

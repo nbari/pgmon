@@ -1,50 +1,63 @@
 //! General metadata fetchers for `PgClient`.
 
-use super::PgClient;
+use super::{DbResult, PgClient, PgClientConnection};
 use crate::pg::queries::{DATABASE_QUERY, DATABASE_TREE_QUERY, LOCKS_QUERY, SETTINGS_QUERY};
-use anyhow::Result;
+use sqlx::Row;
 
 impl PgClient {
-    pub fn fetch_database_stats(&mut self) -> Result<Vec<Vec<String>>> {
-        let rows = self.client.query(DATABASE_QUERY, &[])?;
+    pub(crate) async fn fetch_database_stats(
+        &self,
+        connection: &mut PgClientConnection,
+    ) -> DbResult<Vec<Vec<String>>> {
+        let rows = sqlx::query(DATABASE_QUERY)
+            .fetch_all(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
         rows.into_iter()
             .map(|row| {
                 Ok(vec![
-                    row.try_get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    row.try_get::<_, i32>(1)?.to_string(),
-                    row.try_get::<_, i64>(2)?.to_string(),
-                    row.try_get::<_, i64>(3)?.to_string(),
-                    format!("{:.1}%", row.try_get::<_, f64>(4)?),
-                    row.try_get::<_, i64>(5)?.to_string(),
-                    row.try_get::<_, i64>(6)?.to_string(),
-                    row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(7)?
-                        .map(|t| t.to_rfc3339())
+                    row.try_get::<Option<String>, _>(0)?.unwrap_or_default(),
+                    row.try_get::<i32, _>(1)?.to_string(),
+                    row.try_get::<i64, _>(2)?.to_string(),
+                    row.try_get::<i64, _>(3)?.to_string(),
+                    format!("{:.1}%", row.try_get::<f64, _>(4)?),
+                    row.try_get::<i64, _>(5)?.to_string(),
+                    row.try_get::<i64, _>(6)?.to_string(),
+                    row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(7)?
+                        .map(|timestamp| timestamp.to_rfc3339())
                         .unwrap_or_default(),
                 ])
             })
-            .collect()
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(super::connect::classify_query_error)
     }
 
-    pub fn fetch_locks(&mut self) -> Result<Vec<Vec<String>>> {
-        let rows = self.client.query(LOCKS_QUERY, &[])?;
-        let result: Result<Vec<Vec<String>>> = rows
+    pub(crate) async fn fetch_locks(
+        &self,
+        connection: &mut PgClientConnection,
+    ) -> DbResult<Vec<Vec<String>>> {
+        let rows = sqlx::query(LOCKS_QUERY)
+            .fetch_all(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
+        let result = rows
             .into_iter()
             .map(|row| {
                 Ok(vec![
-                    row.try_get::<_, String>(0)?,
-                    row.try_get::<_, String>(1)?,
-                    row.try_get::<_, String>(2)?,
-                    row.try_get::<_, String>(3)?,
-                    row.try_get::<_, String>(4)?,
-                    row.try_get::<_, i64>(5)?.to_string(),
-                    row.try_get::<_, String>(6)?,
+                    row.try_get::<String, _>(0)?,
+                    row.try_get::<String, _>(1)?,
+                    row.try_get::<String, _>(2)?,
+                    row.try_get::<String, _>(3)?,
+                    row.try_get::<String, _>(4)?,
+                    row.try_get::<i64, _>(5)?.to_string(),
+                    row.try_get::<String, _>(6)?,
                 ])
             })
-            .collect();
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(super::connect::classify_query_error)?;
 
-        let mut data = result?;
-        if data.is_empty() {
-            data.push(vec![
+        if result.is_empty() {
+            return Ok(vec![vec![
                 String::new(),
                 String::new(),
                 String::new(),
@@ -52,16 +65,18 @@ impl PgClient {
                 String::new(),
                 String::new(),
                 String::new(),
-            ]);
+            ]]);
         }
-        Ok(data)
+
+        Ok(result)
     }
 
-    pub fn fetch_table_definition(
-        &mut self,
+    pub(crate) async fn fetch_table_definition(
+        &self,
+        connection: &mut PgClientConnection,
         schema: &str,
         table: &str,
-    ) -> Result<(Vec<Vec<String>>, Vec<String>)> {
+    ) -> DbResult<(Vec<Vec<String>>, Vec<String>)> {
         let col_query = r"
             SELECT
                 column_name,
@@ -74,20 +89,24 @@ impl PgClient {
             ORDER BY ordinal_position
         ";
 
-        let columns = self
-            .client
-            .query(col_query, &[&schema, &table])?
+        let columns = sqlx::query(col_query)
+            .bind(schema)
+            .bind(table)
+            .fetch_all(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?
             .into_iter()
             .map(|row| {
                 Ok(vec![
-                    row.try_get::<_, String>(0)?,
-                    row.try_get::<_, String>(1)?,
-                    row.try_get::<_, String>(2)?,
-                    row.try_get::<_, String>(3)?,
-                    row.try_get::<_, String>(4)?,
+                    row.try_get::<String, _>(0)?,
+                    row.try_get::<String, _>(1)?,
+                    row.try_get::<String, _>(2)?,
+                    row.try_get::<String, _>(3)?,
+                    row.try_get::<String, _>(4)?,
                 ])
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(super::connect::classify_query_error)?;
 
         let idx_query = r"
             SELECT pg_get_indexdef(indexrelid)
@@ -98,53 +117,71 @@ impl PgClient {
         let quoted_schema = format!("\"{schema}\"");
         let quoted_table = format!("\"{table}\"");
 
-        let indexes = self
-            .client
-            .query(idx_query, &[&quoted_schema, &quoted_table])?
+        let indexes = sqlx::query(idx_query)
+            .bind(&quoted_schema)
+            .bind(&quoted_table)
+            .fetch_all(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?
             .into_iter()
-            .map(|row| row.try_get::<_, String>(0))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|row| row.try_get::<String, _>(0))
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(super::connect::classify_query_error)?;
 
         Ok((columns, indexes))
     }
 
-    pub fn fetch_database_tree(&mut self) -> Result<Vec<Vec<String>>> {
-        let rows = self.client.query(DATABASE_TREE_QUERY, &[])?;
+    pub(crate) async fn fetch_database_tree(
+        &self,
+        connection: &mut PgClientConnection,
+    ) -> DbResult<Vec<Vec<String>>> {
+        let rows = sqlx::query(DATABASE_TREE_QUERY)
+            .fetch_all(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
         rows.into_iter()
             .map(|row| {
-                let depth = row.try_get::<_, i32>(5)?;
+                let depth = row.try_get::<i32, _>(5)?;
                 let label = match depth {
-                    0 => row.try_get::<_, String>(0)?,
+                    0 => row.try_get::<String, _>(0)?,
                     _ => format!(
                         "  {}",
-                        row.try_get::<_, Option<String>>(1)?.unwrap_or_default()
+                        row.try_get::<Option<String>, _>(1)?.unwrap_or_default()
                     ),
                 };
                 Ok(vec![
                     label,
-                    row.try_get::<_, String>(2)?,
-                    row.try_get::<_, i64>(3)?.to_string(),
-                    row.try_get::<_, String>(4)?,
-                    row.try_get::<_, String>(0)?,
-                    row.try_get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.try_get::<String, _>(2)?,
+                    row.try_get::<i64, _>(3)?.to_string(),
+                    row.try_get::<String, _>(4)?,
+                    row.try_get::<String, _>(0)?,
+                    row.try_get::<Option<String>, _>(1)?.unwrap_or_default(),
                     depth.to_string(),
                 ])
             })
-            .collect()
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(super::connect::classify_query_error)
     }
 
-    pub fn fetch_settings(&mut self) -> Result<Vec<Vec<String>>> {
-        let rows = self.client.query(SETTINGS_QUERY, &[])?;
+    pub(crate) async fn fetch_settings(
+        &self,
+        connection: &mut PgClientConnection,
+    ) -> DbResult<Vec<Vec<String>>> {
+        let rows = sqlx::query(SETTINGS_QUERY)
+            .fetch_all(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
         rows.into_iter()
             .map(|row| {
                 Ok(vec![
-                    row.try_get::<_, String>(0)?,
-                    row.try_get::<_, String>(1)?,
-                    row.try_get::<_, String>(2)?,
-                    row.try_get::<_, String>(3)?,
-                    row.try_get::<_, String>(4)?,
+                    row.try_get::<String, _>(0)?,
+                    row.try_get::<String, _>(1)?,
+                    row.try_get::<String, _>(2)?,
+                    row.try_get::<String, _>(3)?,
+                    row.try_get::<String, _>(4)?,
                 ])
             })
-            .collect()
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(super::connect::classify_query_error)
     }
 }

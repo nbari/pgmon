@@ -43,7 +43,7 @@ impl Action {
                     &home_view,
                     &sort,
                     *config,
-                );
+                )?;
                 app.run()
             }
             Action::CheckConfig { report, success } => {
