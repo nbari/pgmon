@@ -35,13 +35,9 @@ jobs:
             os: macos-latest
             target: x86_64-apple-darwin
 
-          - build: windows
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.2
 
       - name: Get package name from Cargo.toml
         id: package
@@ -70,5 +66,5 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build
-        if: matrix.build != 'linux'
+        if: matrix.build == 'macos'
         run: cargo build --release --locked --target ${{ matrix.target }}

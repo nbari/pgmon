@@ -31,13 +31,9 @@ jobs:
             os: macos-latest
             target: x86_64-apple-darwin
 
-          - build: windows
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.2
 
       - name: Get package name from Cargo.toml
         id: package
@@ -57,7 +53,7 @@ jobs:
 
       - name: Install tools (Linux)
         if: matrix.build == 'linux'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.75.20
         with:
           tool: cargo-deb,cargo-generate-rpm
 
@@ -98,9 +94,9 @@ jobs:
           DEB_PATH="$(find target/debian -maxdepth 1 -type f -name '*.deb' -print -quit)"
           echo "DEB_ASSET=$DEB_PATH" >> $GITHUB_ENV
 
-      # Non-Linux builds (macOS, Windows)
+      # Non-Linux builds (macOS)
       - name: Build
-        if: matrix.build != 'linux'
+        if: matrix.build == 'macos'
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build archive
@@ -109,20 +105,9 @@ jobs:
           binary_name="${{ steps.package.outputs.name }}"
           dirname="$binary_name-${{ env.VERSION }}-${{ matrix.target }}"
           mkdir "$dirname"
-
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            mv "target/${{ matrix.target }}/release/$binary_name.exe" "$dirname"
-          else
-            mv "target/${{ matrix.target }}/release/$binary_name" "$dirname"
-          fi
-
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            7z a "$dirname.zip" "$dirname"
-            echo "ASSET=$dirname.zip" >> $GITHUB_ENV
-          else
-            tar -czf "$dirname.tar.gz" "$dirname"
-            echo "ASSET=$dirname.tar.gz" >> $GITHUB_ENV
-          fi
+          mv "target/${{ matrix.target }}/release/$binary_name" "$dirname"
+          tar -czf "$dirname.tar.gz" "$dirname"
+          echo "ASSET=$dirname.tar.gz" >> $GITHUB_ENV
 
       - name: Prepare release assets
         shell: bash
@@ -136,7 +121,7 @@ jobs:
       # Skip release if the tag starts with 't'
       - name: Release
         if: startsWith(github.ref, 'refs/tags/') && !startsWith(github.ref_name, 't')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.0
         with:
           draft: false
           files: release_assets/*
@@ -152,7 +137,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.2
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

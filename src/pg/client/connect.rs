@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn test_pool_key_captures_socket_and_ssl_mode() {
         let target = match prepare_connection_target(
-            "postgresql:///?host=/var/run/postgresql&dbname=postgres&sslmode=disable",
+            "postgresql:///?host=/var/run/postgresql&dbname=postgres&user=pgmon&sslmode=disable",
             None,
         ) {
             Ok(target) => target,
@@ -445,7 +445,7 @@ mod tests {
                 hostaddr: None,
                 port: 5432,
                 database: "postgres".to_string(),
-                user: std::env::var("USER").unwrap_or_default(),
+                user: "pgmon".to_string(),
                 socket: Some("/var/run/postgresql".to_string()),
                 ssl_mode: "Disable".to_string(),
                 ssl_root_cert: None,
