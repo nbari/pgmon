@@ -10,7 +10,7 @@ on:
 jobs:
   coverage:
     name: Coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@stable
@@ -18,7 +18,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Run tests
-        run: cargo test --verbose -- --nocapture
+        run: cargo test --locked --verbose -- --nocapture
         env:
           RUST_BACKTRACE: full
           CARGO_INCREMENTAL: 0

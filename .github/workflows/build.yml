@@ -7,8 +7,14 @@ on:
       - '*'
   workflow_dispatch:
 
+# Builds only read the repository; releasing is handled by release.yml.
 permissions:
-  contents: write
+  contents: read
+
+# Cancel superseded runs for the same branch to save CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -19,21 +25,34 @@ jobs:
     secrets: inherit
 
   build:
-    name: Build
+    name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    needs: 
+    needs:
       - test
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - build: linux
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+            platform: linux
+
+          - build: linux-arm
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            platform: linux
 
           - build: macos
-            os: macos-latest
+            os: macos-15
             target: x86_64-apple-darwin
+            platform: macos
+
+          - build: macos-arm
+            os: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
 
     steps:
       - name: Checkout
@@ -44,27 +63,19 @@ jobs:
         shell: bash
         run: |
           PACKAGE_NAME=$(awk -F '"' '/^name = / {print $2; exit}' Cargo.toml)
-          echo "name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+          echo "name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
           echo "Package name: $PACKAGE_NAME"
-
-      - name: Branch name
-        run: echo "${GITHUB_REF##*/}"
-
-      - name: Get the release version from the tag
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - run: sudo apt -y install musl-dev musl-tools
-        if: matrix.build == 'linux'
-
-      - name: Build (Linux musl)
-        if: matrix.build == 'linux'
-        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Install system deps (musl)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y musl-dev musl-tools
 
       - name: Build
-        if: matrix.build == 'macos'
         run: cargo build --release --locked --target ${{ matrix.target }}

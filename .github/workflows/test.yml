@@ -11,7 +11,7 @@ env:
 jobs:
   format:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@stable
@@ -23,31 +23,33 @@ jobs:
 
   lint:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --locked --all-targets --all-features
 
   check:
     name: Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Check
-        run: cargo check
+        run: cargo check --locked
 
   test:
     name: Test
     strategy:
+      fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
-          - macOS-latest
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-15
         rust:
           - stable
     runs-on: ${{ matrix.os }}
@@ -60,16 +62,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: test
-        run: cargo test
+        run: cargo test --locked
 
   explain-safety:
     name: Explain Safety (PG${{ matrix.postgres }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - format
       - lint
       - check
     strategy:
+      fail-fast: false
       matrix:
         postgres:
           - 14
@@ -96,4 +99,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: explain safety
-        run: cargo test --all-features explain_safety
+        run: cargo test --locked --all-features explain_safety
