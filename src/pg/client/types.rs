@@ -74,6 +74,24 @@ pub(crate) struct ActivityCheckpointSnapshot {
     pub(crate) checkpoint_timeout_seconds: i64,
     pub(crate) max_wal_size_mb: i64,
     pub(crate) completion_target: f64,
+    /// `min_wal_size`, in megabytes (as `PostgreSQL` reports the setting).
+    pub(crate) min_wal_size_mb: i64,
+    /// `wal_segment_size`, in bytes. Large segments (the default is 16 MiB) inflate
+    /// the WAL "distance" consumed by each forced segment switch, which can trip
+    /// WAL-threshold checkpoints even when almost no real WAL is written.
+    pub(crate) wal_segment_size_bytes: i64,
+    /// Total WAL generated since `pg_stat_wal` was last reset, in bytes.
+    pub(crate) wal_bytes: i64,
+    /// Seconds elapsed since `pg_stat_wal` was last reset, used with `wal_bytes` to
+    /// derive the WAL generation rate.
+    pub(crate) wal_elapsed_seconds: f64,
+    /// Whether the server is a standby (`pg_is_in_recovery()`). On a standby the
+    /// counters describe **restartpoints**, not checkpoints, which changes wording.
+    pub(crate) in_recovery: bool,
+    /// Seconds since the last completed checkpoint/restartpoint (control file).
+    /// `None` when unknown (e.g. the role lacks `pg_monitor`). A value far larger
+    /// than `checkpoint_timeout` indicates a lagging or stalled checkpointer.
+    pub(crate) seconds_since_last_checkpoint: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-06-30
+
+### Fixed
+- **Checkpoint Verdict False Positive**: The Checkpoints readout no longer recommends raising `max_wal_size` on low-write systems. The old rule keyed on the `requested`-checkpoint share alone, but `requested` checkpoints also come from manual `CHECKPOINT`, `CREATE`/`DROP DATABASE`, base backups, and forced WAL-segment switches — so a quiet node flushing ~0.1 MB per checkpoint was wrongly told to raise `max_wal_size` (which had no effect). The verdict now keys on checkpoint **frequency vs `checkpoint_timeout`** gated by **MB written per checkpoint**, and only mentions `max_wal_size` when checkpoints are both frequent *and* flushing real I/O.
+- **Checkpoint Interval With 0 Timed**: The interval is now computed from the **total** checkpoint count (`timed + requested`) instead of `timed` alone, so low-write systems (where scheduled checkpoints are skipped and `timed` can be 0) show the real ~cadence instead of `-`.
+
+### Added
+- **Lagging/Stalled Checkpointer Detection**: The readout now reads the last checkpoint age from `pg_control_checkpoint()` and surfaces a red verdict when no checkpoint has completed in well over `checkpoint_timeout`, or when an average checkpoint overruns a whole cycle while doing real I/O — the genuinely dangerous condition (a restart in this state can force very long WAL replay). Executing `pg_control_checkpoint()` needs `pg_monitor`/superuser; a less-privileged role still gets the rest of the readout.
+- **Last Checkpoint Age**: A new `Last ckpt` line shows how long ago the last checkpoint (or restartpoint) completed.
+- **WAL Throughput & Sizing Context**: New `WAL` (generation rate + total since `pg_stat_wal` reset) and `Segment` (`wal_segment_size` + `min_wal_size`) lines make it obvious when WAL pressure cannot be the trigger (e.g. tiny write rate, large segments forcing checkpoints).
+- **Standby-Aware Wording**: On a standby (`pg_is_in_recovery()`), the verdict describes **restartpoints** instead of checkpoints.
+
+### Changed
+- **Verdict Priorities**: Reordered by operational severity — lagging/stalled and timeout-overrunning checkpointers are red, checkpoint **frequency** is a yellow advisory (short write bursts are normal, and PostgreSQL 18 removed `checkpoint_warning`), and the readout never recommends changing `checkpoint_timeout` (an availability/RTO trade-off, not a throughput knob).
+
 ## [0.7.0] - 2026-06-30
 
 ### Added

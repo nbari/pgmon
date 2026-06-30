@@ -157,10 +157,13 @@ FROM pg_stat_database
 
 /// Checkpoint activity for `PostgreSQL` 14-16, where checkpoint counters live in
 /// `pg_stat_bgwriter`. `timed` checkpoints are triggered by `checkpoint_timeout`;
-/// `requested` checkpoints are triggered by `max_wal_size` being reached (or a
-/// manual `CHECKPOINT`). A high `requested` share means WAL fills before the
-/// timeout elapses, suggesting `max_wal_size` should be increased. The buffer and
-/// time columns describe the I/O each checkpoint causes.
+/// `requested` checkpoints are triggered by several causes (WAL reaching the
+/// `max_wal_size`-derived threshold, a manual `CHECKPOINT`, `CREATE`/`DROP DATABASE`,
+/// base backups, forced segment switches with a large `wal_segment_size`, shutdown,
+/// or end of recovery). A high `requested` share alone is therefore not proof of
+/// `max_wal_size` pressure: the buffer/time columns plus the WAL throughput
+/// (`wal_bytes` over `wal_elapsed_seconds`) and `wal_segment_size` are needed to
+/// tell real WAL pressure from trivial-I/O churn.
 pub const ACTIVITY_CHECKPOINT_QUERY: &str = r"
 SELECT
     b.checkpoints_timed::bigint AS timed,
@@ -171,7 +174,12 @@ SELECT
     b.stats_reset AS stats_reset,
     (SELECT setting::bigint FROM pg_settings WHERE name = 'checkpoint_timeout') AS checkpoint_timeout_seconds,
     (SELECT setting::bigint FROM pg_settings WHERE name = 'max_wal_size') AS max_wal_size_mb,
-    (SELECT setting::float8 FROM pg_settings WHERE name = 'checkpoint_completion_target') AS completion_target
+    (SELECT setting::float8 FROM pg_settings WHERE name = 'checkpoint_completion_target') AS completion_target,
+    (SELECT setting::bigint FROM pg_settings WHERE name = 'min_wal_size') AS min_wal_size_mb,
+    (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size') AS wal_segment_size_bytes,
+    (SELECT COALESCE(wal_bytes, 0)::bigint FROM pg_stat_wal) AS wal_bytes,
+    (SELECT extract(epoch FROM now() - stats_reset)::float8 FROM pg_stat_wal) AS wal_elapsed_seconds,
+    pg_is_in_recovery() AS in_recovery
 FROM pg_stat_bgwriter b
 ";
 
@@ -188,8 +196,25 @@ SELECT
     c.stats_reset AS stats_reset,
     (SELECT setting::bigint FROM pg_settings WHERE name = 'checkpoint_timeout') AS checkpoint_timeout_seconds,
     (SELECT setting::bigint FROM pg_settings WHERE name = 'max_wal_size') AS max_wal_size_mb,
-    (SELECT setting::float8 FROM pg_settings WHERE name = 'checkpoint_completion_target') AS completion_target
+    (SELECT setting::float8 FROM pg_settings WHERE name = 'checkpoint_completion_target') AS completion_target,
+    (SELECT setting::bigint FROM pg_settings WHERE name = 'min_wal_size') AS min_wal_size_mb,
+    (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size') AS wal_segment_size_bytes,
+    (SELECT COALESCE(wal_bytes, 0)::bigint FROM pg_stat_wal) AS wal_bytes,
+    (SELECT extract(epoch FROM now() - stats_reset)::float8 FROM pg_stat_wal) AS wal_elapsed_seconds,
+    pg_is_in_recovery() AS in_recovery
 FROM pg_stat_checkpointer c
+";
+
+/// Age of the most recently completed checkpoint (or restartpoint on a standby),
+/// in seconds, read from the control file via `pg_control_checkpoint()`. This is
+/// the robust "is the checkpointer keeping up?" signal: unlike the cumulative
+/// counters it reflects the *last* checkpoint, so a stalled checkpointer that
+/// emits no further activity is still detectable. Executing `pg_control_checkpoint()`
+/// requires `pg_monitor` (or superuser); callers treat a failure as "unknown" so a
+/// less-privileged role still gets the rest of the readout.
+pub const ACTIVITY_CHECKPOINT_CONTROL_QUERY: &str = r"
+SELECT round(extract(epoch FROM now() - checkpoint_time))::bigint AS seconds_since_last_checkpoint
+FROM pg_control_checkpoint()
 ";
 
 pub const ACTIVITY_PROCESS_QUERY: &str = r"

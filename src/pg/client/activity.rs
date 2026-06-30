@@ -6,9 +6,10 @@ use super::{
     PgClientConnection,
 };
 use crate::pg::queries::{
-    ACTIVITY_BLOCKING_QUERY, ACTIVITY_CHECKPOINT_QUERY, ACTIVITY_CHECKPOINT_QUERY_PG17,
-    ACTIVITY_DETAIL_QUERY, ACTIVITY_LOCKS_QUERY, ACTIVITY_PROCESS_QUERY, ACTIVITY_SESSIONS_QUERY,
-    ACTIVITY_SUMMARY_QUERY, AUTO_EXPLAIN_STATUS_QUERY,
+    ACTIVITY_BLOCKING_QUERY, ACTIVITY_CHECKPOINT_CONTROL_QUERY, ACTIVITY_CHECKPOINT_QUERY,
+    ACTIVITY_CHECKPOINT_QUERY_PG17, ACTIVITY_DETAIL_QUERY, ACTIVITY_LOCKS_QUERY,
+    ACTIVITY_PROCESS_QUERY, ACTIVITY_SESSIONS_QUERY, ACTIVITY_SUMMARY_QUERY,
+    AUTO_EXPLAIN_STATUS_QUERY,
 };
 use chrono::{DateTime, Utc};
 use sqlx::Row;
@@ -37,6 +38,13 @@ impl PgClient {
             .fetch_one(connection.as_mut())
             .await
             .map_err(super::connect::classify_query_error)?;
+        // The control-file checkpoint age requires pg_monitor/superuser. Treat a
+        // failure as "unknown" so a less-privileged role still gets the readout.
+        let checkpoint_age = sqlx::query(ACTIVITY_CHECKPOINT_CONTROL_QUERY)
+            .fetch_one(connection.as_mut())
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<i64, _>(0).ok());
         let session_rows = sqlx::query(ACTIVITY_SESSIONS_QUERY)
             .fetch_all(connection.as_mut())
             .await
@@ -48,13 +56,16 @@ impl PgClient {
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(super::connect::classify_query_error)?;
 
+        let mut checkpoint = map_activity_checkpoint(&checkpoint_row)
+            .map_err(super::connect::classify_query_error)?;
+        checkpoint.seconds_since_last_checkpoint = checkpoint_age;
+
         Ok(ActivitySnapshot {
             summary: map_activity_summary(&summary_row)
                 .map_err(super::connect::classify_query_error)?,
             process: map_activity_process(&process_row)
                 .map_err(super::connect::classify_query_error)?,
-            checkpoint: map_activity_checkpoint(&checkpoint_row)
-                .map_err(super::connect::classify_query_error)?,
+            checkpoint,
             sessions,
         })
     }
@@ -287,5 +298,11 @@ fn map_activity_checkpoint(
         checkpoint_timeout_seconds: row.try_get::<i64, _>(6)?,
         max_wal_size_mb: row.try_get::<i64, _>(7)?,
         completion_target: row.try_get::<f64, _>(8)?,
+        min_wal_size_mb: row.try_get::<i64, _>(9)?,
+        wal_segment_size_bytes: row.try_get::<i64, _>(10)?,
+        wal_bytes: row.try_get::<i64, _>(11)?,
+        wal_elapsed_seconds: row.try_get::<f64, _>(12)?,
+        in_recovery: row.try_get::<bool, _>(13)?,
+        seconds_since_last_checkpoint: None,
     })
 }

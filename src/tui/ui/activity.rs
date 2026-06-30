@@ -245,10 +245,30 @@ fn draw_checkpoints_panel(f: &mut Frame, app: &App, area: Rect) {
     let mb_per = checkpoint_mb_per(cp.buffers_written, total);
     let write_per = per_checkpoint_ms(cp.write_time_ms, total);
     let sync_per = per_checkpoint_ms(cp.sync_time_ms, total);
-    let interval = checkpoint_interval_seconds(Utc::now(), cp.stats_reset, cp.timed);
-    let (verdict, verdict_color) = checkpoint_verdict(req_pct, sync_per, total);
+    let interval = checkpoint_interval_seconds(Utc::now(), cp.stats_reset, total);
+    let wal_rate = wal_bytes_per_second(cp.wal_bytes, cp.wal_elapsed_seconds);
+    let (verdict, verdict_color) = checkpoint_verdict(
+        cp.in_recovery,
+        cp.seconds_since_last_checkpoint,
+        interval,
+        cp.checkpoint_timeout_seconds,
+        mb_per,
+        write_per + sync_per,
+        total,
+    );
 
     let interval_str = interval.map_or_else(|| "-".to_string(), format_seconds_short);
+    let last_ckpt_str = {
+        let age = cp.seconds_since_last_checkpoint.map_or_else(
+            || "-".to_string(),
+            |age| format!("{} ago", format_seconds_short(age)),
+        );
+        if cp.in_recovery {
+            format!("{age} (standby)")
+        } else {
+            age
+        }
+    };
 
     let lines = vec![
         checkpoint_metric_line(
@@ -258,6 +278,7 @@ fn draw_checkpoints_panel(f: &mut Frame, app: &App, area: Rect) {
                 format_seconds_short(cp.checkpoint_timeout_seconds)
             ),
         ),
+        checkpoint_metric_line("Last ckpt", last_ckpt_str),
         checkpoint_metric_line(
             "Frequency",
             format!(
@@ -271,6 +292,22 @@ fn draw_checkpoints_panel(f: &mut Frame, app: &App, area: Rect) {
                 "{mb_per:.1} MB · write {} · sync {}",
                 format_millis(write_per),
                 format_millis(sync_per)
+            ),
+        ),
+        checkpoint_metric_line(
+            "WAL",
+            format!(
+                "{}/s · {}",
+                format_bytes(round_to_i64_saturating(wal_rate)),
+                format_bytes(cp.wal_bytes)
+            ),
+        ),
+        checkpoint_metric_line(
+            "Segment",
+            format!(
+                "seg {} · min {}",
+                format_bytes(cp.wal_segment_size_bytes),
+                format_megabytes(cp.min_wal_size_mb)
             ),
         ),
         checkpoint_metric_line(
@@ -335,21 +372,37 @@ fn per_checkpoint_ms(total_ms: f64, count: i64) -> f64 {
     (total_ms.max(0.0)) / divisor
 }
 
-/// Average seconds between timed checkpoints since stats were last reset.
+/// Average seconds between checkpoints since stats were last reset, using the
+/// total checkpoint count (`timed + requested`). On low-write systems scheduled
+/// checkpoints are often skipped (so `timed` can be 0) while the system still
+/// checkpoints on a healthy cadence; dividing by the total reflects the real
+/// interval instead of returning nothing.
 fn checkpoint_interval_seconds(
     now: DateTime<Utc>,
     stats_reset: Option<DateTime<Utc>>,
-    timed: i64,
+    total: i64,
 ) -> Option<i64> {
     let reset = stats_reset?;
-    if timed <= 0 {
+    if total <= 0 {
         return None;
     }
     let elapsed = now.signed_duration_since(reset).num_seconds();
     if elapsed <= 0 {
         return None;
     }
-    Some(elapsed / timed)
+    Some(elapsed / total)
+}
+
+/// Average WAL bytes generated per second since `pg_stat_wal` was last reset. A
+/// tiny rate is the decisive signal that `max_wal_size` cannot be the checkpoint
+/// trigger, regardless of how `PostgreSQL` labels the checkpoints.
+fn wal_bytes_per_second(wal_bytes: i64, elapsed_seconds: f64) -> f64 {
+    if elapsed_seconds <= 0.0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let bytes = wal_bytes.max(0) as f64;
+    bytes / elapsed_seconds
 }
 
 /// Format a millisecond duration compactly (`7ms`, `1.2s`).
@@ -361,18 +414,81 @@ fn format_millis(ms: f64) -> String {
     }
 }
 
-/// Operator verdict for the checkpoints readout. Prioritizes the most actionable
-/// signal: frequent `max_wal_size`-driven checkpoints, then slow `fsync` (storage
-/// I/O pressure), otherwise healthy.
-fn checkpoint_verdict(req_pct: f64, sync_per_ckpt_ms: f64, total: i64) -> (&'static str, Color) {
+/// Threshold (MiB written per checkpoint) above which frequent checkpoints are
+/// treated as genuine `max_wal_size` pressure rather than trivial-I/O churn.
+/// Calibrated against a low-write production node that flushed ~0.1 MB/ckpt yet was
+/// labelled "wal"/requested by `PostgreSQL` because of forced segment switches.
+const CHECKPOINT_MB_PRESSURE_THRESHOLD: f64 = 16.0;
+
+/// A checkpoint that has not completed in more than this multiple of
+/// `checkpoint_timeout` indicates a lagging or stalled checkpointer — the genuinely
+/// dangerous condition (a restart in this state can trigger very long WAL replay).
+const CHECKPOINT_STALE_FACTOR: i64 = 2;
+
+/// Operator verdict for the checkpoints readout, ordered by operational severity.
+///
+/// The dangerous condition is a **lagging/stalled checkpointer**, not the
+/// `max_wal_size` label: if checkpoints stop completing (or take longer than a whole
+/// cycle), a restart can force enormous WAL replay. So staleness and overrun are
+/// checked first and flagged red. Frequency is only advisory — `PostgreSQL` removed
+/// `checkpoint_warning` in 18 and short write bursts are normal — so frequent
+/// checkpoints are yellow, and we only mention `max_wal_size` when they also flush
+/// real I/O. On a standby the counters describe restartpoints, so the wording
+/// adapts. Note: this tool never recommends changing `checkpoint_timeout`, which is
+/// an availability/RTO trade-off rather than a throughput knob.
+fn checkpoint_verdict(
+    in_recovery: bool,
+    seconds_since_last: Option<i64>,
+    interval_seconds: Option<i64>,
+    timeout_seconds: i64,
+    mb_per_ckpt: f64,
+    total_ms_per_ckpt: f64,
+    total: i64,
+) -> (&'static str, Color) {
     if total <= 0 {
-        ("No checkpoints yet", Color::DarkGray)
-    } else if req_pct > 30.0 {
-        ("Frequent: raise max_wal_size", Color::Red)
-    } else if sync_per_ckpt_ms > 1000.0 {
-        ("Slow fsync: storage I/O pressure", Color::Yellow)
+        return ("No checkpoints yet", Color::DarkGray);
+    }
+    // 1) Stalled: nothing has completed in well over the timeout.
+    let stalled = matches!(
+        (seconds_since_last, timeout_seconds),
+        (Some(age), timeout)
+            if timeout > 0 && age > timeout.saturating_mul(CHECKPOINT_STALE_FACTOR)
+    );
+    if stalled {
+        return if in_recovery {
+            ("Restartpointer lagging (stale)", Color::Red)
+        } else {
+            ("Checkpointer lagging (stale)", Color::Red)
+        };
+    }
+    // 2) Overrunning: an average checkpoint takes longer than a whole cycle to
+    //    finish despite doing real I/O — storage cannot keep up.
+    let total_ms = round_to_i64_saturating(total_ms_per_ckpt);
+    let overrunning =
+        timeout_seconds > 0 && mb_per_ckpt > 0.0 && total_ms > timeout_seconds.saturating_mul(1000);
+    if overrunning {
+        return if in_recovery {
+            ("Restartpoints overrun timeout (I/O-bound)", Color::Red)
+        } else {
+            ("Checkpoints overrun timeout (I/O-bound)", Color::Red)
+        };
+    }
+    // 3) Frequency is advisory: frequent + real I/O hints at max_wal_size; frequent
+    //    + trivial I/O is manual/DDL/backup/segment churn, not max_wal_size.
+    let too_frequent = matches!(
+        (interval_seconds, timeout_seconds),
+        (Some(interval), timeout) if timeout > 0 && interval.saturating_mul(2) < timeout
+    );
+    if too_frequent {
+        if mb_per_ckpt >= CHECKPOINT_MB_PRESSURE_THRESHOLD {
+            return ("Frequent + I/O: consider max_wal_size", Color::Yellow);
+        }
+        return ("Frequent low-I/O: manual/DDL/backup", Color::Yellow);
+    }
+    if in_recovery {
+        ("Healthy (restartpoints keeping up)", Color::Green)
     } else {
-        ("Healthy (timeout-driven)", Color::Green)
+        ("Healthy (timeout-paced)", Color::Green)
     }
 }
 
@@ -1277,6 +1393,10 @@ mod tests {
         app.dashboard.summary.checkpoint.checkpoint_timeout_seconds = 300;
         app.dashboard.summary.checkpoint.max_wal_size_mb = 1024;
         app.dashboard.summary.checkpoint.completion_target = 0.9;
+        app.dashboard.summary.checkpoint.min_wal_size_mb = 80;
+        app.dashboard.summary.checkpoint.wal_segment_size_bytes = 16 * 1024 * 1024;
+        app.dashboard.summary.checkpoint.wal_bytes = 5 * 1024 * 1024 * 1024;
+        app.dashboard.summary.checkpoint.wal_elapsed_seconds = 3600.0;
 
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1293,7 +1413,115 @@ mod tests {
         assert!(text.contains("Checkpoints"), "panel title not visible");
         assert!(text.contains("Frequency"), "frequency row not visible");
         assert!(text.contains("I/O / ckpt"), "I/O row not visible");
+        assert!(text.contains("WAL"), "WAL row not visible");
+        assert!(text.contains("Segment"), "WAL segment row not visible");
+        assert!(text.contains("seg"), "WAL segment size not visible");
         assert!(text.contains("Healthy"), "verdict not visible");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_checkpoints_panel_low_write_is_healthy_not_max_wal() {
+        // Reproduces the field false positive: a low-write node with 0 timed and
+        // 100% requested checkpoints at the timeout cadence, flushing ~0.1 MB each,
+        // must read Healthy rather than "raise max_wal_size".
+        use chrono::Duration;
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = crate::tui::app::App::new_for_test(
+            String::new(),
+            0,
+            None,
+            1000,
+            0,
+            "activity",
+            "",
+            crate::config::Config::default(),
+        );
+        app.activity_chart_metric = crate::tui::app::ActivityChartMetric::Checkpoints;
+        let cp = &mut app.dashboard.summary.checkpoint;
+        cp.timed = 0;
+        cp.requested = 309;
+        cp.buffers_written = 3918; // ~0.1 MB/ckpt
+        cp.write_time_ms = 375_100.0;
+        cp.sync_time_ms = 1087.0;
+        cp.checkpoint_timeout_seconds = 1800;
+        cp.max_wal_size_mb = 2048;
+        cp.min_wal_size_mb = 512;
+        cp.completion_target = 0.9;
+        cp.wal_segment_size_bytes = 128 * 1024 * 1024;
+        cp.wal_bytes = 36_949_392; // ~37 MB total
+        cp.wal_elapsed_seconds = 362_671.0; // ~100 B/s
+        // ~309 checkpoints over the elapsed window → ~20 min interval.
+        cp.stats_reset = Some(Utc::now() - Duration::seconds(362_671));
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_dashboard(f, &mut app, f.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("Healthy"), "expected Healthy verdict");
+        assert!(
+            !text.contains("raise max_wal_size"),
+            "must not recommend raising max_wal_size on a low-write node"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_checkpoints_panel_flags_stalled_checkpointer() {
+        // A checkpointer that hasn't completed in well over checkpoint_timeout is the
+        // genuinely dangerous condition: it must be surfaced (red "lagging"), and the
+        // "Last ckpt" age must be visible to the operator.
+        use chrono::Duration;
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = crate::tui::app::App::new_for_test(
+            String::new(),
+            0,
+            None,
+            1000,
+            0,
+            "activity",
+            "",
+            crate::config::Config::default(),
+        );
+        app.activity_chart_metric = crate::tui::app::ActivityChartMetric::Checkpoints;
+        let cp = &mut app.dashboard.summary.checkpoint;
+        cp.timed = 10;
+        cp.requested = 5;
+        cp.buffers_written = 5_000_000;
+        cp.write_time_ms = 1_000_000.0;
+        cp.sync_time_ms = 50_000.0;
+        cp.checkpoint_timeout_seconds = 300; // 5 min
+        cp.max_wal_size_mb = 1024;
+        cp.completion_target = 0.9;
+        cp.stats_reset = Some(Utc::now() - Duration::seconds(3600));
+        // Last checkpoint completed 50 minutes ago vs a 5-minute timeout → stalled.
+        cp.seconds_since_last_checkpoint = Some(3000);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_dashboard(f, &mut app, f.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("Last ckpt"), "Last ckpt row not visible");
+        assert!(
+            text.contains("lagging"),
+            "stalled checkpointer must be flagged as lagging"
+        );
     }
 
     #[test]
@@ -1322,18 +1550,381 @@ mod tests {
         use chrono::TimeZone;
         let reset = Utc.timestamp_opt(1_000_000, 0).single();
         let now = Utc.timestamp_opt(1_000_000 + 3000, 0).single().unwrap();
-        // 3000s elapsed over 10 timed checkpoints → 300s interval.
+        // 3000s elapsed over 10 total checkpoints → 300s interval.
         assert_eq!(checkpoint_interval_seconds(now, reset, 10), Some(300));
-        // No timed checkpoints yet → no interval.
+        // Even with 0 timed checkpoints, a non-zero total still yields an interval
+        // (low-write systems skip scheduled checkpoints but still checkpoint).
+        assert_eq!(checkpoint_interval_seconds(now, reset, 6), Some(500));
+        // No checkpoints at all → no interval.
         assert_eq!(checkpoint_interval_seconds(now, reset, 0), None);
         assert_eq!(checkpoint_interval_seconds(now, None, 10), None);
     }
 
     #[test]
     fn test_checkpoint_verdict() {
-        assert_eq!(checkpoint_verdict(0.0, 0.0, 0).1, Color::DarkGray);
-        assert_eq!(checkpoint_verdict(0.0, 7.0, 55).1, Color::Green);
-        assert_eq!(checkpoint_verdict(60.0, 7.0, 55).1, Color::Red);
-        assert_eq!(checkpoint_verdict(0.0, 1500.0, 55).1, Color::Yellow);
+        // Args: (in_recovery, age_since_last, interval, timeout, mb, total_ms, total).
+        // No checkpoints yet.
+        assert_eq!(
+            checkpoint_verdict(false, None, None, 1800, 0.0, 0.0, 0).1,
+            Color::DarkGray
+        );
+
+        // Field false positive: low-write, at-timeout, trivial I/O, recent ckpt.
+        let (msg, color) = checkpoint_verdict(false, Some(600), Some(1200), 1800, 0.1, 1200.0, 309);
+        assert_eq!(color, Color::Green);
+        assert_eq!(msg, "Healthy (timeout-paced)");
+
+        // Stalled checkpointer (age > 2x timeout) is the dangerous case → red.
+        let (msg, color) =
+            checkpoint_verdict(false, Some(4000), Some(1200), 1800, 0.1, 1200.0, 309);
+        assert_eq!(color, Color::Red);
+        assert_eq!(msg, "Checkpointer lagging (stale)");
+
+        // Overrunning: average checkpoint exceeds a whole cycle, with real I/O → red.
+        let (msg, color) =
+            checkpoint_verdict(false, Some(600), Some(1700), 1800, 50.0, 2_000_000.0, 100);
+        assert_eq!(color, Color::Red);
+        assert_eq!(msg, "Checkpoints overrun timeout (I/O-bound)");
+
+        // Frequent + real I/O → advisory yellow, mentions max_wal_size.
+        let (msg, color) = checkpoint_verdict(false, Some(300), Some(300), 1800, 32.0, 500.0, 200);
+        assert_eq!(color, Color::Yellow);
+        assert_eq!(msg, "Frequent + I/O: consider max_wal_size");
+
+        // Frequent + trivial I/O → manual/DDL/backup, not max_wal_size.
+        let (msg, color) = checkpoint_verdict(false, Some(300), Some(300), 1800, 0.1, 50.0, 200);
+        assert_eq!(color, Color::Yellow);
+        assert_eq!(msg, "Frequent low-I/O: manual/DDL/backup");
+
+        // Standby uses restartpoint wording.
+        assert_eq!(
+            checkpoint_verdict(true, Some(600), Some(1200), 1800, 0.1, 1200.0, 50).0,
+            "Healthy (restartpoints keeping up)"
+        );
+        assert_eq!(
+            checkpoint_verdict(true, Some(5000), Some(1200), 1800, 0.1, 1200.0, 50).0,
+            "Restartpointer lagging (stale)"
+        );
+
+        // Unknown staleness/interval must not false-alarm.
+        assert_eq!(
+            checkpoint_verdict(false, None, None, 1800, 100.0, 10.0, 55).1,
+            Color::Green
+        );
+    }
+
+    #[test]
+    fn test_wal_bytes_per_second() {
+        // ~37 MB over ~362k seconds ≈ 100 B/s (the observed low-write node).
+        let rate = wal_bytes_per_second(36_949_392, 362_671.0);
+        assert!((rate - 101.9).abs() < 1.0, "got {rate}");
+        assert!((wal_bytes_per_second(1000, 0.0) - 0.0).abs() < f64::EPSILON);
+        assert!((wal_bytes_per_second(-5, 10.0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// Documented decision matrix for `checkpoint_verdict`, ordered by severity:
+    /// a lagging/stalled or overrunning checkpointer (red) is the dangerous case and
+    /// outranks frequency (yellow advisory). Only "frequent AND real I/O" mentions
+    /// `max_wal_size`. Timeout is 1800s unless noted, so: stale if age over 3600s,
+    /// overrun if avg total over 1.8M ms (with I/O), too-frequent if interval < 900s.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_checkpoint_verdict_matrix() {
+        struct Case {
+            name: &'static str,
+            in_recovery: bool,
+            age: Option<i64>,
+            interval: Option<i64>,
+            timeout: i64,
+            mb: f64,
+            total_ms: f64,
+            total: i64,
+            msg: &'static str,
+            color: Color,
+        }
+        let cases = [
+            Case {
+                name: "no checkpoints since reset",
+                in_recovery: false,
+                age: None,
+                interval: None,
+                timeout: 1800,
+                mb: 0.0,
+                total_ms: 0.0,
+                total: 0,
+                msg: "No checkpoints yet",
+                color: Color::DarkGray,
+            },
+            Case {
+                name: "field false positive: 100% requested, at-timeout, trivial I/O",
+                in_recovery: false,
+                age: Some(600),
+                interval: Some(1200),
+                timeout: 1800,
+                mb: 0.1,
+                total_ms: 1200.0,
+                total: 309,
+                msg: "Healthy (timeout-paced)",
+                color: Color::Green,
+            },
+            Case {
+                name: "write-heavy but completes within the cycle: big I/O is normal",
+                in_recovery: false,
+                age: Some(1700),
+                interval: Some(1800),
+                timeout: 1800,
+                mb: 200.0,
+                total_ms: 600_000.0,
+                total: 480,
+                msg: "Healthy (timeout-paced)",
+                color: Color::Green,
+            },
+            Case {
+                name: "genuine WAL pressure: frequent + heavy I/O",
+                in_recovery: false,
+                age: Some(200),
+                interval: Some(300),
+                timeout: 1800,
+                mb: 64.0,
+                total_ms: 5000.0,
+                total: 600,
+                msg: "Frequent + I/O: consider max_wal_size",
+                color: Color::Yellow,
+            },
+            Case {
+                name: "frequent manual CHECKPOINT cron: low I/O, not max_wal_size",
+                in_recovery: false,
+                age: Some(200),
+                interval: Some(300),
+                timeout: 1800,
+                mb: 0.1,
+                total_ms: 50.0,
+                total: 600,
+                msg: "Frequent low-I/O: manual/DDL/backup",
+                color: Color::Yellow,
+            },
+            Case {
+                name: "frequent large-segment forced switches: low I/O",
+                in_recovery: false,
+                age: Some(100),
+                interval: Some(120),
+                timeout: 1800,
+                mb: 0.1,
+                total_ms: 50.0,
+                total: 900,
+                msg: "Frequent low-I/O: manual/DDL/backup",
+                color: Color::Yellow,
+            },
+            Case {
+                name: "stalled checkpointer: no completion in over 2x timeout",
+                in_recovery: false,
+                age: Some(5400),
+                interval: Some(1200),
+                timeout: 1800,
+                mb: 0.1,
+                total_ms: 1200.0,
+                total: 309,
+                msg: "Checkpointer lagging (stale)",
+                color: Color::Red,
+            },
+            Case {
+                name: "I/O-bound overrun: checkpoint takes longer than a whole cycle",
+                in_recovery: false,
+                age: Some(1700),
+                interval: Some(1700),
+                timeout: 1800,
+                mb: 30.0,
+                total_ms: 3_130_000.0,
+                total: 100,
+                msg: "Checkpoints overrun timeout (I/O-bound)",
+                color: Color::Red,
+            },
+            Case {
+                name: "precedence: stalled outranks frequency",
+                in_recovery: false,
+                age: Some(4000),
+                interval: Some(200),
+                timeout: 1800,
+                mb: 64.0,
+                total_ms: 5000.0,
+                total: 700,
+                msg: "Checkpointer lagging (stale)",
+                color: Color::Red,
+            },
+            Case {
+                name: "precedence: overrun outranks frequency",
+                in_recovery: false,
+                age: Some(600),
+                interval: Some(200),
+                timeout: 1800,
+                mb: 64.0,
+                total_ms: 2_000_000.0,
+                total: 700,
+                msg: "Checkpoints overrun timeout (I/O-bound)",
+                color: Color::Red,
+            },
+            Case {
+                name: "unknown interval, heavy I/O: cannot judge frequency, stay calm",
+                in_recovery: false,
+                age: Some(600),
+                interval: None,
+                timeout: 1800,
+                mb: 500.0,
+                total_ms: 100.0,
+                total: 55,
+                msg: "Healthy (timeout-paced)",
+                color: Color::Green,
+            },
+            Case {
+                name: "unknown timeout (misconfig): never trip any threshold",
+                in_recovery: false,
+                age: Some(99_999),
+                interval: Some(1),
+                timeout: 0,
+                mb: 500.0,
+                total_ms: 9_999_999.0,
+                total: 55,
+                msg: "Healthy (timeout-paced)",
+                color: Color::Green,
+            },
+            Case {
+                name: "standby healthy: restartpoints keeping up",
+                in_recovery: true,
+                age: Some(600),
+                interval: Some(1200),
+                timeout: 1800,
+                mb: 0.1,
+                total_ms: 1200.0,
+                total: 50,
+                msg: "Healthy (restartpoints keeping up)",
+                color: Color::Green,
+            },
+            Case {
+                name: "standby stalled: restartpointer lagging",
+                in_recovery: true,
+                age: Some(5400),
+                interval: Some(1200),
+                timeout: 1800,
+                mb: 0.1,
+                total_ms: 1200.0,
+                total: 50,
+                msg: "Restartpointer lagging (stale)",
+                color: Color::Red,
+            },
+            Case {
+                name: "standby overrun: restartpoints I/O-bound",
+                in_recovery: true,
+                age: Some(1700),
+                interval: Some(1700),
+                timeout: 1800,
+                mb: 30.0,
+                total_ms: 3_130_000.0,
+                total: 100,
+                msg: "Restartpoints overrun timeout (I/O-bound)",
+                color: Color::Red,
+            },
+            Case {
+                name: "short timeout (5min) low-write: 4min cadence is healthy",
+                in_recovery: false,
+                age: Some(240),
+                interval: Some(240),
+                timeout: 300,
+                mb: 0.1,
+                total_ms: 50.0,
+                total: 200,
+                msg: "Healthy (timeout-paced)",
+                color: Color::Green,
+            },
+        ];
+        for c in cases {
+            let (msg, color) = checkpoint_verdict(
+                c.in_recovery,
+                c.age,
+                c.interval,
+                c.timeout,
+                c.mb,
+                c.total_ms,
+                c.total,
+            );
+            assert_eq!(msg, c.msg, "msg for case: {}", c.name);
+            assert_eq!(color, c.color, "color for case: {}", c.name);
+        }
+    }
+
+    /// Exact threshold boundaries, so re-tuning a constant cannot silently flip a
+    /// verdict without a failing test.
+    #[test]
+    fn test_checkpoint_verdict_boundaries() {
+        // Staleness boundary: stale iff age > STALE_FACTOR*timeout (strict).
+        // age == 2*timeout is NOT stale; one second over is.
+        assert_eq!(
+            checkpoint_verdict(false, Some(3600), Some(1200), 1800, 0.1, 1200.0, 100).0,
+            "Healthy (timeout-paced)",
+            "age == 2x timeout must not be stale"
+        );
+        assert_eq!(
+            checkpoint_verdict(false, Some(3601), Some(1200), 1800, 0.1, 1200.0, 100).0,
+            "Checkpointer lagging (stale)",
+            "age just over 2x timeout is stale"
+        );
+
+        // Overrun boundary: overrun iff avg total > timeout*1000 (strict) AND I/O > 0.
+        assert_eq!(
+            checkpoint_verdict(false, Some(600), Some(1700), 1800, 1.0, 1_800_000.0, 100).0,
+            "Healthy (timeout-paced)",
+            "total == timeout is not yet overrun"
+        );
+        assert_eq!(
+            checkpoint_verdict(false, Some(600), Some(1700), 1800, 1.0, 1_800_001.0, 100).0,
+            "Checkpoints overrun timeout (I/O-bound)",
+            "total just over timeout is overrun"
+        );
+        assert_eq!(
+            checkpoint_verdict(false, Some(600), Some(1700), 1800, 0.0, 5_000_000.0, 100).0,
+            "Healthy (timeout-paced)",
+            "overrun requires real I/O (mb > 0)"
+        );
+
+        // Frequency boundary: too_frequent iff interval*2 < timeout (strict).
+        assert_eq!(
+            checkpoint_verdict(false, Some(600), Some(900), 1800, 64.0, 50.0, 100).0,
+            "Healthy (timeout-paced)",
+            "interval == timeout/2 must not be too frequent"
+        );
+        assert_eq!(
+            checkpoint_verdict(false, Some(600), Some(899), 1800, 64.0, 50.0, 100).0,
+            "Frequent + I/O: consider max_wal_size",
+            "interval just below timeout/2 must be too frequent"
+        );
+
+        // MB pressure boundary at exactly 16.0 (>= trips).
+        assert_eq!(
+            checkpoint_verdict(
+                false,
+                Some(600),
+                Some(300),
+                1800,
+                CHECKPOINT_MB_PRESSURE_THRESHOLD,
+                50.0,
+                100
+            )
+            .0,
+            "Frequent + I/O: consider max_wal_size",
+            "mb == threshold counts as pressure"
+        );
+        assert_eq!(
+            checkpoint_verdict(
+                false,
+                Some(600),
+                Some(300),
+                1800,
+                CHECKPOINT_MB_PRESSURE_THRESHOLD - 0.1,
+                50.0,
+                100
+            )
+            .0,
+            "Frequent low-I/O: manual/DDL/backup",
+            "mb just below threshold is not pressure"
+        );
     }
 }
