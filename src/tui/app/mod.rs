@@ -566,6 +566,7 @@ impl App {
                     self.input_mode = InputMode::Search;
                     self.search_query.clear();
                 }
+                KeyCode::Char('A') => self.set_activity_subview(ActivitySubview::All),
                 KeyCode::Char('a') => self.set_activity_subview(ActivitySubview::Active),
                 KeyCode::Char('w') => self.set_activity_subview(ActivitySubview::Waiting),
                 KeyCode::Char('b') => self.set_activity_subview(ActivitySubview::Blocking),
@@ -806,7 +807,7 @@ impl App {
             HelpSection {
                 heading: "Activity".to_string(),
                 lines: vec![
-                    "a/w/b/t switch between active, waiting, blocking, and idle-in-transaction sessions.".to_string(),
+                    "A shows all sessions (including idle); a/w/b/t switch between active, waiting, blocking, and idle-in-transaction sessions.".to_string(),
                     "i opens info for the selected backend query; x runs safe Explain from that info modal.".to_string(),
                     "On PostgreSQL 16+, parameterized SQL uses a generic estimated plan; on PostgreSQL 14/15 pgmon leaves those statements as info-only.".to_string(),
                     "The info modal also shows whether auto_explain is enabled for real execution plans.".to_string(),
@@ -1542,6 +1543,7 @@ impl App {
         self.dashboard.summary = build_activity_summary(
             &snapshot.summary,
             &snapshot.process,
+            &snapshot.checkpoint,
             session_counts,
             self.previous_activity_sample.as_ref(),
         );

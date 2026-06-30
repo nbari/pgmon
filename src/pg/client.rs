@@ -15,9 +15,9 @@ pub(crate) use self::error::{DbError, DbResult};
 pub(crate) use self::explain::analyze_explain_query;
 pub(crate) use self::runtime::{DbExecutor, DbRuntime};
 pub(crate) use self::types::{
-    ActivityDetail, ActivityProcessSnapshot, ActivitySession, ActivitySnapshot,
-    ActivitySummarySnapshot, AutoExplainInfo, CapabilityStatus, ConnectionMeta, ExplainMode,
-    ReplicationSender, ReplicationSlot, ReplicationSnapshot,
+    ActivityCheckpointSnapshot, ActivityDetail, ActivityProcessSnapshot, ActivitySession,
+    ActivitySnapshot, ActivitySummarySnapshot, AutoExplainInfo, CapabilityStatus, ConnectionMeta,
+    ExplainMode, ReplicationSender, ReplicationSlot, ReplicationSnapshot,
 };
 
 pub(crate) const MIN_SUPPORTED_SERVER_VERSION_NUM: i32 = 140_000;

@@ -52,7 +52,28 @@ pub(crate) struct ConnectionMeta {
 pub(crate) struct ActivitySnapshot {
     pub(crate) summary: ActivitySummarySnapshot,
     pub(crate) process: ActivityProcessSnapshot,
+    pub(crate) checkpoint: ActivityCheckpointSnapshot,
     pub(crate) sessions: Vec<ActivitySession>,
+}
+
+/// Checkpoint activity counters, I/O figures, and related settings, used to show
+/// whether checkpoints are being driven by `checkpoint_timeout` (`timed`) or by
+/// `max_wal_size` (`requested`), and how much I/O they cause.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ActivityCheckpointSnapshot {
+    pub(crate) timed: i64,
+    pub(crate) requested: i64,
+    /// Buffers (8 KiB pages) written by checkpoints since `stats_reset`.
+    pub(crate) buffers_written: i64,
+    /// Cumulative time spent writing checkpoint buffers, in milliseconds.
+    pub(crate) write_time_ms: f64,
+    /// Cumulative time spent syncing checkpoint files (`fsync`), in milliseconds.
+    pub(crate) sync_time_ms: f64,
+    /// When the checkpoint statistics were last reset.
+    pub(crate) stats_reset: Option<DateTime<Utc>>,
+    pub(crate) checkpoint_timeout_seconds: i64,
+    pub(crate) max_wal_size_mb: i64,
+    pub(crate) completion_target: f64,
 }
 
 #[derive(Debug, Clone)]

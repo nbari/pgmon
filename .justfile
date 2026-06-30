@@ -1,4 +1,7 @@
-export PGMON_DSN := "postgresql://postgres:postgres@localhost:5432/postgres"
+# Use PGMON_DSN from the environment when set (e.g. inside the devcontainer, where
+# PostgreSQL is reachable as `postgres:5432`); otherwise default to localhost for the
+# host-side `just up` workflow.
+export PGMON_DSN := env_var_or_default("PGMON_DSN", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 default: test
   @just --list
@@ -42,3 +45,8 @@ run:
 # Run pgmon with pg_stat_statements view
 run-statements:
     cargo run -- --dsn "{{PGMON_DSN}}" --home-view statements
+
+# Generate a mixed PostgreSQL workload (idle/blocking/active/slow queries) for
+# exercising the TUI. Connects to {{PGMON_DSN}}. Press Ctrl-C to stop and clean up.
+load:
+    python3 pgload.py "{{PGMON_DSN}}"

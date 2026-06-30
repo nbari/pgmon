@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-06-30
+
+### Added
+- **Checkpoint Readout**: The Activity chart panel has a new `Checkpoints` view (cycle with `m`) — a text readout (no graph, since checkpoints are rare events) showing the checkpoint interval, timed-vs-requested split, I/O per checkpoint (MB written, write/sync time), the `max_wal_size` / `checkpoint_timeout` / `completion_target` settings, and an operator verdict (Healthy / raise `max_wal_size` / slow `fsync`). Reads `pg_stat_checkpointer` on PostgreSQL 17+ and `pg_stat_bgwriter` on 14–16.
+- **All Sessions Subview**: The Activity view now has an unfiltered `A:All` subview that lists every session, including plain `idle` connections, so you can see who is holding connection slots (e.g. a pool). The default subview remains `a:Active`.
+- **Active Subview Highlight**: The Activity sessions panel now highlights the selected subview filter (`A:All`/`a:Active`/`w:Waiting`/`b:Blocking`/`t:IdleInTxn`) in its accent color so the active one is easy to identify.
+- **Devcontainer**: Added a compose-based DevPod devcontainer (app + always-on PostgreSQL 18) with a mise-managed toolchain (`just`, `psql`, `psycopg2`, `pg_activity`), `dev-up`/`dev-ssh` scripts, and a `just load` recipe for running `pgload.py`.
+
+### Changed
+- **Display Limit Defaults To All**: The `-n, --top-n` row limit now defaults to `0` ("All", no truncation); pass a value of `1`–`100` to cap the rows shown.
+- **Activity Color Alignment**: `idle in transaction (aborted)` sessions now use a distinct color from plain `idle in transaction`, aligning with `pg_activity` (aborted-in-transaction is the riskiest idle state).
+- **sqlx 0.9**: Upgraded sqlx from 0.8 to 0.9, wrapping dynamically-built queries in `AssertSqlSafe` for the new `SqlSafeStr` API.
+
 ## [0.6.0] - 2026-04-22
 
 ### Added

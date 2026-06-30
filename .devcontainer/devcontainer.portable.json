@@ -1,0 +1,36 @@
+{
+  "name": "pgmon (DevPod, compose portable)",
+  "dockerComposeFile": [
+    "compose.yaml"
+  ],
+  "service": "app",
+  "runServices": [
+    "app",
+    "postgres"
+  ],
+  "workspaceFolder": "/workspaces/pgmon",
+  "remoteUser": "vscode",
+  "overrideCommand": false,
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "username": "vscode",
+      "upgradePackages": true
+    },
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/duduribeiro/devcontainer-features/neovim:1": {
+      "version": "stable"
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/postcreate.sh",
+  "postStartCommand": "bash .devcontainer/post-start.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb"
+      ]
+    }
+  }
+}

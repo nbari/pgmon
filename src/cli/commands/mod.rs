@@ -107,10 +107,10 @@ fn top_n_arg() -> Arg {
         .short('n')
         .long("top-n")
         .value_name("u32")
-        .help("Number of rows to show in top views")
-        .long_help("Specifies the maximum number of rows to display in views like 'Top Queries' or 'Activity'. This helps manage terminal space and performance.")
-        .value_parser(clap::value_parser!(u32).range(1..=100))
-        .default_value("10")
+        .help("Number of rows to show in top views (0 = all)")
+        .long_help("Specifies the maximum number of rows to display in views like 'Top Queries' or 'Activity'. Use 0 to show all rows (the default). A positive limit helps manage terminal space and performance.")
+        .value_parser(clap::value_parser!(u32).range(0..=100))
+        .default_value("0")
 }
 
 fn home_view_arg() -> Arg {
@@ -173,7 +173,7 @@ mod tests {
         assert_eq!(matches.get_one::<String>("config"), None);
         assert_eq!(matches.get_one::<String>("query-output-dir"), None);
         assert_eq!(matches.get_one::<u64>("refresh-ms"), Some(&1000));
-        assert_eq!(matches.get_one::<u32>("top-n"), Some(&10));
+        assert_eq!(matches.get_one::<u32>("top-n"), Some(&0));
         assert_eq!(
             matches.get_one::<String>("home-view"),
             Some(&"activity".to_string())
@@ -197,6 +197,24 @@ mod tests {
 
         let matches =
             new().try_get_matches_from(vec!["pgmon", "--dsn", "x", "--sort", "longest_running"]);
+        assert!(matches.is_err());
+    }
+
+    #[test]
+    fn test_cli_top_n_accepts_zero_and_enforces_range() {
+        // 0 means "show all" and must be accepted (it is also the default).
+        let matches = new().try_get_matches_from(vec!["pgmon", "--dsn", "x", "--top-n", "0"]);
+        assert!(matches.is_ok());
+        if let Ok(matches) = matches {
+            assert_eq!(matches.get_one::<u32>("top-n"), Some(&0));
+        }
+
+        // The upper bound (100) is still accepted.
+        let matches = new().try_get_matches_from(vec!["pgmon", "--dsn", "x", "--top-n", "100"]);
+        assert!(matches.is_ok());
+
+        // Anything above the upper bound is rejected.
+        let matches = new().try_get_matches_from(vec!["pgmon", "--dsn", "x", "--top-n", "101"]);
         assert!(matches.is_err());
     }
 

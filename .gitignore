@@ -31,3 +31,6 @@ __pycache__/
 
 # Local PostgreSQL credentials for manual testing
 .pgpass
+
+# direnv: local dev env (git identity forwarded to the devcontainer by scripts/dev-up)
+.envrc

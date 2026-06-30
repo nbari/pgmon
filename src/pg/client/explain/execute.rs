@@ -25,7 +25,7 @@ impl PgClient {
         let explain_query = format!("{} {query}", mode.statement_prefix());
 
         match mode {
-            ExplainMode::Estimated => sqlx::query(&explain_query)
+            ExplainMode::Estimated => sqlx::query(sqlx::AssertSqlSafe(explain_query.as_str()))
                 .fetch_all(connection.as_mut())
                 .await
                 .map_err(super::super::connect::classify_query_error)?
@@ -35,7 +35,7 @@ impl PgClient {
                         .map_err(super::super::connect::classify_query_error)
                 })
                 .collect(),
-            ExplainMode::GenericEstimated => sqlx::raw_sql(&explain_query)
+            ExplainMode::GenericEstimated => sqlx::raw_sql(sqlx::AssertSqlSafe(explain_query.as_str()))
                 .fetch_all(connection.as_mut())
                 .await
                 .map_err(|error| {

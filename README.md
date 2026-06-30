@@ -138,7 +138,7 @@ When themes are available, press `T` inside the TUI to switch between them at ru
 - `--connect-timeout-ms <u64>`: Connection timeout in milliseconds (default: 3000)
 - `--query-output-dir <PATH>`: Directory used when saving selected queries with `Enter`
 - `-r, --refresh-ms <u64>`: Refresh interval (default: 1000)
-- `-n, --top-n <u32>`: Rows to show (default: 10)
+- `-n, --top-n <u32>`: Rows to show, 0 = all (default: 0)
 - `--home-view <activity|statements>`: Initial view
 - `-s, --sort <total_time|mean_time|calls>`: Statements sort column (default: `total_time`)
 - `-v`: Verbose logging

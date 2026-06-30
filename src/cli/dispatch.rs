@@ -35,7 +35,7 @@ pub fn handler(matches: &ArgMatches, config: Config, config_path: Option<&Path>)
         .get_one::<String>("query-output-dir")
         .map(PathBuf::from);
     let refresh_ms = *matches.get_one::<u64>("refresh-ms").unwrap_or(&1000);
-    let top_n = *matches.get_one::<u32>("top-n").unwrap_or(&10);
+    let top_n = *matches.get_one::<u32>("top-n").unwrap_or(&0);
     let home_view = matches
         .get_one::<String>("home-view")
         .cloned()

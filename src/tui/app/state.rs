@@ -1,4 +1,7 @@
-use crate::pg::client::{ActivityProcessSnapshot, ActivitySession, CapabilityStatus, ExplainMode};
+use crate::pg::client::{
+    ActivityCheckpointSnapshot, ActivityProcessSnapshot, ActivitySession, CapabilityStatus,
+    ExplainMode,
+};
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -73,6 +76,7 @@ pub enum ActivityChartMetric {
     Dml,
     TempBytesPerSec,
     GrowthBytesPerSec,
+    Checkpoints,
 }
 
 impl ActivityChartMetric {
@@ -82,7 +86,8 @@ impl ActivityChartMetric {
             Self::Tps => Self::Dml,
             Self::Dml => Self::TempBytesPerSec,
             Self::TempBytesPerSec => Self::GrowthBytesPerSec,
-            Self::GrowthBytesPerSec => Self::Connections,
+            Self::GrowthBytesPerSec => Self::Checkpoints,
+            Self::Checkpoints => Self::Connections,
         }
     }
 
@@ -93,6 +98,7 @@ impl ActivityChartMetric {
             Self::Dml => "DML/s",
             Self::TempBytesPerSec => "Temp Bytes/s",
             Self::GrowthBytesPerSec => "Growth Bytes/s",
+            Self::Checkpoints => "Checkpoints",
         }
     }
 }
@@ -172,6 +178,7 @@ pub struct ConnectionHealthState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivitySubview {
+    All,
     Active,
     Waiting,
     Blocking,
@@ -179,12 +186,35 @@ pub enum ActivitySubview {
 }
 
 impl ActivitySubview {
+    /// All subviews in the order they appear in the sessions panel controls
+    /// (`A:All a:Active w:Waiting b:Blocking t:IdleInTxn`).
+    pub const ALL: [Self; 5] = [
+        Self::All,
+        Self::Active,
+        Self::Waiting,
+        Self::Blocking,
+        Self::IdleInTransaction,
+    ];
+
+    /// Single-character keybinding shown in the controls hint (`A`/`a`/`w`/`b`/`t`).
     pub fn label(self) -> &'static str {
         match self {
+            Self::All => "A",
             Self::Active => "a",
             Self::Waiting => "w",
             Self::Blocking => "b",
             Self::IdleInTransaction => "t",
+        }
+    }
+
+    /// Human-readable name shown next to the keybinding in the sessions panel title.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Active => "Active",
+            Self::Waiting => "Waiting",
+            Self::Blocking => "Blocking",
+            Self::IdleInTransaction => "IdleInTxn",
         }
     }
 }
@@ -239,6 +269,7 @@ pub struct ActivityDisplaySummary {
     pub session_counts: SessionCounts,
     pub rates: ActivityRates,
     pub process: ActivityProcessSnapshot,
+    pub checkpoint: ActivityCheckpointSnapshot,
     pub max_connections: i64,
 }
 
@@ -256,6 +287,7 @@ impl Default for ActivityDisplaySummary {
             session_counts: SessionCounts::default(),
             rates: ActivityRates::default(),
             process: ActivityProcessSnapshot::default(),
+            checkpoint: ActivityCheckpointSnapshot::default(),
             max_connections: 0,
         }
     }

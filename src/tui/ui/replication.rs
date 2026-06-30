@@ -313,6 +313,18 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_replication_filters_top_n_zero_shows_all() {
+        // top_n == 0 ("All", the default) must not truncate the replication rows.
+        let mut rows: Vec<Vec<String>> = (0..8)
+            .map(|i| vec![format!("replica_{i}"), "streaming".to_string()])
+            .collect();
+
+        apply_replication_filters(&mut rows, "", 0);
+
+        assert_eq!(rows.len(), 8);
+    }
+
+    #[test]
     fn test_sender_to_row_formats_lag_bytes() {
         let sender = ReplicationSender {
             pid: "1".to_string(),

@@ -1,12 +1,14 @@
 //! Activity and diagnostic fetchers for `PgClient`.
 
 use super::{
-    ActivityDetail, ActivityProcessSnapshot, ActivitySession, ActivitySnapshot,
-    ActivitySummarySnapshot, AutoExplainInfo, DbResult, PgClient, PgClientConnection,
+    ActivityCheckpointSnapshot, ActivityDetail, ActivityProcessSnapshot, ActivitySession,
+    ActivitySnapshot, ActivitySummarySnapshot, AutoExplainInfo, DbResult, PgClient,
+    PgClientConnection,
 };
 use crate::pg::queries::{
-    ACTIVITY_BLOCKING_QUERY, ACTIVITY_DETAIL_QUERY, ACTIVITY_LOCKS_QUERY, ACTIVITY_PROCESS_QUERY,
-    ACTIVITY_SESSIONS_QUERY, ACTIVITY_SUMMARY_QUERY, AUTO_EXPLAIN_STATUS_QUERY,
+    ACTIVITY_BLOCKING_QUERY, ACTIVITY_CHECKPOINT_QUERY, ACTIVITY_CHECKPOINT_QUERY_PG17,
+    ACTIVITY_DETAIL_QUERY, ACTIVITY_LOCKS_QUERY, ACTIVITY_PROCESS_QUERY, ACTIVITY_SESSIONS_QUERY,
+    ACTIVITY_SUMMARY_QUERY, AUTO_EXPLAIN_STATUS_QUERY,
 };
 use chrono::{DateTime, Utc};
 use sqlx::Row;
@@ -21,6 +23,17 @@ impl PgClient {
             .await
             .map_err(super::connect::classify_query_error)?;
         let process_row = sqlx::query(ACTIVITY_PROCESS_QUERY)
+            .fetch_one(connection.as_mut())
+            .await
+            .map_err(super::connect::classify_query_error)?;
+        // Checkpoint counters moved from pg_stat_bgwriter to pg_stat_checkpointer in
+        // PostgreSQL 17, so pick the query that matches the server version.
+        let checkpoint_query = if self.server_version_num() >= 170_000 {
+            ACTIVITY_CHECKPOINT_QUERY_PG17
+        } else {
+            ACTIVITY_CHECKPOINT_QUERY
+        };
+        let checkpoint_row = sqlx::query(checkpoint_query)
             .fetch_one(connection.as_mut())
             .await
             .map_err(super::connect::classify_query_error)?;
@@ -39,6 +52,8 @@ impl PgClient {
             summary: map_activity_summary(&summary_row)
                 .map_err(super::connect::classify_query_error)?,
             process: map_activity_process(&process_row)
+                .map_err(super::connect::classify_query_error)?,
+            checkpoint: map_activity_checkpoint(&checkpoint_row)
                 .map_err(super::connect::classify_query_error)?,
             sessions,
         })
@@ -256,5 +271,21 @@ fn map_activity_process(
         wal_receivers: row.try_get::<i64, _>(10)?,
         replication_slots: row.try_get::<i64, _>(11)?,
         max_replication_slots: row.try_get::<i64, _>(12)?,
+    })
+}
+
+fn map_activity_checkpoint(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ActivityCheckpointSnapshot, sqlx::Error> {
+    Ok(ActivityCheckpointSnapshot {
+        timed: row.try_get::<i64, _>(0)?,
+        requested: row.try_get::<i64, _>(1)?,
+        buffers_written: row.try_get::<i64, _>(2)?,
+        write_time_ms: row.try_get::<f64, _>(3)?,
+        sync_time_ms: row.try_get::<f64, _>(4)?,
+        stats_reset: row.try_get::<Option<DateTime<Utc>>, _>(5)?,
+        checkpoint_timeout_seconds: row.try_get::<i64, _>(6)?,
+        max_wal_size_mb: row.try_get::<i64, _>(7)?,
+        completion_target: row.try_get::<f64, _>(8)?,
     })
 }

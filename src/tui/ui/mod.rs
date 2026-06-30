@@ -303,9 +303,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
 fn activity_controls(has_selection: bool) -> &'static str {
     if has_selection {
-        "e:Export | /:Search | Enter:Save Query | i:Info | a/w/b/t:Subviews | m:Metric"
+        "e:Export | /:Search | Enter:Save Query | i:Info | A/a/w/b/t:Subviews | m:Metric"
     } else {
-        "q:Quit | hjkl:Navigate | e:Export | /:Search | Enter:Save Query | i:Info | a/w/b/t:Subviews | m:Metric"
+        "q:Quit | hjkl:Navigate | e:Export | /:Search | Enter:Save Query | i:Info | A/a/w/b/t:Subviews | m:Metric"
     }
 }
 

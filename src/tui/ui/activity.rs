@@ -1,9 +1,10 @@
 use crate::tui::app::{
-    ActivityChartMetric, ActivitySummaryMetric, ActivitySummarySection, App,
+    ActivityChartMetric, ActivitySubview, ActivitySummaryMetric, ActivitySummarySection, App,
     format::{
         activity_state_cell, activity_wait_cell, format_activity_query, format_bytes, format_uptime,
     },
 };
+use chrono::{DateTime, Utc};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -82,6 +83,7 @@ fn draw_activity_chart(f: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or(Color::LightBlue),
             true,
         ),
+        ActivityChartMetric::Checkpoints => draw_checkpoints_panel(f, app, area),
     }
 }
 
@@ -227,6 +229,151 @@ fn draw_dml_chart(f: &mut Frame, app: &App, area: Rect, bounds: ChartBounds) {
         max_y,
         chart_axis_labels(max_y, false),
     );
+}
+
+/// Cumulative checkpoints chart: timed (driven by `checkpoint_timeout`) vs
+/// requested (driven by `max_wal_size` or a manual `CHECKPOINT`). A rising
+/// requested line means WAL is filling before the timeout elapses — a signal to
+/// raise `max_wal_size`. The title also surfaces the two relevant settings.
+/// Render the Checkpoints readout (in place of a chart, since checkpoints are rare
+/// discrete events). Shows whether checkpoints are timeout- or `max_wal_size`-driven
+/// and how much I/O they cause, with an operator-facing verdict.
+fn draw_checkpoints_panel(f: &mut Frame, app: &App, area: Rect) {
+    let cp = &app.dashboard.summary.checkpoint;
+    let total = cp.timed.saturating_add(cp.requested);
+    let req_pct = checkpoint_request_pct(cp.timed, cp.requested);
+    let mb_per = checkpoint_mb_per(cp.buffers_written, total);
+    let write_per = per_checkpoint_ms(cp.write_time_ms, total);
+    let sync_per = per_checkpoint_ms(cp.sync_time_ms, total);
+    let interval = checkpoint_interval_seconds(Utc::now(), cp.stats_reset, cp.timed);
+    let (verdict, verdict_color) = checkpoint_verdict(req_pct, sync_per, total);
+
+    let interval_str = interval.map_or_else(|| "-".to_string(), format_seconds_short);
+
+    let lines = vec![
+        checkpoint_metric_line(
+            "Interval",
+            format!(
+                "{interval_str}  (timeout {})",
+                format_seconds_short(cp.checkpoint_timeout_seconds)
+            ),
+        ),
+        checkpoint_metric_line(
+            "Frequency",
+            format!(
+                "{} timed · {} req  ({req_pct:.0}% req)",
+                cp.timed, cp.requested
+            ),
+        ),
+        checkpoint_metric_line(
+            "I/O / ckpt",
+            format!(
+                "{mb_per:.1} MB · write {} · sync {}",
+                format_millis(write_per),
+                format_millis(sync_per)
+            ),
+        ),
+        checkpoint_metric_line(
+            "Tuning",
+            format!(
+                "max_wal {} · compl {:.1}",
+                format_megabytes(cp.max_wal_size_mb),
+                cp.completion_target
+            ),
+        ),
+        Line::from(vec![
+            Span::styled("→ ", Style::default().fg(verdict_color)),
+            Span::styled(
+                verdict,
+                Style::default()
+                    .fg(verdict_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+
+    let title = Line::from(chart_metric_title(ActivityChartMetric::Checkpoints));
+    let block = Block::default().borders(Borders::ALL).title(title);
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// One `label  value` line for the checkpoints readout.
+fn checkpoint_metric_line(label: &'static str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(" {label:<11}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            value,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+/// Average megabytes written per checkpoint (buffers are 8 KiB pages).
+fn checkpoint_mb_per(buffers_written: i64, count: i64) -> f64 {
+    if count <= 0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let bytes = buffers_written.max(0) as f64 * 8192.0;
+    #[allow(clippy::cast_precision_loss)]
+    let per = bytes / count as f64;
+    per / (1024.0 * 1024.0)
+}
+
+/// Average milliseconds per checkpoint for a cumulative time counter.
+fn per_checkpoint_ms(total_ms: f64, count: i64) -> f64 {
+    if count <= 0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let divisor = count as f64;
+    (total_ms.max(0.0)) / divisor
+}
+
+/// Average seconds between timed checkpoints since stats were last reset.
+fn checkpoint_interval_seconds(
+    now: DateTime<Utc>,
+    stats_reset: Option<DateTime<Utc>>,
+    timed: i64,
+) -> Option<i64> {
+    let reset = stats_reset?;
+    if timed <= 0 {
+        return None;
+    }
+    let elapsed = now.signed_duration_since(reset).num_seconds();
+    if elapsed <= 0 {
+        return None;
+    }
+    Some(elapsed / timed)
+}
+
+/// Format a millisecond duration compactly (`7ms`, `1.2s`).
+fn format_millis(ms: f64) -> String {
+    if ms < 1000.0 {
+        format!("{ms:.0}ms")
+    } else {
+        format!("{:.1}s", ms / 1000.0)
+    }
+}
+
+/// Operator verdict for the checkpoints readout. Prioritizes the most actionable
+/// signal: frequent `max_wal_size`-driven checkpoints, then slow `fsync` (storage
+/// I/O pressure), otherwise healthy.
+fn checkpoint_verdict(req_pct: f64, sync_per_ckpt_ms: f64, total: i64) -> (&'static str, Color) {
+    if total <= 0 {
+        ("No checkpoints yet", Color::DarkGray)
+    } else if req_pct > 30.0 {
+        ("Frequent: raise max_wal_size", Color::Red)
+    } else if sync_per_ckpt_ms > 1000.0 {
+        ("Slow fsync: storage I/O pressure", Color::Yellow)
+    } else {
+        ("Healthy (timeout-driven)", Color::Green)
+    }
 }
 
 fn draw_scalar_chart(
@@ -633,6 +780,39 @@ fn activity_summary_sections(app: &App) -> Vec<ActivitySummarySection> {
     ]
 }
 
+/// Share of checkpoints triggered by `max_wal_size` (or a manual `CHECKPOINT`)
+/// rather than `checkpoint_timeout`, as a percentage of all checkpoints. A high
+/// value indicates WAL fills before the timeout elapses, suggesting `max_wal_size`
+/// should be raised. Returns 0.0 when no checkpoints have occurred yet.
+fn checkpoint_request_pct(timed: i64, requested: i64) -> f64 {
+    let total = timed.saturating_add(requested);
+    if total <= 0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let pct = requested as f64 / total as f64 * 100.0;
+    pct
+}
+
+/// Format a duration given in whole seconds compactly (e.g. `30s`, `5min`,
+/// `1m30s`), used for the `checkpoint_timeout` setting.
+fn format_seconds_short(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds % 60 == 0 {
+        format!("{}min", seconds / 60)
+    } else {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    }
+}
+
+/// Format a size given in whole megabytes (as `PostgreSQL` reports `max_wal_size`)
+/// using the shared byte formatter (e.g. `1.0 GiB`).
+fn format_megabytes(megabytes: i64) -> String {
+    format_bytes(megabytes.saturating_mul(1024 * 1024))
+}
+
 fn draw_activity_summary_section(f: &mut Frame, area: Rect, section: &ActivitySummarySection) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -713,6 +893,42 @@ fn section_line_count(section: &ActivitySummarySection) -> usize {
     section.metrics.len() + 1
 }
 
+/// Accent color used to highlight the active session subview in the sessions panel
+/// title. Mirrors the per-state row colors so the selected filter reads the same as
+/// the rows it shows (Active=Green, Waiting=Yellow, Blocking=Magenta,
+/// Idle in transaction=Cyan).
+fn subview_indicator_color(subview: ActivitySubview) -> Color {
+    match subview {
+        ActivitySubview::All => Color::White,
+        ActivitySubview::Active => Color::Green,
+        ActivitySubview::Waiting => Color::Yellow,
+        ActivitySubview::Blocking => Color::Magenta,
+        ActivitySubview::IdleInTransaction => Color::Cyan,
+    }
+}
+
+/// Build the sessions panel title, highlighting the currently active subview filter
+/// (bold, in its accent color) so it stands out from the dimmed inactive ones.
+fn activity_sessions_title(count: usize, active: ActivitySubview) -> Line<'static> {
+    let mut spans = vec![Span::raw(format!(" Sessions ({count}) | "))];
+    for (index, subview) in ActivitySubview::ALL.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let text = format!("{}:{}", subview.label(), subview.name());
+        let style = if subview == active {
+            Style::default()
+                .fg(subview_indicator_color(subview))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(text, style));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
 fn draw_activity_sessions_panel(f: &mut Frame, app: &mut App, area: Rect) {
     let header_cells = [
         "PID", "XMIN", "Database", "App", "User", "Client", "Time+", "Waiting", "State", "Query",
@@ -741,10 +957,7 @@ fn draw_activity_sessions_panel(f: &mut Frame, app: &mut App, area: Rect) {
         });
 
     let count = app.dashboard.sessions.len();
-    let title = format!(
-        " Sessions: {} ({count}) | a:Active w:Waiting b:Blocking t:IdleInTxn ",
-        app.activity_subview.label()
-    );
+    let title = activity_sessions_title(count, app.activity_subview);
     let table = Table::new(rows, widths)
         .header(
             Row::new(header_cells.iter().map(|h| Cell::from(*h)))
@@ -774,20 +987,33 @@ fn draw_activity_sessions_panel(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
+/// Color used for an Activity session row, by severity. Mirrors how `pg_activity`
+/// distinguishes states: a transaction left `idle in transaction (aborted)` is the
+/// most dangerous idle state (it still holds locks/snapshot but will only roll
+/// back), so it gets a distinct, more alarming color than a plain
+/// `idle in transaction`.
+fn session_state_color(session: &crate::pg::client::ActivitySession) -> Color {
+    if session.blocked_by_count > 0 {
+        Color::Red // Blocked sessions are Red (CRITICAL)
+    } else if session.blocked_count > 0 {
+        Color::Magenta // Blocking sessions are Magenta (ACTION REQUIRED)
+    } else if session.state.contains("idle in transaction (aborted)") {
+        Color::LightRed // Aborted idle-in-transaction is the riskiest idle state
+    } else if session.state.contains("idle in transaction") {
+        Color::Cyan // Idle in transaction is Cyan (WARNING)
+    } else if session.state == "active" {
+        Color::Green // Active is Green (OK)
+    } else {
+        Color::DarkGray // Idle/Other is Dim
+    }
+}
+
 fn session_to_row(session: &crate::pg::client::ActivitySession, is_selected: bool) -> Row<'_> {
     // 1. Determine Row Style (Warnings)
     let base_style = if is_selected {
         Style::default().fg(Color::Black).bg(Color::White)
-    } else if session.blocked_by_count > 0 {
-        Style::default().fg(Color::Red) // Blocked sessions are Red (CRITICAL)
-    } else if session.blocked_count > 0 {
-        Style::default().fg(Color::Magenta) // Blocking sessions are Magenta (ACTION REQUIRED)
-    } else if session.state.contains("idle in transaction") {
-        Style::default().fg(Color::Cyan) // Idle in transaction is Cyan (WARNING)
-    } else if session.state == "active" {
-        Style::default().fg(Color::Green) // Active is Green (OK)
     } else {
-        Style::default().fg(Color::DarkGray) // Idle/Other is Dim
+        Style::default().fg(session_state_color(session))
     };
 
     let white_style = if is_selected {
@@ -898,5 +1124,216 @@ mod tests {
             activity_time_style(false, 301, Style::default()).fg,
             Some(Color::Red)
         );
+    }
+
+    #[test]
+    fn test_subview_indicator_color_is_distinct_per_subview() {
+        let colors: Vec<Color> = ActivitySubview::ALL
+            .into_iter()
+            .map(subview_indicator_color)
+            .collect();
+        assert_eq!(
+            colors,
+            vec![
+                Color::White,
+                Color::Green,
+                Color::Yellow,
+                Color::Magenta,
+                Color::Cyan
+            ]
+        );
+    }
+
+    #[test]
+    fn test_activity_sessions_title_highlights_active_subview() {
+        let title = activity_sessions_title(7, ActivitySubview::Blocking);
+
+        // The leading segment shows the session count.
+        assert!(
+            title
+                .spans
+                .first()
+                .is_some_and(|span| span.content.as_ref().contains("Sessions (7)"))
+        );
+
+        // Every subview is listed, and only the active one is bold + accent-colored;
+        // the inactive ones are dimmed (DarkGray, not bold).
+        for subview in ActivitySubview::ALL {
+            let label = format!("{}:{}", subview.label(), subview.name());
+            let span = title
+                .spans
+                .iter()
+                .find(|span| span.content.as_ref() == label);
+            let styled_correctly = span.is_some_and(|span| {
+                if subview == ActivitySubview::Blocking {
+                    span.style.fg == Some(subview_indicator_color(subview))
+                        && span.style.add_modifier.contains(Modifier::BOLD)
+                } else {
+                    span.style.fg == Some(Color::DarkGray)
+                        && !span.style.add_modifier.contains(Modifier::BOLD)
+                }
+            });
+            assert!(styled_correctly, "subview {label} styled incorrectly");
+        }
+    }
+
+    fn session_with_state(state: &str) -> crate::pg::client::ActivitySession {
+        crate::pg::client::ActivitySession {
+            pid: "1".to_string(),
+            backend_type: "client backend".to_string(),
+            xmin: String::new(),
+            database: "db".to_string(),
+            application: "app".to_string(),
+            user: "user".to_string(),
+            client: "127.0.0.1".to_string(),
+            duration_seconds: 0,
+            wait_info: String::new(),
+            state: state.to_string(),
+            query: String::new(),
+            blocked_by_count: 0,
+            blocked_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_session_state_color_distinguishes_aborted_idle_in_transaction() {
+        // Aligns with pg_activity: aborted idle-in-transaction is the riskiest idle
+        // state and must be visually distinct from a plain idle-in-transaction.
+        let aborted = session_state_color(&session_with_state("idle in transaction (aborted)"));
+        let idle_in_tx = session_state_color(&session_with_state("idle in transaction"));
+
+        assert_eq!(aborted, Color::LightRed);
+        assert_eq!(idle_in_tx, Color::Cyan);
+        assert_ne!(aborted, idle_in_tx);
+
+        // Sanity: the other states keep their established colors.
+        assert_eq!(
+            session_state_color(&session_with_state("active")),
+            Color::Green
+        );
+        assert_eq!(
+            session_state_color(&session_with_state("idle")),
+            Color::DarkGray
+        );
+    }
+
+    #[test]
+    fn test_session_state_color_prioritizes_blocked_and_blocking() {
+        let mut blocked = session_with_state("active");
+        blocked.blocked_by_count = 1;
+        assert_eq!(session_state_color(&blocked), Color::Red);
+
+        let mut blocking = session_with_state("active");
+        blocking.blocked_count = 2;
+        assert_eq!(session_state_color(&blocking), Color::Magenta);
+    }
+
+    #[test]
+    fn test_checkpoint_request_pct() {
+        // No checkpoints yet → 0%.
+        assert!((checkpoint_request_pct(0, 0) - 0.0).abs() < f64::EPSILON);
+        // All timed → 0% requested (healthy: driven by checkpoint_timeout).
+        assert!((checkpoint_request_pct(33, 0) - 0.0).abs() < f64::EPSILON);
+        // All requested → 100% (driven by max_wal_size).
+        assert!((checkpoint_request_pct(0, 5) - 100.0).abs() < f64::EPSILON);
+        // Mixed.
+        assert!((checkpoint_request_pct(3, 1) - 25.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_format_seconds_short() {
+        assert_eq!(format_seconds_short(30), "30s");
+        assert_eq!(format_seconds_short(300), "5min");
+        assert_eq!(format_seconds_short(90), "1m30s");
+        assert_eq!(format_seconds_short(-5), "0s");
+    }
+
+    #[test]
+    fn test_format_megabytes() {
+        assert_eq!(format_megabytes(1024), "1.0 GiB");
+        assert_eq!(format_megabytes(0), "0 B");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_dashboard_renders_checkpoints_panel_when_selected() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = crate::tui::app::App::new_for_test(
+            String::new(),
+            0,
+            None,
+            1000,
+            0,
+            "activity",
+            "",
+            crate::config::Config::default(),
+        );
+        app.activity_chart_metric = crate::tui::app::ActivityChartMetric::Checkpoints;
+        app.dashboard.summary.checkpoint.timed = 55;
+        app.dashboard.summary.checkpoint.requested = 0;
+        app.dashboard.summary.checkpoint.buffers_written = 20341;
+        app.dashboard.summary.checkpoint.write_time_ms = 658_434.0;
+        app.dashboard.summary.checkpoint.sync_time_ms = 363.0;
+        app.dashboard.summary.checkpoint.checkpoint_timeout_seconds = 300;
+        app.dashboard.summary.checkpoint.max_wal_size_mb = 1024;
+        app.dashboard.summary.checkpoint.completion_target = 0.9;
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_dashboard(f, &mut app, f.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("Checkpoints"), "panel title not visible");
+        assert!(text.contains("Frequency"), "frequency row not visible");
+        assert!(text.contains("I/O / ckpt"), "I/O row not visible");
+        assert!(text.contains("Healthy"), "verdict not visible");
+    }
+
+    #[test]
+    fn test_checkpoint_mb_per() {
+        // 20341 buffers (8 KiB) over 55 checkpoints ≈ 2.9 MB each.
+        let mb = checkpoint_mb_per(20341, 55);
+        assert!((mb - 2.89).abs() < 0.05, "got {mb}");
+        assert!((checkpoint_mb_per(100, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_per_checkpoint_ms() {
+        assert!((per_checkpoint_ms(363.0, 55) - 6.6).abs() < 0.1);
+        assert!((per_checkpoint_ms(100.0, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_format_millis() {
+        assert_eq!(format_millis(7.0), "7ms");
+        assert_eq!(format_millis(1500.0), "1.5s");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_checkpoint_interval_seconds() {
+        use chrono::TimeZone;
+        let reset = Utc.timestamp_opt(1_000_000, 0).single();
+        let now = Utc.timestamp_opt(1_000_000 + 3000, 0).single().unwrap();
+        // 3000s elapsed over 10 timed checkpoints → 300s interval.
+        assert_eq!(checkpoint_interval_seconds(now, reset, 10), Some(300));
+        // No timed checkpoints yet → no interval.
+        assert_eq!(checkpoint_interval_seconds(now, reset, 0), None);
+        assert_eq!(checkpoint_interval_seconds(now, None, 10), None);
+    }
+
+    #[test]
+    fn test_checkpoint_verdict() {
+        assert_eq!(checkpoint_verdict(0.0, 0.0, 0).1, Color::DarkGray);
+        assert_eq!(checkpoint_verdict(0.0, 7.0, 55).1, Color::Green);
+        assert_eq!(checkpoint_verdict(60.0, 7.0, 55).1, Color::Red);
+        assert_eq!(checkpoint_verdict(0.0, 1500.0, 55).1, Color::Yellow);
     }
 }

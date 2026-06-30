@@ -45,7 +45,10 @@ impl PgClient {
             Err(error) => return Err(error),
         };
 
-        let rows = match sqlx::query(&query).fetch_all(connection.as_mut()).await {
+        let rows = match sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
+            .fetch_all(connection.as_mut())
+            .await
+        {
             Ok(rows) => rows,
             Err(error) => {
                 if error.to_string().contains("shared_preload_libraries") {

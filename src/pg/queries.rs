@@ -155,6 +155,43 @@ SELECT
 FROM pg_stat_database
 ";
 
+/// Checkpoint activity for `PostgreSQL` 14-16, where checkpoint counters live in
+/// `pg_stat_bgwriter`. `timed` checkpoints are triggered by `checkpoint_timeout`;
+/// `requested` checkpoints are triggered by `max_wal_size` being reached (or a
+/// manual `CHECKPOINT`). A high `requested` share means WAL fills before the
+/// timeout elapses, suggesting `max_wal_size` should be increased. The buffer and
+/// time columns describe the I/O each checkpoint causes.
+pub const ACTIVITY_CHECKPOINT_QUERY: &str = r"
+SELECT
+    b.checkpoints_timed::bigint AS timed,
+    b.checkpoints_req::bigint AS requested,
+    b.buffers_checkpoint::bigint AS buffers_written,
+    b.checkpoint_write_time::float8 AS write_time_ms,
+    b.checkpoint_sync_time::float8 AS sync_time_ms,
+    b.stats_reset AS stats_reset,
+    (SELECT setting::bigint FROM pg_settings WHERE name = 'checkpoint_timeout') AS checkpoint_timeout_seconds,
+    (SELECT setting::bigint FROM pg_settings WHERE name = 'max_wal_size') AS max_wal_size_mb,
+    (SELECT setting::float8 FROM pg_settings WHERE name = 'checkpoint_completion_target') AS completion_target
+FROM pg_stat_bgwriter b
+";
+
+/// Checkpoint activity for `PostgreSQL` 17+, where the checkpoint counters moved
+/// from `pg_stat_bgwriter` to `pg_stat_checkpointer` (`num_timed` / `num_requested`,
+/// `buffers_written`). Returns the same columns as `ACTIVITY_CHECKPOINT_QUERY`.
+pub const ACTIVITY_CHECKPOINT_QUERY_PG17: &str = r"
+SELECT
+    c.num_timed::bigint AS timed,
+    c.num_requested::bigint AS requested,
+    c.buffers_written::bigint AS buffers_written,
+    c.write_time::float8 AS write_time_ms,
+    c.sync_time::float8 AS sync_time_ms,
+    c.stats_reset AS stats_reset,
+    (SELECT setting::bigint FROM pg_settings WHERE name = 'checkpoint_timeout') AS checkpoint_timeout_seconds,
+    (SELECT setting::bigint FROM pg_settings WHERE name = 'max_wal_size') AS max_wal_size_mb,
+    (SELECT setting::float8 FROM pg_settings WHERE name = 'checkpoint_completion_target') AS completion_target
+FROM pg_stat_checkpointer c
+";
+
 pub const ACTIVITY_PROCESS_QUERY: &str = r"
 SELECT
     COALESCE(

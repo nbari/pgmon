@@ -134,9 +134,9 @@ fn test_explain_safety_live_insert_does_not_mutate_rows() -> Result<()> {
     with_live_clients(&dsn, |control_client, explain_client| async move {
         let mut control_connection = control_client.acquire().await.map_err(db_error)?;
         let mut explain_connection = explain_client.acquire().await.map_err(db_error)?;
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL);"
-        ))
+        )))
         .execute(control_connection.as_mut())
         .await?;
 
@@ -152,9 +152,11 @@ fn test_explain_safety_live_insert_does_not_mutate_rows() -> Result<()> {
             0
         );
 
-        sqlx::raw_sql(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))
-            .execute(control_connection.as_mut())
-            .await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS \"{table_name}\";"
+        )))
+        .execute(control_connection.as_mut())
+        .await?;
         Ok(())
     })
 }
@@ -168,9 +170,9 @@ fn test_explain_safety_live_update_does_not_mutate_rows() -> Result<()> {
     with_live_clients(&dsn, |control_client, explain_client| async move {
         let mut control_connection = control_client.acquire().await.map_err(db_error)?;
         let mut explain_connection = explain_client.acquire().await.map_err(db_error)?;
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10);"
-        ))
+        )))
         .execute(control_connection.as_mut())
         .await?;
 
@@ -186,9 +188,11 @@ fn test_explain_safety_live_update_does_not_mutate_rows() -> Result<()> {
             10
         );
 
-        sqlx::raw_sql(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))
-            .execute(control_connection.as_mut())
-            .await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS \"{table_name}\";"
+        )))
+        .execute(control_connection.as_mut())
+        .await?;
         Ok(())
     })
 }
@@ -202,9 +206,9 @@ fn test_explain_safety_live_delete_does_not_mutate_rows() -> Result<()> {
     with_live_clients(&dsn, |control_client, explain_client| async move {
         let mut control_connection = control_client.acquire().await.map_err(db_error)?;
         let mut explain_connection = explain_client.acquire().await.map_err(db_error)?;
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10);"
-        ))
+        )))
         .execute(control_connection.as_mut())
         .await?;
 
@@ -220,9 +224,11 @@ fn test_explain_safety_live_delete_does_not_mutate_rows() -> Result<()> {
             1
         );
 
-        sqlx::raw_sql(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))
-            .execute(control_connection.as_mut())
-            .await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS \"{table_name}\";"
+        )))
+        .execute(control_connection.as_mut())
+        .await?;
         Ok(())
     })
 }
@@ -236,9 +242,9 @@ fn test_explain_safety_live_modifying_cte_select_does_not_mutate_rows() -> Resul
     with_live_clients(&dsn, |control_client, explain_client| async move {
         let mut control_connection = control_client.acquire().await.map_err(db_error)?;
         let mut explain_connection = explain_client.acquire().await.map_err(db_error)?;
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO \"{table_name}\" (id, value) VALUES (1, 10);"
-        ))
+        )))
         .execute(control_connection.as_mut())
         .await?;
 
@@ -256,9 +262,11 @@ fn test_explain_safety_live_modifying_cte_select_does_not_mutate_rows() -> Resul
             1
         );
 
-        sqlx::raw_sql(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))
-            .execute(control_connection.as_mut())
-            .await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS \"{table_name}\";"
+        )))
+        .execute(control_connection.as_mut())
+        .await?;
         Ok(())
     })
 }
@@ -277,9 +285,9 @@ fn test_explain_safety_live_generic_insert_does_not_mutate_rows() -> Result<()> 
             return Ok(());
         }
 
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "DROP TABLE IF EXISTS \"{table_name}\"; CREATE TABLE \"{table_name}\" (id integer PRIMARY KEY, value integer NOT NULL);"
-        ))
+        )))
         .execute(control_connection.as_mut())
         .await?;
 
@@ -300,9 +308,11 @@ fn test_explain_safety_live_generic_insert_does_not_mutate_rows() -> Result<()> 
             0
         );
 
-        sqlx::raw_sql(&format!("DROP TABLE IF EXISTS \"{table_name}\";"))
-            .execute(control_connection.as_mut())
-            .await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS \"{table_name}\";"
+        )))
+        .execute(control_connection.as_mut())
+        .await?;
         Ok(())
     })
 }
@@ -347,9 +357,11 @@ async fn current_server_version_num(connection: &mut PgClientConnection) -> Resu
 }
 
 async fn table_row_count(connection: &mut PgClientConnection, table_name: &str) -> Result<i64> {
-    let row = sqlx::query(&format!("SELECT COUNT(*) FROM \"{table_name}\""))
-        .fetch_one(connection.as_mut())
-        .await?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM \"{table_name}\""
+    )))
+    .fetch_one(connection.as_mut())
+    .await?;
     row.try_get::<i64, _>(0).map_err(Into::into)
 }
 
@@ -358,10 +370,12 @@ async fn table_value(
     table_name: &str,
     id: i32,
 ) -> Result<i32> {
-    let row = sqlx::query(&format!("SELECT value FROM \"{table_name}\" WHERE id = $1"))
-        .bind(id)
-        .fetch_one(connection.as_mut())
-        .await?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT value FROM \"{table_name}\" WHERE id = $1"
+    )))
+    .bind(id)
+    .fetch_one(connection.as_mut())
+    .await?;
     row.try_get::<i32, _>(0).map_err(Into::into)
 }
 

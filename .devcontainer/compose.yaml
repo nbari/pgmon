@@ -1,0 +1,118 @@
+# Compose-based devcontainer for pgmon.
+#
+# A single compose project defines the dev container (`app`) and the one backing
+# service it needs (`postgres`). DevPod (devcontainer.json -> dockerComposeFile)
+# brings both up together and execs into `app`, so the environment is fully
+# self-contained. The default devcontainer is tuned for local podman/docker; use
+# devcontainer.portable.json for remote providers that cannot apply local overrides.
+#
+# Inside the project network the app reaches the database by name at
+# `postgres:5432` (container-to-container), so there is no host port-forward in the
+# path. pgmon connects with PGMON_DSN and the explain-safety tests use
+# PGMON_TEST_DSN; both point at the postgres sibling so `just test` and
+# `cargo run` work in-container with no host database.
+#
+# Trust boundary: local/dev only. Postgres uses trust auth. Never reuse outside a
+# dev machine.
+
+name: pgmon
+
+networks:
+  pgmon:
+    driver: bridge
+
+volumes:
+  pgdata:
+  cargo-registry:
+  cargo-git:
+  cargo-target:
+  rustup:
+  mise-data:
+  mise-cache:
+  # Persist Neovim plugins / treesitter / state across rebuilds so a recreate does
+  # not re-download everything (the config itself comes from the chezmoi dotfiles).
+  nvim-data:
+  nvim-state:
+  nvim-cache:
+
+services:
+  app:
+    image: mcr.microsoft.com/devcontainers/rust:trixie
+    init: true
+    user: vscode
+    # Disable SELinux labeling for bind mounts (clean on fedora-atomic / rootless
+    # podman) instead of per-mount :Z.
+    security_opt:
+      - label=disable
+    # Keep the dev container alive; DevPod execs in and runs lifecycle hooks.
+    command: sleep infinity
+    environment:
+      DEVPOD: "true"
+      DEVPOD_WORKSPACE_ID: pgmon
+      EDITOR: nvim
+      VISUAL: nvim
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      CARGO_HOME: /home/vscode/.cargo
+      # Target dir is a SUBDIR of the mounted volume so `cargo clean` can remove
+      # it (removing the volume mount point itself fails with EBUSY).
+      CARGO_TARGET_DIR: /home/vscode/.cargo/target/build
+      MISE_DATA_DIR: /home/vscode/.local/share/mise
+      MISE_CACHE_DIR: /home/vscode/.cache/mise
+      MISE_CONFIG_DIR: /home/vscode/.config/mise
+      MISE_CONFIG_FILE: /workspaces/pgmon/mise.toml
+      # pgmon resolves its DSN from PGMON_DSN; the explain-safety tests read
+      # PGMON_TEST_DSN. Both target the postgres sibling (reachable as `postgres`,
+      # not localhost) so the TUI and tests connect with no host database.
+      PGMON_DSN: postgresql://postgres:postgres@postgres:5432/postgres
+      PGMON_TEST_DSN: postgresql://postgres:postgres@postgres:5432/postgres
+    volumes:
+      - ..:/workspaces/pgmon
+      - cargo-registry:/home/vscode/.cargo/registry
+      - cargo-git:/home/vscode/.cargo/git
+      - cargo-target:/home/vscode/.cargo/target
+      - rustup:/home/vscode/.rustup
+      - mise-data:/home/vscode/.local/share/mise
+      - mise-cache:/home/vscode/.cache/mise
+      - nvim-data:/home/vscode/.local/share/nvim
+      - nvim-state:/home/vscode/.local/state/nvim
+      - nvim-cache:/home/vscode/.cache/nvim
+    networks:
+      pgmon:
+        aliases:
+          - app
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: docker.io/library/postgres:18
+    security_opt:
+      - label=disable
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+      PGDATA: /var/lib/postgresql/data/pgdata
+    # Preload pg_stat_statements via flags so the TUI's statements view and the
+    # tests find it immediately. Using flags avoids mounting a postgresql.conf that
+    # hard-codes a host log path.
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c pg_stat_statements.max=10000
+    # Expose 5432 to the host for ad-hoc psql/GUI access. The app itself reaches the
+    # DB over the compose network (postgres:5432), not via this forward.
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+    restart: unless-stopped
+    networks:
+      - pgmon

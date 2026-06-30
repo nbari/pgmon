@@ -120,6 +120,18 @@ mod test_harness {
     }
 
     #[test]
+    fn test_filter_activity_sessions_all_includes_every_session() {
+        // The "All" subview is unfiltered: every session, including plain idle, is kept.
+        let sessions = vec![
+            create_test_session("1", "active", ""),
+            create_test_session("2", "idle", ""),
+            create_test_session("3", "idle in transaction", ""),
+        ];
+        let filtered = filter_activity_sessions(&sessions, ActivitySubview::All);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
     #[allow(clippy::unwrap_used)]
     fn test_sorted_activity_sessions_prefers_blocker_count_in_blocking_view() {
         let mut s1 = create_test_session("1", "active", "");
@@ -217,6 +229,145 @@ mod test_harness {
         let data = vec![vec!["row".into()]];
         let processed = app.prepare_table_data(data.clone());
         assert_eq!(processed.len(), 1);
+    }
+
+    #[test]
+    fn test_prepare_table_data_top_n_zero_shows_all_rows() {
+        // top_n == 0 is the "All" sentinel: no truncation should occur.
+        let app = App::new(
+            String::new(),
+            0,
+            None,
+            1000,
+            0,
+            "activity",
+            "",
+            crate::config::Config::default(),
+        );
+
+        let data: Vec<Vec<String>> = (0..25).map(|i| vec![i.to_string()]).collect();
+        let processed = app.prepare_table_data(data);
+        assert_eq!(processed.len(), 25);
+    }
+
+    #[test]
+    fn test_prepare_table_data_top_n_limits_rows() {
+        // A positive top_n caps the number of displayed rows.
+        let app = App::new(
+            String::new(),
+            0,
+            None,
+            1000,
+            3,
+            "activity",
+            "",
+            crate::config::Config::default(),
+        );
+
+        let data: Vec<Vec<String>> = (0..25).map(|i| vec![i.to_string()]).collect();
+        let processed = app.prepare_table_data(data);
+        assert_eq!(processed.len(), 3);
+    }
+
+    #[test]
+    fn test_apply_activity_session_view_top_n_zero_keeps_all_sessions() {
+        // top_n == 0 must keep every matching session in the Activity view.
+        let mut app = App::new(
+            String::new(),
+            0,
+            None,
+            1000,
+            0,
+            "activity",
+            "",
+            crate::config::Config::default(),
+        );
+        app.activity_sessions = (0..12)
+            .map(|i| create_test_session(&i.to_string(), "active", ""))
+            .collect();
+
+        app.apply_activity_session_view();
+        assert_eq!(app.dashboard.sessions.len(), 12);
+    }
+
+    #[test]
+    fn test_apply_activity_session_view_top_n_limits_sessions() {
+        // A positive top_n caps the number of sessions shown in the Activity view.
+        let mut app = App::new(
+            String::new(),
+            0,
+            None,
+            1000,
+            4,
+            "activity",
+            "",
+            crate::config::Config::default(),
+        );
+        app.activity_sessions = (0..12)
+            .map(|i| create_test_session(&i.to_string(), "active", ""))
+            .collect();
+
+        app.apply_activity_session_view();
+        assert_eq!(app.dashboard.sessions.len(), 4);
+    }
+
+    #[test]
+    fn test_handle_key_event_all_subview_includes_idle_sessions() {
+        // Pressing 'A' selects the unfiltered "All" subview, which lists plain idle
+        // sessions that the default "Active" subview hides.
+        let mut app = App::new(
+            String::new(),
+            0,
+            None,
+            1000,
+            0,
+            "activity",
+            "",
+            crate::config::Config::default(),
+        );
+        app.activity_sessions = vec![
+            create_test_session("1", "active", ""),
+            create_test_session("2", "idle", ""),
+            create_test_session("3", "idle in transaction", ""),
+        ];
+
+        // Default subview is Active: only the active session is shown.
+        app.apply_activity_session_view();
+        assert_eq!(app.dashboard.sessions.len(), 1);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.activity_subview, ActivitySubview::All);
+        assert_eq!(app.dashboard.sessions.len(), 3);
+        assert!(
+            app.dashboard
+                .sessions
+                .iter()
+                .any(|session| session.state == "idle")
+        );
+    }
+
+    #[test]
+    fn test_top_n_modal_highlights_all_when_limit_is_zero() {
+        // With the default limit of 0 ("All"), opening the display-limit modal should
+        // pre-select the "All" entry (the 0 sentinel in the options list).
+        let mut app = App::new(
+            String::new(),
+            0,
+            None,
+            1000,
+            0,
+            "activity",
+            "",
+            crate::config::Config::default(),
+        );
+
+        app.toggle_top_n_modal();
+        let selected_is_all = app
+            .top_n_modal
+            .as_ref()
+            .is_some_and(|modal| modal.options.get(modal.selected_index) == Some(&0));
+        assert!(selected_is_all);
     }
 
     #[test]
@@ -714,6 +865,9 @@ mod test_harness {
             app.activity_chart_metric,
             ActivityChartMetric::GrowthBytesPerSec
         );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.activity_chart_metric, ActivityChartMetric::Checkpoints);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
         assert_eq!(app.activity_chart_metric, ActivityChartMetric::Connections);

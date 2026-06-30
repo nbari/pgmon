@@ -2,8 +2,8 @@ use super::state::{
     ActivityDisplaySummary, ActivityRates, ActivitySubview, DatabaseView, SessionCounts, Tab,
 };
 use crate::pg::client::{
-    ActivityProcessSnapshot, ActivitySession, ActivitySummarySnapshot, ReplicationSender,
-    ReplicationSlot,
+    ActivityCheckpointSnapshot, ActivityProcessSnapshot, ActivitySession, ActivitySummarySnapshot,
+    ReplicationSender, ReplicationSlot,
 };
 use chrono::Utc;
 
@@ -199,6 +199,7 @@ impl From<&ActivitySummarySnapshot> for ActivityCounterSample {
 pub(crate) fn build_activity_summary(
     summary: &ActivitySummarySnapshot,
     process: &ActivityProcessSnapshot,
+    checkpoint: &ActivityCheckpointSnapshot,
     session_counts: SessionCounts,
     previous_sample: Option<&ActivityCounterSample>,
 ) -> ActivityDisplaySummary {
@@ -218,6 +219,7 @@ pub(crate) fn build_activity_summary(
         session_counts,
         rates: compute_activity_rates(previous_sample, summary),
         process: process.clone(),
+        checkpoint: checkpoint.clone(),
         max_connections: summary.max_connections,
     }
 }
@@ -348,6 +350,7 @@ pub(crate) fn filter_activity_sessions(
     sessions
         .iter()
         .filter(|s| match subview {
+            ActivitySubview::All => true,
             ActivitySubview::Active => s.state == "active" || s.blocked_count > 0,
             ActivitySubview::Waiting => is_waiting_session(s),
             ActivitySubview::Blocking => s.blocked_count > 0,

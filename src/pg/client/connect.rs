@@ -48,7 +48,7 @@ impl PgClient {
         connection: &mut super::PgClientConnection,
         query: &str,
     ) -> DbResult<()> {
-        sqlx::raw_sql(query)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(query))
             .execute(connection.as_mut())
             .await
             .map(|_| ())
