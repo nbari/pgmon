@@ -585,9 +585,16 @@ mod tests {
     }
 
     fn write_temp_pgpass(content: &str) -> Result<PathBuf, Box<dyn Error>> {
+        // A nanosecond timestamp alone is not unique enough: on some platforms
+        // (notably macOS) the clock granularity is coarse, so parallel tests can
+        // collide on the same filename and clobber each other's file. Add a
+        // per-process atomic counter to guarantee uniqueness.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let filename = format!(
-            "pgmon-test-{}.pgpass",
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+            "pgmon-test-{}-{}-{}.pgpass",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let path = std::env::temp_dir().join(filename);
         fs::write(&path, content)?;
