@@ -74,11 +74,14 @@ pub(crate) struct ActivityCheckpointSnapshot {
     pub(crate) checkpoint_timeout_seconds: i64,
     pub(crate) max_wal_size_mb: i64,
     pub(crate) completion_target: f64,
-    /// `min_wal_size`, in megabytes (as `PostgreSQL` reports the setting).
+    /// `min_wal_size`, in megabytes (as `PostgreSQL` reports the setting, unit `MB`).
     pub(crate) min_wal_size_mb: i64,
-    /// `wal_segment_size`, in bytes. Large segments (the default is 16 MiB) inflate
-    /// the WAL "distance" consumed by each forced segment switch, which can trip
-    /// WAL-threshold checkpoints even when almost no real WAL is written.
+    /// `wal_segment_size`, in bytes. `pg_settings` reports this setting with
+    /// `unit = 'B'`, so the raw `setting` value is already a byte count and is used
+    /// directly (unlike the `*_mb` fields above, it must NOT be scaled). Large
+    /// segments (the default is 16 MiB) inflate the WAL "distance" consumed by each
+    /// forced segment switch, which can trip WAL-threshold checkpoints even when
+    /// almost no real WAL is written.
     pub(crate) wal_segment_size_bytes: i64,
     /// Total WAL generated since `pg_stat_wal` was last reset, in bytes.
     pub(crate) wal_bytes: i64,

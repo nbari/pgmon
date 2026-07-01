@@ -164,6 +164,11 @@ FROM pg_stat_database
 /// `max_wal_size` pressure: the buffer/time columns plus the WAL throughput
 /// (`wal_bytes` over `wal_elapsed_seconds`) and `wal_segment_size` are needed to
 /// tell real WAL pressure from trivial-I/O churn.
+///
+/// Unit note (source of a past display bug): these three settings do NOT share a
+/// unit. `max_wal_size` and `min_wal_size` are reported in `MB` (kept as `*_mb` and
+/// rendered via `format_megabytes`), whereas `wal_segment_size` is reported in `B`
+/// (bytes) and is used directly — never multiply it by 8192.
 pub const ACTIVITY_CHECKPOINT_QUERY: &str = r"
 SELECT
     b.checkpoints_timed::bigint AS timed,
@@ -176,6 +181,7 @@ SELECT
     (SELECT setting::bigint FROM pg_settings WHERE name = 'max_wal_size') AS max_wal_size_mb,
     (SELECT setting::float8 FROM pg_settings WHERE name = 'checkpoint_completion_target') AS completion_target,
     (SELECT setting::bigint FROM pg_settings WHERE name = 'min_wal_size') AS min_wal_size_mb,
+    -- wal_segment_size unit is 'B' (bytes) already; do NOT multiply by 8192.
     (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size') AS wal_segment_size_bytes,
     (SELECT COALESCE(wal_bytes, 0)::bigint FROM pg_stat_wal) AS wal_bytes,
     (SELECT extract(epoch FROM now() - stats_reset)::float8 FROM pg_stat_wal) AS wal_elapsed_seconds,
@@ -185,7 +191,9 @@ FROM pg_stat_bgwriter b
 
 /// Checkpoint activity for `PostgreSQL` 17+, where the checkpoint counters moved
 /// from `pg_stat_bgwriter` to `pg_stat_checkpointer` (`num_timed` / `num_requested`,
-/// `buffers_written`). Returns the same columns as `ACTIVITY_CHECKPOINT_QUERY`.
+/// `buffers_written`). Returns the same columns as `ACTIVITY_CHECKPOINT_QUERY`,
+/// including the same unit caveat: `wal_segment_size` is bytes (used directly),
+/// while `max_wal_size`/`min_wal_size` are `MB`.
 pub const ACTIVITY_CHECKPOINT_QUERY_PG17: &str = r"
 SELECT
     c.num_timed::bigint AS timed,
@@ -198,6 +206,7 @@ SELECT
     (SELECT setting::bigint FROM pg_settings WHERE name = 'max_wal_size') AS max_wal_size_mb,
     (SELECT setting::float8 FROM pg_settings WHERE name = 'checkpoint_completion_target') AS completion_target,
     (SELECT setting::bigint FROM pg_settings WHERE name = 'min_wal_size') AS min_wal_size_mb,
+    -- wal_segment_size unit is 'B' (bytes) already; do NOT multiply by 8192.
     (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size') AS wal_segment_size_bytes,
     (SELECT COALESCE(wal_bytes, 0)::bigint FROM pg_stat_wal) AS wal_bytes,
     (SELECT extract(epoch FROM now() - stats_reset)::float8 FROM pg_stat_wal) AS wal_elapsed_seconds,
@@ -432,11 +441,24 @@ mod tests {
 
     #[test]
     fn test_checkpoint_queries_read_wal_segment_size_as_bytes() {
+        // pg_settings.wal_segment_size has unit 'B' (bytes) on all supported
+        // versions (verified against PG14-18: setting is the raw byte count, e.g.
+        // 16777216 for the 16 MiB default). It must be read directly and NEVER
+        // scaled — a past regression multiplied it by 8192, rendering 16 MiB as
+        // 128 GB. Guard against any 8192/1024 rescaling of the setting.
         for query in [ACTIVITY_CHECKPOINT_QUERY, ACTIVITY_CHECKPOINT_QUERY_PG17] {
             assert!(
-                query.contains("setting::bigint FROM pg_settings WHERE name = 'wal_segment_size'")
+                query.contains("setting::bigint FROM pg_settings WHERE name = 'wal_segment_size'"),
+                "wal_segment_size must be selected as raw bytes"
             );
-            assert!(!query.contains("setting::bigint * 8192"));
+            assert!(
+                !query.contains("* 8192"),
+                "wal_segment_size (unit 'B') must not be multiplied by 8192"
+            );
+            assert!(
+                !query.contains("setting::bigint * 1024"),
+                "wal_segment_size (unit 'B') must not be rescaled by 1024"
+            );
         }
     }
 }
