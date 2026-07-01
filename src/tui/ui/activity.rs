@@ -1394,7 +1394,7 @@ mod tests {
         app.dashboard.summary.checkpoint.max_wal_size_mb = 1024;
         app.dashboard.summary.checkpoint.completion_target = 0.9;
         app.dashboard.summary.checkpoint.min_wal_size_mb = 80;
-        app.dashboard.summary.checkpoint.wal_segment_size_bytes = 16 * 1024 * 1024;
+        app.dashboard.summary.checkpoint.wal_segment_size_bytes = 64 * 1024 * 1024;
         app.dashboard.summary.checkpoint.wal_bytes = 5 * 1024 * 1024 * 1024;
         app.dashboard.summary.checkpoint.wal_elapsed_seconds = 3600.0;
 
@@ -1416,6 +1416,10 @@ mod tests {
         assert!(text.contains("WAL"), "WAL row not visible");
         assert!(text.contains("Segment"), "WAL segment row not visible");
         assert!(text.contains("seg"), "WAL segment size not visible");
+        assert!(
+            text.contains("64.0 MiB"),
+            "64 MiB WAL segment size not rendered correctly"
+        );
         assert!(text.contains("Healthy"), "verdict not visible");
     }
 

@@ -176,7 +176,7 @@ SELECT
     (SELECT setting::bigint FROM pg_settings WHERE name = 'max_wal_size') AS max_wal_size_mb,
     (SELECT setting::float8 FROM pg_settings WHERE name = 'checkpoint_completion_target') AS completion_target,
     (SELECT setting::bigint FROM pg_settings WHERE name = 'min_wal_size') AS min_wal_size_mb,
-    (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size') AS wal_segment_size_bytes,
+    (SELECT setting::bigint * 8192 FROM pg_settings WHERE name = 'wal_segment_size') AS wal_segment_size_bytes,
     (SELECT COALESCE(wal_bytes, 0)::bigint FROM pg_stat_wal) AS wal_bytes,
     (SELECT extract(epoch FROM now() - stats_reset)::float8 FROM pg_stat_wal) AS wal_elapsed_seconds,
     pg_is_in_recovery() AS in_recovery
@@ -198,7 +198,7 @@ SELECT
     (SELECT setting::bigint FROM pg_settings WHERE name = 'max_wal_size') AS max_wal_size_mb,
     (SELECT setting::float8 FROM pg_settings WHERE name = 'checkpoint_completion_target') AS completion_target,
     (SELECT setting::bigint FROM pg_settings WHERE name = 'min_wal_size') AS min_wal_size_mb,
-    (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size') AS wal_segment_size_bytes,
+    (SELECT setting::bigint * 8192 FROM pg_settings WHERE name = 'wal_segment_size') AS wal_segment_size_bytes,
     (SELECT COALESCE(wal_bytes, 0)::bigint FROM pg_stat_wal) AS wal_bytes,
     (SELECT extract(epoch FROM now() - stats_reset)::float8 FROM pg_stat_wal) AS wal_elapsed_seconds,
     pg_is_in_recovery() AS in_recovery
@@ -419,12 +419,21 @@ ORDER BY schema_name ASC, depth ASC, sort_bytes DESC, table_name ASC NULLS LAST
 
 #[cfg(test)]
 mod tests {
-    use super::ACTIVITY_SESSIONS_QUERY;
+    use super::{
+        ACTIVITY_CHECKPOINT_QUERY, ACTIVITY_CHECKPOINT_QUERY_PG17, ACTIVITY_SESSIONS_QUERY,
+    };
 
     #[test]
     fn test_activity_sessions_query_includes_walsender_backends() {
         assert!(
             ACTIVITY_SESSIONS_QUERY.contains("backend_type IN ('client backend', 'walsender')")
         );
+    }
+
+    #[test]
+    fn test_checkpoint_queries_convert_wal_segment_size_to_bytes() {
+        for query in [ACTIVITY_CHECKPOINT_QUERY, ACTIVITY_CHECKPOINT_QUERY_PG17] {
+            assert!(query.contains("setting::bigint * 8192"));
+        }
     }
 }
