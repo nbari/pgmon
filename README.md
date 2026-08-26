@@ -27,6 +27,7 @@ Supports PostgreSQL 14 and newer.
 - Pg-activity-inspired `Activity` dashboard with sampled TPS/DML/temp rates, session counts, and worker/process summaries
 - Activity subviews for active, waiting, blocking, and idle in transaction backends
 - Contextual in-app help overlay (`?`) with current-view shortcuts and metric explanations
+- TLS/SSL connections via rustls, including `sslmode=verify-full` and custom root certificates
 - Built-in themes plus runtime theme switching and config validation with `pgmon check-config`
 - Interactive TUI (Tabs, Table navigation)
 - Configurable refresh rate and top-N rows.
@@ -145,6 +146,54 @@ When themes are available, press `T` inside the TUI to switch between them at ru
 
 Connection precedence is: explicit `--dsn`, then positional alias from `pgmon.yaml` or `pgmon.yml`, then `default_connection`, then `PGMON_DSN`, then the first usable entry in `PGPASSFILE` or `~/.pgpass`. If no aliases are configured at all, the resolution simply continues to `PGMON_DSN` and `.pgpass`.
 
+## TLS / SSL
+
+`pgmon` is built with TLS support (rustls + ring), so encrypted connections work
+out of the box. TLS parameters are read from the DSN and follow libpq naming:
+
+```bash
+# Encrypt, but do not verify the server certificate
+pgmon --dsn "postgresql://user@db.example.com/postgres?sslmode=require"
+
+# Encrypt and fully verify the certificate and hostname
+pgmon --dsn "postgresql://user@db.example.com/postgres?sslmode=verify-full"
+
+# Verify against a private CA
+pgmon --dsn "postgresql://user@db.example.com/postgres?sslmode=verify-full&sslrootcert=/etc/ssl/certs/my-ca.crt"
+
+# Client certificate authentication
+pgmon --dsn "postgresql://user@db.example.com/postgres?sslmode=verify-full&sslcert=/path/client.crt&sslkey=/path/client.key"
+```
+
+Supported parameters: `sslmode`, `sslrootcert`, `sslcert`, and `sslkey`. They
+work in key/value DSNs too (`host=db.example.com sslmode=require`).
+
+> [!IMPORTANT]
+> The default `sslmode` is `prefer`, which silently falls back to an
+> unencrypted connection when the server does not offer TLS. Set `sslmode` to
+> `require` or higher whenever encryption is not optional — otherwise a
+> misconfigured server yields a plaintext session rather than an error.
+
+By default the trusted root certificates are the Mozilla set bundled into the
+binary (`webpki-roots`), which keeps the static musl releases self-contained.
+Point `sslrootcert` at your CA file for internal certificates, or build against
+the host trust store instead:
+
+```bash
+cargo build --release --no-default-features --features tls-rustls-ring-native-roots
+```
+
+To confirm which TLS backend a given binary was built with:
+
+```bash
+pgmon --version          # long version: includes commit hash and TLS line
+pgmon -V                 # short version: version number only
+pgmon check-config       # reports backend and root certificate source
+```
+
+Releases up to and including 0.7.1 were built without any TLS backend and could
+not connect to servers requiring TLS ([#6](https://github.com/nbari/pgmon/issues/6)).
+
 ## TUI Shortcuts
 
 - `1`-`8`: switch tabs
@@ -176,6 +225,7 @@ The report includes:
 - invalid color or alias/default-connection issues
 - the effective connection source (`--dsn`, alias, `PGMON_DSN`, or `.pgpass`)
 - a safe connection target summary without printing passwords
+- the TLS backend compiled into the binary and where it loads root certificates from
 
 ## Connection & Capability Status
 

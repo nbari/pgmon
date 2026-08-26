@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **TLS Connections**: `pgmon` is now built with a TLS backend (rustls + ring) and can connect to PostgreSQL servers that require TLS. The `sqlx` dependency set `default-features = false` without re-enabling a TLS feature, so `sslmode=require` and stricter modes failed with a TLS error on every published binary, every distro package, and `cargo install pgmon` up to and including 0.7.1 — not only the musl Linux tarball reported in [#6](https://github.com/nbari/pgmon/issues/6). Because sqlx defaults `sslmode` to `prefer`, affected builds also downgraded silently to plaintext rather than reporting a problem.
+
+### Added
+- **Visible TLS Status**: `pgmon --version` now reports the TLS backend and root certificate source, and `pgmon check-config` gained a `TLS` section, so a binary's TLS capability can be confirmed without a database to connect to.
+- **Selectable Root Store**: Root certificates come from the bundled Mozilla set (`webpki-roots`) by default, keeping the static musl releases self-contained. Build with `--no-default-features --features tls-rustls-ring-native-roots` to use the host OS trust store instead.
+- **TLS Backend Build Guard**: `build.rs` now fails the build unless exactly one TLS backend feature is enabled, so the dependency configuration that caused #6 cannot silently return.
+
 ## [0.7.1] - 2026-06-30
 
 ### Fixed
