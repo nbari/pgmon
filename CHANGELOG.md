@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.7.2] - 2026-09-30
 
 ### Fixed
 - **TLS Connections**: `pgmon` is now built with a TLS backend (rustls + ring) and can connect to PostgreSQL servers that require TLS. No release up to and including 0.7.1 could negotiate TLS: 0.1.0–0.5.1 connected through the `postgres` crate with `NoTls` hardcoded, and from 0.6.0 the `sqlx` dependency set `default-features = false` without re-enabling a TLS feature. `sslmode=require` and stricter modes therefore failed on every published binary, every distro package, and `cargo install pgmon`, not only the musl Linux tarball reported in [#6](https://github.com/nbari/pgmon/issues/6). Because sqlx defaults `sslmode` to `prefer`, affected builds also fell back to plaintext without reporting a problem.
