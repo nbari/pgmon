@@ -31,6 +31,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features
 
+      # The alternative root store documented in the README; --all-features
+      # enables both TLS features, so it does not cover this build on its own.
+      - name: Clippy (host trust store)
+        run: cargo clippy --locked --all-targets --no-default-features --features tls-rustls-ring-native-roots
+
   check:
     name: Check
     runs-on: ubuntu-24.04

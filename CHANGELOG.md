@@ -5,12 +5,18 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
-- **TLS Connections**: `pgmon` is now built with a TLS backend (rustls + ring) and can connect to PostgreSQL servers that require TLS. The `sqlx` dependency set `default-features = false` without re-enabling a TLS feature, so `sslmode=require` and stricter modes failed with a TLS error on every published binary, every distro package, and `cargo install pgmon` up to and including 0.7.1 — not only the musl Linux tarball reported in [#6](https://github.com/nbari/pgmon/issues/6). Because sqlx defaults `sslmode` to `prefer`, affected builds also downgraded silently to plaintext rather than reporting a problem.
+- **TLS Connections**: `pgmon` is now built with a TLS backend (rustls + ring) and can connect to PostgreSQL servers that require TLS. No release up to and including 0.7.1 could negotiate TLS: 0.1.0–0.5.1 connected through the `postgres` crate with `NoTls` hardcoded, and from 0.6.0 the `sqlx` dependency set `default-features = false` without re-enabling a TLS feature. `sslmode=require` and stricter modes therefore failed on every published binary, every distro package, and `cargo install pgmon`, not only the musl Linux tarball reported in [#6](https://github.com/nbari/pgmon/issues/6). Because sqlx defaults `sslmode` to `prefer`, affected builds also fell back to plaintext without reporting a problem.
+- **`sslmode=require` With `sslrootcert`**: The server certificate is now verified against the given CA, as libpq does. sqlx on its own skips certificate verification under `require` and ignores the root certificate, so a DSN copied from `psql` would have silently lost its CA check.
 
 ### Added
 - **Visible TLS Status**: `pgmon --version` now reports the TLS backend and root certificate source, and `pgmon check-config` gained a `TLS` section, so a binary's TLS capability can be confirmed without a database to connect to.
-- **Selectable Root Store**: Root certificates come from the bundled Mozilla set (`webpki-roots`) by default, keeping the static musl releases self-contained. Build with `--no-default-features --features tls-rustls-ring-native-roots` to use the host OS trust store instead.
-- **TLS Backend Build Guard**: `build.rs` now fails the build unless exactly one TLS backend feature is enabled, so the dependency configuration that caused #6 cannot silently return.
+- **Effective `sslmode` in `check-config`**: The connection report now shows the `sslmode` pgmon will use for the resolved target, with a warning for modes that can connect unencrypted (`disable`, `allow`, `prefer`) or that skip the hostname check (`verify-ca`). Connection settings sqlx cannot parse, such as an unknown `sslmode`, now fail the check instead of passing it.
+- **Selectable Root Store**: Root certificates come from the bundled Mozilla set (`webpki-roots`) by default, keeping the static musl releases self-contained. Build with `--no-default-features --features tls-rustls-ring-native-roots` to use the host OS trust store instead; with both features enabled, the host trust store wins.
+- **TLS Backend Build Guard**: `pgmon` now fails to compile when no TLS backend feature is enabled, so the dependency configuration that caused #6 cannot silently return. Enabling both features is allowed, so `--all-features` builds keep working.
+- **TLS Documentation**: The README's `TLS / SSL` section lists how each `sslmode` behaves in pgmon and where it differs from libpq.
+
+### Changed
+- **CI**: Clippy also checks the host-trust-store build, which `--all-features` does not cover on its own.
 
 ## [0.7.1] - 2026-06-30
 

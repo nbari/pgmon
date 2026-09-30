@@ -2,9 +2,13 @@
 
 use super::{DbError, DbResult, MIN_SUPPORTED_SERVER_VERSION_NUM, PgClient};
 use crate::pg::conninfo::describe_connection_target;
-use sqlx::{PgPool, postgres::PgConnectOptions};
+use sqlx::{
+    PgPool,
+    postgres::{PgConnectOptions, PgSslMode},
+};
 use std::{
     collections::BTreeMap,
+    ffi::OsStr,
     fmt::Write as _,
     hash::{Hash, Hasher},
     str::FromStr,
@@ -36,6 +40,22 @@ pub(super) struct PreparedConnectionTarget {
     pub(super) key: PoolKey,
     pub(super) options: PgConnectOptions,
     pub(super) target_summary: String,
+}
+
+/// Connection parameter names sqlx accepts for the TLS root certificate.
+const ROOT_CERT_PARAMS: [&str; 3] = ["sslrootcert", "ssl-root-cert", "ssl-ca"];
+
+/// The `sslmode` a DSN asks for and the one pgmon connects with, for
+/// `check-config`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SslModeResolution {
+    /// Mode from the DSN, or from `PGSSLMODE` when the DSN sets none, in libpq
+    /// spelling.
+    pub(crate) requested: &'static str,
+    /// Mode pgmon applies after [`effective_ssl_mode`], in libpq spelling.
+    pub(crate) effective: &'static str,
+    /// Why the effective mode may not protect the session, if it may not.
+    pub(crate) warning: Option<String>,
 }
 
 impl PgClient {
@@ -103,22 +123,12 @@ pub(super) fn prepare_connection_target(
     dsn: &str,
     database_override: Option<&str>,
 ) -> DbResult<PreparedConnectionTarget> {
-    let url = if looks_like_postgres_url(dsn) {
-        dsn.to_string()
-    } else {
-        conninfo_to_url(dsn)?
-    };
-
-    let params = url_query_params(&url)?;
-    let mut options = PgConnectOptions::from_str(&url).map_err(|error| {
-        DbError::fatal(format!(
-            "Failed to parse Postgres connection settings for {}: {error}",
-            describe_connection_target(dsn)
-        ))
-    })?;
+    let (mut options, params) = parse_connect_options(dsn)?;
     if let Some(database) = database_override {
         options = options.database(database);
     }
+    let ssl_mode = effective_ssl_mode(options.get_ssl_mode(), root_cert_configured(&params));
+    options = options.ssl_mode(ssl_mode);
 
     let key = build_pool_key(&options, &params, database_override);
 
@@ -127,6 +137,114 @@ pub(super) fn prepare_connection_target(
         options,
         target_summary: describe_connection_target(dsn),
     })
+}
+
+/// Resolve the `sslmode` pgmon will use for `dsn` without connecting.
+///
+/// # Errors
+///
+/// Returns an error when `dsn` cannot be parsed into connection settings.
+pub(crate) fn resolve_ssl_mode(dsn: &str) -> DbResult<SslModeResolution> {
+    let (options, params) = parse_connect_options(dsn)?;
+    let requested = options.get_ssl_mode();
+    let effective = effective_ssl_mode(requested, root_cert_configured(&params));
+
+    Ok(SslModeResolution {
+        requested: ssl_mode_name(requested),
+        effective: ssl_mode_name(effective),
+        warning: ssl_mode_warning(effective),
+    })
+}
+
+/// Parse `dsn`, URL or key/value form, into sqlx options plus its raw
+/// parameters.
+fn parse_connect_options(dsn: &str) -> DbResult<(PgConnectOptions, BTreeMap<String, String>)> {
+    let url = if looks_like_postgres_url(dsn) {
+        dsn.to_string()
+    } else {
+        conninfo_to_url(dsn)?
+    };
+
+    let params = url_query_params(&url)?;
+    let options = PgConnectOptions::from_str(&url).map_err(|error| {
+        DbError::fatal(format!(
+            "Failed to parse Postgres connection settings for {}: {error}",
+            describe_connection_target(dsn)
+        ))
+    })?;
+
+    Ok((options, params))
+}
+
+/// Apply libpq's rule that `sslmode=require` verifies the server certificate
+/// once a root certificate is configured.
+///
+/// libpq treats `require` as `verify-ca` whenever a root CA file is present.
+/// sqlx skips certificate verification for `require` and ignores
+/// `sslrootcert`, so without this a DSN copied from `psql` would silently drop
+/// its CA check. Every other mode is returned unchanged.
+const fn effective_ssl_mode(requested: PgSslMode, root_cert_configured: bool) -> PgSslMode {
+    match requested {
+        PgSslMode::Require if root_cert_configured => PgSslMode::VerifyCa,
+        other => other,
+    }
+}
+
+/// Whether sqlx will receive a root certificate, from the DSN or
+/// `PGSSLROOTCERT`.
+///
+/// libpq's default `~/.postgresql/root.crt` is not consulted because sqlx never
+/// loads it.
+fn root_cert_configured(params: &BTreeMap<String, String>) -> bool {
+    root_cert_in(params, std::env::var_os("PGSSLROOTCERT").as_deref())
+}
+
+/// Whether `params` or the `PGSSLROOTCERT` value name a root certificate.
+///
+/// Empty values are ignored: under `require` sqlx never reads the file, so an
+/// empty setting must not trigger the `verify-ca` upgrade and fail the
+/// connection.
+fn root_cert_in(params: &BTreeMap<String, String>, env_root_cert: Option<&OsStr>) -> bool {
+    ROOT_CERT_PARAMS
+        .iter()
+        .any(|key| params.get(*key).is_some_and(|value| !value.is_empty()))
+        || env_root_cert.is_some_and(|value| !value.is_empty())
+}
+
+/// libpq spelling of an sqlx `sslmode`.
+const fn ssl_mode_name(mode: PgSslMode) -> &'static str {
+    match mode {
+        PgSslMode::Disable => "disable",
+        PgSslMode::Allow => "allow",
+        PgSslMode::Prefer => "prefer",
+        PgSslMode::Require => "require",
+        PgSslMode::VerifyCa => "verify-ca",
+        PgSslMode::VerifyFull => "verify-full",
+    }
+}
+
+/// Explain how `mode`, as sqlx implements it, can leave a session exposed.
+///
+/// sqlx never attempts TLS under `allow`, unlike libpq, and its `verify-ca`
+/// trusts the compiled-in root store in addition to `sslrootcert`.
+fn ssl_mode_warning(mode: PgSslMode) -> Option<String> {
+    match mode {
+        PgSslMode::Disable | PgSslMode::Allow => Some(format!(
+            "sslmode={} never uses TLS; the connection is unencrypted.",
+            ssl_mode_name(mode)
+        )),
+        PgSslMode::Prefer => Some(
+            "sslmode=prefer connects unencrypted when the server does not offer TLS; \
+             use require or stricter when encryption is mandatory."
+                .to_string(),
+        ),
+        PgSslMode::VerifyCa => Some(format!(
+            "sslmode=verify-ca does not check the hostname and also trusts every CA in \
+             the {}; use verify-full to pin the server identity.",
+            crate::tls::root_store()
+        )),
+        PgSslMode::Require | PgSslMode::VerifyFull => None,
+    }
 }
 
 pub(super) fn classify_connect_error(target_summary: &str, error: sqlx::Error) -> DbError {
@@ -369,7 +487,12 @@ fn hash_value(value: &str) -> u64 {
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use super::{PoolKey, conninfo_to_url, parse_conninfo_params, prepare_connection_target};
+    use super::{
+        PoolKey, conninfo_to_url, effective_ssl_mode, parse_conninfo_params,
+        prepare_connection_target, resolve_ssl_mode, root_cert_in, ssl_mode_name, ssl_mode_warning,
+    };
+    use sqlx::postgres::PgSslMode;
+    use std::{collections::BTreeMap, ffi::OsStr};
 
     #[test]
     fn test_parse_conninfo_params_handles_quotes_and_escapes() {
@@ -457,5 +580,115 @@ mod tests {
                 password_fingerprint: None,
             }
         );
+    }
+
+    #[test]
+    fn test_effective_ssl_mode_upgrades_require_with_root_cert() {
+        assert_eq!(
+            ssl_mode_name(effective_ssl_mode(PgSslMode::Require, true)),
+            "verify-ca"
+        );
+        assert_eq!(
+            ssl_mode_name(effective_ssl_mode(PgSslMode::Require, false)),
+            "require"
+        );
+    }
+
+    #[test]
+    fn test_effective_ssl_mode_keeps_other_modes_with_root_cert() {
+        for mode in [
+            PgSslMode::Disable,
+            PgSslMode::Allow,
+            PgSslMode::Prefer,
+            PgSslMode::VerifyCa,
+            PgSslMode::VerifyFull,
+        ] {
+            assert_eq!(
+                ssl_mode_name(effective_ssl_mode(mode, true)),
+                ssl_mode_name(mode)
+            );
+        }
+    }
+
+    #[test]
+    fn test_root_cert_in_accepts_sqlx_aliases_and_env() {
+        for key in ["sslrootcert", "ssl-root-cert", "ssl-ca"] {
+            let params = BTreeMap::from([(key.to_string(), "/etc/ssl/ca.crt".to_string())]);
+            assert!(root_cert_in(&params, None), "{key} should count");
+        }
+
+        assert!(root_cert_in(
+            &BTreeMap::new(),
+            Some(OsStr::new("/etc/ssl/ca.crt"))
+        ));
+        assert!(!root_cert_in(&BTreeMap::new(), None));
+    }
+
+    #[test]
+    fn test_root_cert_in_ignores_empty_values() {
+        let params = BTreeMap::from([("sslrootcert".to_string(), String::new())]);
+
+        assert!(!root_cert_in(&params, Some(OsStr::new(""))));
+    }
+
+    #[test]
+    fn test_prepare_connection_target_verifies_require_with_root_cert() {
+        let target = match prepare_connection_target(
+            "postgresql://pgmon@localhost/postgres?sslmode=require&sslrootcert=/etc/ssl/ca.crt",
+            None,
+        ) {
+            Ok(target) => target,
+            Err(error) => panic!("URL should parse: {error}"),
+        };
+
+        assert_eq!(target.key.ssl_mode, "VerifyCa");
+        assert_eq!(ssl_mode_name(target.options.get_ssl_mode()), "verify-ca");
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_reports_require_upgrade_in_conninfo() {
+        let resolution = match resolve_ssl_mode(
+            "host=localhost dbname=postgres sslmode=require sslrootcert=/etc/ssl/ca.crt",
+        ) {
+            Ok(resolution) => resolution,
+            Err(error) => panic!("conninfo should parse: {error}"),
+        };
+
+        assert_eq!(resolution.requested, "require");
+        assert_eq!(resolution.effective, "verify-ca");
+        assert!(
+            resolution
+                .warning
+                .is_some_and(|warning| warning.contains("verify-full"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_has_no_warning_for_verify_full() {
+        let resolution =
+            match resolve_ssl_mode("postgresql://pgmon@localhost/postgres?sslmode=verify-full") {
+                Ok(resolution) => resolution,
+                Err(error) => panic!("URL should parse: {error}"),
+            };
+
+        assert_eq!(resolution.effective, "verify-full");
+        assert_eq!(resolution.warning, None);
+    }
+
+    #[test]
+    fn test_ssl_mode_warning_flags_plaintext_capable_modes() {
+        for mode in [PgSslMode::Disable, PgSslMode::Allow, PgSslMode::Prefer] {
+            assert!(
+                ssl_mode_warning(mode).is_some_and(|warning| warning.contains("unencrypted")),
+                "{} should warn about plaintext",
+                ssl_mode_name(mode)
+            );
+        }
+        assert_eq!(ssl_mode_warning(PgSslMode::Require), None);
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_rejects_invalid_sslmode() {
+        assert!(resolve_ssl_mode("postgresql://pgmon@localhost/postgres?sslmode=bogus").is_err());
     }
 }

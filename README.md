@@ -152,7 +152,7 @@ Connection precedence is: explicit `--dsn`, then positional alias from `pgmon.ya
 out of the box. TLS parameters are read from the DSN and follow libpq naming:
 
 ```bash
-# Encrypt, but do not verify the server certificate
+# Encrypt, but do not verify the server certificate (see the table below)
 pgmon --dsn "postgresql://user@db.example.com/postgres?sslmode=require"
 
 # Encrypt and fully verify the certificate and hostname
@@ -166,7 +166,25 @@ pgmon --dsn "postgresql://user@db.example.com/postgres?sslmode=verify-full&sslce
 ```
 
 Supported parameters: `sslmode`, `sslrootcert`, `sslcert`, and `sslkey`. They
-work in key/value DSNs too (`host=db.example.com sslmode=require`).
+work in key/value DSNs too (`host=db.example.com sslmode=require`), and the
+`PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, and `PGSSLKEY` environment variables
+apply when the DSN does not set them.
+
+The TLS connection is made by sqlx, so a few modes behave differently from
+`psql`:
+
+| `sslmode` | Encrypted | Server certificate checked | Differences from libpq |
+| --- | --- | --- | --- |
+| `disable`, `allow` | no | no | `allow` never attempts TLS, even when the server requires it |
+| `prefer` (default) | when the server offers TLS | no | a failed TLS handshake fails the connection instead of retrying without TLS |
+| `require` | yes | no, unless `sslrootcert` is set | with `sslrootcert`, pgmon applies `verify-ca`, as libpq does |
+| `verify-ca` | yes | chain only, not the hostname | the compiled-in root store is trusted **in addition to** `sslrootcert`, so any publicly trusted certificate is accepted |
+| `verify-full` | yes | chain and hostname | none; use this whenever the server identity matters |
+
+Two more differences: libpq's default `~/.postgresql/root.crt` is not read, so
+pass `sslrootcert` explicitly, and when a key/value DSN sets both `host` and
+`hostaddr`, `verify-full` checks the certificate against the `hostaddr` IP
+address rather than the host name.
 
 > [!IMPORTANT]
 > The default `sslmode` is `prefer`, which silently falls back to an
@@ -225,6 +243,7 @@ The report includes:
 - invalid color or alias/default-connection issues
 - the effective connection source (`--dsn`, alias, `PGMON_DSN`, or `.pgpass`)
 - a safe connection target summary without printing passwords
+- the effective `sslmode` for that target, with a warning when it can connect unencrypted or does not check the hostname
 - the TLS backend compiled into the binary and where it loads root certificates from
 
 ## Connection & Capability Status

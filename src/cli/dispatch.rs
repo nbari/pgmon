@@ -1,4 +1,8 @@
-use crate::{cli::actions::Action, config::Config, pg::conninfo};
+use crate::{
+    cli::actions::Action,
+    config::Config,
+    pg::{client, conninfo},
+};
 use anyhow::{Result, anyhow};
 use clap::{ArgMatches, parser::ValueSource};
 use std::path::{Path, PathBuf};
@@ -196,6 +200,19 @@ fn check_connection_resolution(matches: &ArgMatches, config: &Config) -> Result<
         "- Effective target: {}",
         conninfo::describe_connection_target(&resolved_dsn)
     ));
+
+    let ssl_mode = client::resolve_ssl_mode(&resolved_dsn)?;
+    lines.push(if ssl_mode.requested == ssl_mode.effective {
+        format!("- Effective sslmode: {}", ssl_mode.effective)
+    } else {
+        format!(
+            "- Effective sslmode: {} ({} with sslrootcert verifies the CA, as in libpq)",
+            ssl_mode.effective, ssl_mode.requested
+        )
+    });
+    if let Some(warning) = ssl_mode.warning {
+        lines.push(format!("- Warning: {warning}"));
+    }
 
     if explicit_dsn.is_some()
         && let Some((alias, source)) = alias_selection
@@ -404,6 +421,44 @@ mod tests {
         };
         assert!(success);
         assert!(report.contains("Effective source: --dsn"));
+        assert!(report.contains("\nTLS\n- Backend: rustls (ring)\n- Root certificates: "));
+    }
+
+    #[test]
+    fn test_check_config_reports_verify_ca_upgrade_and_warning() {
+        let matches = commands::new().get_matches_from(vec![
+            "pgmon",
+            "check-config",
+            "--dsn",
+            "postgresql://localhost/postgres?sslmode=require&sslrootcert=/etc/ssl/ca.crt",
+        ]);
+
+        let action = handler(&matches, Config::default(), None);
+
+        let Ok(Action::CheckConfig { success, report }) = action else {
+            panic!("check-config action should be returned");
+        };
+        assert!(success);
+        assert!(report.contains("- Effective sslmode: verify-ca (require with sslrootcert"));
+        assert!(report.contains("- Warning: sslmode=verify-ca does not check the hostname"));
+    }
+
+    #[test]
+    fn test_check_config_fails_on_invalid_sslmode() {
+        let matches = commands::new().get_matches_from(vec![
+            "pgmon",
+            "check-config",
+            "--dsn",
+            "postgresql://localhost/postgres?sslmode=bogus",
+        ]);
+
+        let action = handler(&matches, Config::default(), None);
+
+        let Ok(Action::CheckConfig { success, report }) = action else {
+            panic!("check-config action should be returned");
+        };
+        assert!(!success);
+        assert!(report.contains("- Resolution: failed"));
     }
 
     #[test]

@@ -42,9 +42,11 @@ large_stack_arrays = "deny"
 [features]
 default = ["tls-rustls-ring"]
 
-# TLS backends for the PostgreSQL connection. Exactly one must be enabled;
-# build.rs enforces that, so a dependency edit cannot silently produce a binary
-# without TLS support again (https://github.com/nbari/pgmon/issues/6).
+# TLS backends for the PostgreSQL connection. At least one must be enabled;
+# src/tls.rs enforces that at compile time, so a dependency edit cannot silently
+# produce a binary without TLS support again
+# (https://github.com/nbari/pgmon/issues/6). With both enabled (for example
+# under --all-features), sqlx uses the host OS trust store.
 #
 # tls-rustls-ring              - rustls + ring, Mozilla roots bundled into the
 #                                binary (webpki-roots). Self-contained, which is

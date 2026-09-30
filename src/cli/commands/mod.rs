@@ -173,6 +173,14 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_long_version_reports_tls_backend() {
+        let long_version = new().render_long_version();
+
+        assert!(long_version.contains(&format!("\nTLS: {}", crate::tls::summary())));
+        assert!(!new().render_version().contains("TLS"));
+    }
+
+    #[test]
     fn test_cli_default_values() {
         let cmd = new();
         let matches = cmd.get_matches_from(vec!["pgmon", "--dsn", "postgres://localhost"]);

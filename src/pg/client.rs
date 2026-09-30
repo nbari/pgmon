@@ -11,6 +11,7 @@ mod types;
 use sqlx::{PgPool, Postgres, pool::PoolConnection};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub(crate) use self::connect::resolve_ssl_mode;
 pub(crate) use self::error::{DbError, DbResult};
 pub(crate) use self::explain::analyze_explain_query;
 pub(crate) use self::runtime::{DbExecutor, DbRuntime};
