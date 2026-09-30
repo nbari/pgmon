@@ -206,11 +206,12 @@ fn check_connection_resolution(matches: &ArgMatches, config: &Config) -> Result<
         format!("- Effective sslmode: {}", ssl_mode.effective)
     } else {
         format!(
-            "- Effective sslmode: {} ({} with sslrootcert verifies the CA, as in libpq)",
+            "- Effective sslmode: {} ({} with an existing sslrootcert verifies the \
+             certificate chain, as in libpq)",
             ssl_mode.effective, ssl_mode.requested
         )
     });
-    if let Some(warning) = ssl_mode.warning {
+    for warning in ssl_mode.warnings {
         lines.push(format!("- Warning: {warning}"));
     }
 
@@ -426,12 +427,12 @@ mod tests {
 
     #[test]
     fn test_check_config_reports_verify_ca_upgrade_and_warning() {
-        let matches = commands::new().get_matches_from(vec![
-            "pgmon",
-            "check-config",
-            "--dsn",
-            "postgresql://localhost/postgres?sslmode=require&sslrootcert=/etc/ssl/ca.crt",
-        ]);
+        let dsn = concat!(
+            "postgresql://localhost/postgres?sslmode=require&sslrootcert=",
+            env!("CARGO_MANIFEST_DIR"),
+            "/Cargo.toml"
+        );
+        let matches = commands::new().get_matches_from(vec!["pgmon", "check-config", "--dsn", dsn]);
 
         let action = handler(&matches, Config::default(), None);
 
@@ -439,7 +440,9 @@ mod tests {
             panic!("check-config action should be returned");
         };
         assert!(success);
-        assert!(report.contains("- Effective sslmode: verify-ca (require with sslrootcert"));
+        assert!(
+            report.contains("- Effective sslmode: verify-ca (require with an existing sslrootcert")
+        );
         assert!(report.contains("- Warning: sslmode=verify-ca does not check the hostname"));
     }
 

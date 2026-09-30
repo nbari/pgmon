@@ -177,14 +177,24 @@ The TLS connection is made by sqlx, so a few modes behave differently from
 | --- | --- | --- | --- |
 | `disable`, `allow` | no | no | `allow` never attempts TLS, even when the server requires it |
 | `prefer` (default) | when the server offers TLS | no | a failed TLS handshake fails the connection instead of retrying without TLS |
-| `require` | yes | no, unless `sslrootcert` is set | with `sslrootcert`, pgmon applies `verify-ca`, as libpq does |
-| `verify-ca` | yes | chain only, not the hostname | the compiled-in root store is trusted **in addition to** `sslrootcert`, so any publicly trusted certificate is accepted |
-| `verify-full` | yes | chain and hostname | none; use this whenever the server identity matters |
+| `require` | yes | no, unless `sslrootcert` names an existing file | with one, pgmon applies `verify-ca`, as libpq does; a missing file leaves the certificate unverified, also as in libpq |
+| `verify-ca` | yes | chain only, not the hostname | any publicly trusted certificate is accepted, because the compiled-in root store is trusted too (see below) |
+| `verify-full` | yes | chain and hostname | a publicly trusted certificate for the host name is accepted even when `sslrootcert` names a private CA |
 
-Two more differences: libpq's default `~/.postgresql/root.crt` is not read, so
-pass `sslrootcert` explicitly, and when a key/value DSN sets both `host` and
-`hostaddr`, `verify-full` checks the certificate against the `hostaddr` IP
-address rather than the host name.
+Use `verify-full` whenever the server identity matters.
+
+More differences:
+
+- `sslrootcert` is trusted **in addition to** the compiled-in root store
+  (bundled Mozilla roots, or the host trust store), not instead of it as in
+  libpq. sqlx offers no way to trust a private CA alone.
+- `sslrootcert=system` is rejected with an error, because sqlx would read it as
+  a file named `system`. Omit `sslrootcert` and use `verify-full` to verify
+  against the compiled-in root store.
+- libpq's default `~/.postgresql/root.crt` is not read, so pass `sslrootcert`
+  explicitly.
+- When a key/value DSN sets both `host` and `hostaddr`, `verify-full` checks the
+  certificate against the `hostaddr` IP address rather than the host name.
 
 > [!IMPORTANT]
 > The default `sslmode` is `prefer`, which silently falls back to an
@@ -243,7 +253,7 @@ The report includes:
 - invalid color or alias/default-connection issues
 - the effective connection source (`--dsn`, alias, `PGMON_DSN`, or `.pgpass`)
 - a safe connection target summary without printing passwords
-- the effective `sslmode` for that target, with a warning when it can connect unencrypted or does not check the hostname
+- the effective `sslmode` for that target, with a warning when it can connect unencrypted, does not check the hostname, trusts more than `sslrootcert`, or names a missing `sslrootcert` file
 - the TLS backend compiled into the binary and where it loads root certificates from
 
 ## Connection & Capability Status

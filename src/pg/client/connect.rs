@@ -8,9 +8,9 @@ use sqlx::{
 };
 use std::{
     collections::BTreeMap,
-    ffi::OsStr,
     fmt::Write as _,
     hash::{Hash, Hasher},
+    path::Path,
     str::FromStr,
     time::Duration,
 };
@@ -54,8 +54,23 @@ pub(crate) struct SslModeResolution {
     pub(crate) requested: &'static str,
     /// Mode pgmon applies after [`effective_ssl_mode`], in libpq spelling.
     pub(crate) effective: &'static str,
-    /// Why the effective mode may not protect the session, if it may not.
-    pub(crate) warning: Option<String>,
+    /// Ways the effective settings may not protect the session, most
+    /// important first.
+    pub(crate) warnings: Vec<String>,
+}
+
+/// The root certificate sqlx will load, classified the way libpq decides
+/// whether `sslmode=require` verifies the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootCert {
+    /// No root certificate, or an empty value.
+    Unset,
+    /// libpq's special value `system`, which sqlx would read as a file name.
+    System,
+    /// Inline PEM or a path to an existing file.
+    Available,
+    /// A path that does not exist.
+    Missing(String),
 }
 
 impl PgClient {
@@ -123,11 +138,11 @@ pub(super) fn prepare_connection_target(
     dsn: &str,
     database_override: Option<&str>,
 ) -> DbResult<PreparedConnectionTarget> {
-    let (mut options, params) = parse_connect_options(dsn)?;
+    let (mut options, params, root_cert) = parse_connect_options(dsn)?;
     if let Some(database) = database_override {
         options = options.database(database);
     }
-    let ssl_mode = effective_ssl_mode(options.get_ssl_mode(), root_cert_configured(&params));
+    let ssl_mode = effective_ssl_mode(options.get_ssl_mode(), &root_cert);
     options = options.ssl_mode(ssl_mode);
 
     let key = build_pool_key(&options, &params, database_override);
@@ -143,29 +158,40 @@ pub(super) fn prepare_connection_target(
 ///
 /// # Errors
 ///
-/// Returns an error when `dsn` cannot be parsed into connection settings.
+/// Returns an error when `dsn` cannot be parsed into connection settings or
+/// uses a root certificate setting pgmon does not support.
 pub(crate) fn resolve_ssl_mode(dsn: &str) -> DbResult<SslModeResolution> {
-    let (options, params) = parse_connect_options(dsn)?;
+    let (options, _, root_cert) = parse_connect_options(dsn)?;
     let requested = options.get_ssl_mode();
-    let effective = effective_ssl_mode(requested, root_cert_configured(&params));
+    let effective = effective_ssl_mode(requested, &root_cert);
 
     Ok(SslModeResolution {
         requested: ssl_mode_name(requested),
         effective: ssl_mode_name(effective),
-        warning: ssl_mode_warning(effective),
+        warnings: ssl_mode_warning(effective)
+            .into_iter()
+            .chain(root_cert_warning(effective, &root_cert))
+            .collect(),
     })
 }
 
-/// Parse `dsn`, URL or key/value form, into sqlx options plus its raw
-/// parameters.
-fn parse_connect_options(dsn: &str) -> DbResult<(PgConnectOptions, BTreeMap<String, String>)> {
+/// Parse `dsn`, URL or key/value form, into sqlx options, its raw parameters,
+/// and the root certificate sqlx will load.
+fn parse_connect_options(
+    dsn: &str,
+) -> DbResult<(PgConnectOptions, BTreeMap<String, String>, RootCert)> {
     let url = if looks_like_postgres_url(dsn) {
         dsn.to_string()
     } else {
         conninfo_to_url(dsn)?
     };
 
-    let params = url_query_params(&url)?;
+    let parsed = Url::parse(&url).map_err(|error| {
+        DbError::fatal(format!(
+            "Failed to parse PostgreSQL connection URL: {error}"
+        ))
+    })?;
+    let params = url_query_params(&parsed);
     let options = PgConnectOptions::from_str(&url).map_err(|error| {
         DbError::fatal(format!(
             "Failed to parse Postgres connection settings for {}: {error}",
@@ -173,42 +199,72 @@ fn parse_connect_options(dsn: &str) -> DbResult<(PgConnectOptions, BTreeMap<Stri
         ))
     })?;
 
-    Ok((options, params))
+    let root_cert = classify_root_cert(
+        root_cert_setting(&parsed, std::env::var("PGSSLROOTCERT").ok()).as_deref(),
+    );
+    if root_cert == RootCert::System {
+        return Err(DbError::fatal(format!(
+            "Unsupported Postgres connection settings for {}: sslrootcert=system is not \
+             supported, because sqlx would read it as a file named \"system\". Remove \
+             sslrootcert and use sslmode=verify-full, which verifies against the {}.",
+            describe_connection_target(dsn),
+            crate::tls::root_store()
+        )));
+    }
+
+    Ok((options, params, root_cert))
 }
 
 /// Apply libpq's rule that `sslmode=require` verifies the server certificate
-/// once a root certificate is configured.
+/// when a root certificate is available.
 ///
-/// libpq treats `require` as `verify-ca` whenever a root CA file is present.
+/// libpq treats `require` as `verify-ca` whenever the root CA file exists.
 /// sqlx skips certificate verification for `require` and ignores
 /// `sslrootcert`, so without this a DSN copied from `psql` would silently drop
 /// its CA check. Every other mode is returned unchanged.
-const fn effective_ssl_mode(requested: PgSslMode, root_cert_configured: bool) -> PgSslMode {
-    match requested {
-        PgSslMode::Require if root_cert_configured => PgSslMode::VerifyCa,
-        other => other,
+const fn effective_ssl_mode(requested: PgSslMode, root_cert: &RootCert) -> PgSslMode {
+    match (requested, root_cert) {
+        (PgSslMode::Require, RootCert::Available) => PgSslMode::VerifyCa,
+        (other, _) => other,
     }
 }
 
-/// Whether sqlx will receive a root certificate, from the DSN or
-/// `PGSSLROOTCERT`.
+/// The root certificate value sqlx will use: the last root parameter in the
+/// URL, otherwise `PGSSLROOTCERT`.
 ///
-/// libpq's default `~/.postgresql/root.crt` is not consulted because sqlx never
-/// loads it.
-fn root_cert_configured(params: &BTreeMap<String, String>) -> bool {
-    root_cert_in(params, std::env::var_os("PGSSLROOTCERT").as_deref())
+/// sqlx starts from the environment and lets every root parameter it parses
+/// overwrite the previous value, so a DSN value, even an empty one, hides the
+/// environment. libpq's default `~/.postgresql/root.crt` is not consulted
+/// because sqlx never loads it.
+fn root_cert_setting(url: &Url, env_root_cert: Option<String>) -> Option<String> {
+    url.query_pairs()
+        .filter(|(key, _)| ROOT_CERT_PARAMS.contains(&key.as_ref()))
+        .last()
+        .map(|(_, value)| value.into_owned())
+        .or(env_root_cert)
 }
 
-/// Whether `params` or the `PGSSLROOTCERT` value name a root certificate.
+/// Classify a root certificate setting as libpq would for `sslmode=require`.
 ///
-/// Empty values are ignored: under `require` sqlx never reads the file, so an
-/// empty setting must not trigger the `verify-ca` upgrade and fail the
-/// connection.
-fn root_cert_in(params: &BTreeMap<String, String>, env_root_cert: Option<&OsStr>) -> bool {
-    ROOT_CERT_PARAMS
-        .iter()
-        .any(|key| params.get(*key).is_some_and(|value| !value.is_empty()))
-        || env_root_cert.is_some_and(|value| !value.is_empty())
+/// Empty values count as unset: under `require` sqlx never reads the file, so
+/// they must not trigger the `verify-ca` upgrade. Inline PEM is recognised
+/// with the same heuristic as sqlx's `CertificateInput`.
+fn classify_root_cert(setting: Option<&str>) -> RootCert {
+    let Some(value) = setting.filter(|value| !value.is_empty()) else {
+        return RootCert::Unset;
+    };
+    if value == "system" {
+        return RootCert::System;
+    }
+
+    let trimmed = value.trim();
+    if (trimmed.starts_with("-----BEGIN") && trimmed.ends_with("-----"))
+        || Path::new(value).exists()
+    {
+        RootCert::Available
+    } else {
+        RootCert::Missing(value.to_string())
+    }
 }
 
 /// libpq spelling of an sqlx `sslmode`.
@@ -244,6 +300,30 @@ fn ssl_mode_warning(mode: PgSslMode) -> Option<String> {
             crate::tls::root_store()
         )),
         PgSslMode::Require | PgSslMode::VerifyFull => None,
+    }
+}
+
+/// Explain how the root certificate changes what `mode` verifies, if it does.
+///
+/// sqlx adds `sslrootcert` to the compiled-in root store instead of trusting
+/// it alone, which matters most under `verify-full`, where libpq would accept
+/// only certificates from that CA. `verify-ca` already warns about this in
+/// [`ssl_mode_warning`].
+fn root_cert_warning(mode: PgSslMode, root_cert: &RootCert) -> Option<String> {
+    match (mode, root_cert) {
+        (PgSslMode::VerifyFull, RootCert::Available) => Some(format!(
+            "sslrootcert is trusted in addition to the {}, not instead of it as in \
+             libpq, so a certificate for this host from any of those CAs is also accepted.",
+            crate::tls::root_store()
+        )),
+        (PgSslMode::Require, RootCert::Missing(path)) => Some(format!(
+            "sslrootcert {path} does not exist, so the server certificate is not \
+             verified (libpq does the same)."
+        )),
+        (PgSslMode::VerifyCa | PgSslMode::VerifyFull, RootCert::Missing(path)) => Some(format!(
+            "sslrootcert {path} does not exist, so the connection will fail until it does."
+        )),
+        _ => None,
     }
 }
 
@@ -337,12 +417,7 @@ fn looks_like_postgres_url(dsn: &str) -> bool {
     trimmed.starts_with("postgres://") || trimmed.starts_with("postgresql://")
 }
 
-fn url_query_params(url: &str) -> DbResult<BTreeMap<String, String>> {
-    let parsed = Url::parse(url).map_err(|error| {
-        DbError::fatal(format!(
-            "Failed to parse PostgreSQL connection URL: {error}"
-        ))
-    })?;
+fn url_query_params(parsed: &Url) -> BTreeMap<String, String> {
     let mut params = parsed
         .query_pairs()
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
@@ -373,7 +448,7 @@ fn url_query_params(url: &str) -> DbResult<BTreeMap<String, String>> {
             .entry("dbname".to_string())
             .or_insert_with(|| database.to_string());
     }
-    Ok(params)
+    params
 }
 
 fn conninfo_to_url(dsn: &str) -> DbResult<String> {
@@ -488,11 +563,24 @@ fn hash_value(value: &str) -> u64 {
 #[allow(clippy::panic)]
 mod tests {
     use super::{
-        PoolKey, conninfo_to_url, effective_ssl_mode, parse_conninfo_params,
-        prepare_connection_target, resolve_ssl_mode, root_cert_in, ssl_mode_name, ssl_mode_warning,
+        PoolKey, RootCert, classify_root_cert, conninfo_to_url, effective_ssl_mode,
+        parse_conninfo_params, prepare_connection_target, resolve_ssl_mode, root_cert_setting,
+        ssl_mode_name, ssl_mode_warning,
     };
     use sqlx::postgres::PgSslMode;
-    use std::{collections::BTreeMap, ffi::OsStr};
+    use url::Url;
+
+    /// A root certificate path that exists whenever the tests run.
+    const EXISTING_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    /// A root certificate path that never exists.
+    const MISSING_FILE: &str = "/nonexistent/pgmon-test-ca.crt";
+
+    fn url(value: &str) -> Url {
+        match Url::parse(value) {
+            Ok(url) => url,
+            Err(error) => panic!("test URL should parse: {error}"),
+        }
+    }
 
     #[test]
     fn test_parse_conninfo_params_handles_quotes_and_escapes() {
@@ -583,15 +671,17 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_ssl_mode_upgrades_require_with_root_cert() {
+    fn test_effective_ssl_mode_upgrades_require_only_with_available_root_cert() {
         assert_eq!(
-            ssl_mode_name(effective_ssl_mode(PgSslMode::Require, true)),
+            ssl_mode_name(effective_ssl_mode(PgSslMode::Require, &RootCert::Available)),
             "verify-ca"
         );
-        assert_eq!(
-            ssl_mode_name(effective_ssl_mode(PgSslMode::Require, false)),
-            "require"
-        );
+        for root_cert in [RootCert::Unset, RootCert::Missing(MISSING_FILE.to_string())] {
+            assert_eq!(
+                ssl_mode_name(effective_ssl_mode(PgSslMode::Require, &root_cert)),
+                "require"
+            );
+        }
     }
 
     #[test]
@@ -604,39 +694,62 @@ mod tests {
             PgSslMode::VerifyFull,
         ] {
             assert_eq!(
-                ssl_mode_name(effective_ssl_mode(mode, true)),
+                ssl_mode_name(effective_ssl_mode(mode, &RootCert::Available)),
                 ssl_mode_name(mode)
             );
         }
     }
 
     #[test]
-    fn test_root_cert_in_accepts_sqlx_aliases_and_env() {
-        for key in ["sslrootcert", "ssl-root-cert", "ssl-ca"] {
-            let params = BTreeMap::from([(key.to_string(), "/etc/ssl/ca.crt".to_string())]);
-            assert!(root_cert_in(&params, None), "{key} should count");
-        }
-
-        assert!(root_cert_in(
-            &BTreeMap::new(),
-            Some(OsStr::new("/etc/ssl/ca.crt"))
-        ));
-        assert!(!root_cert_in(&BTreeMap::new(), None));
-    }
-
-    #[test]
-    fn test_root_cert_in_ignores_empty_values() {
-        let params = BTreeMap::from([("sslrootcert".to_string(), String::new())]);
-
-        assert!(!root_cert_in(&params, Some(OsStr::new(""))));
-    }
-
-    #[test]
-    fn test_prepare_connection_target_verifies_require_with_root_cert() {
-        let target = match prepare_connection_target(
-            "postgresql://pgmon@localhost/postgres?sslmode=require&sslrootcert=/etc/ssl/ca.crt",
+    fn test_root_cert_setting_uses_last_dsn_value_like_sqlx() {
+        let setting = root_cert_setting(
+            &url("postgresql://localhost/postgres?sslrootcert=/first.crt&ssl-ca=/last.crt"),
             None,
-        ) {
+        );
+        assert_eq!(setting.as_deref(), Some("/last.crt"));
+
+        let setting = root_cert_setting(
+            &url("postgresql://localhost/postgres?sslrootcert=/valid.crt&ssl-root-cert="),
+            None,
+        );
+        assert_eq!(setting.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_root_cert_setting_prefers_dsn_over_environment() {
+        let env = Some("/env.crt".to_string());
+
+        let setting = root_cert_setting(&url("postgresql://localhost/postgres"), env.clone());
+        assert_eq!(setting.as_deref(), Some("/env.crt"));
+
+        let setting = root_cert_setting(&url("postgresql://localhost/postgres?sslrootcert="), env);
+        assert_eq!(setting.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_classify_root_cert_matches_libpq_file_rule() {
+        assert_eq!(classify_root_cert(None), RootCert::Unset);
+        assert_eq!(classify_root_cert(Some("")), RootCert::Unset);
+        assert_eq!(classify_root_cert(Some("system")), RootCert::System);
+        assert_eq!(classify_root_cert(Some(EXISTING_FILE)), RootCert::Available);
+        assert_eq!(
+            classify_root_cert(Some(MISSING_FILE)),
+            RootCert::Missing(MISSING_FILE.to_string())
+        );
+        assert_eq!(
+            classify_root_cert(Some(
+                "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+            )),
+            RootCert::Available
+        );
+    }
+
+    #[test]
+    fn test_prepare_connection_target_verifies_require_with_existing_root_cert() {
+        let dsn = format!(
+            "postgresql://pgmon@localhost/postgres?sslmode=require&sslrootcert={EXISTING_FILE}"
+        );
+        let target = match prepare_connection_target(&dsn, None) {
             Ok(target) => target,
             Err(error) => panic!("URL should parse: {error}"),
         };
@@ -646,10 +759,33 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_connection_target_keeps_require_with_missing_root_cert() {
+        let dsn = format!(
+            "postgresql://pgmon@localhost/postgres?sslmode=require&sslrootcert={MISSING_FILE}"
+        );
+        let target = match prepare_connection_target(&dsn, None) {
+            Ok(target) => target,
+            Err(error) => panic!("URL should parse: {error}"),
+        };
+
+        assert_eq!(target.key.ssl_mode, "Require");
+    }
+
+    #[test]
+    fn test_prepare_connection_target_rejects_system_root_cert() {
+        let result = prepare_connection_target(
+            "postgresql://pgmon@localhost/postgres?sslmode=verify-full&sslrootcert=system",
+            None,
+        );
+
+        assert!(result.is_err_and(|error| error.to_string().contains("sslrootcert=system")));
+    }
+
+    #[test]
     fn test_resolve_ssl_mode_reports_require_upgrade_in_conninfo() {
-        let resolution = match resolve_ssl_mode(
-            "host=localhost dbname=postgres sslmode=require sslrootcert=/etc/ssl/ca.crt",
-        ) {
+        let dsn =
+            format!("host=localhost dbname=postgres sslmode=require sslrootcert='{EXISTING_FILE}'");
+        let resolution = match resolve_ssl_mode(&dsn) {
             Ok(resolution) => resolution,
             Err(error) => panic!("conninfo should parse: {error}"),
         };
@@ -658,21 +794,60 @@ mod tests {
         assert_eq!(resolution.effective, "verify-ca");
         assert!(
             resolution
-                .warning
-                .is_some_and(|warning| warning.contains("verify-full"))
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("use verify-full"))
         );
     }
 
     #[test]
-    fn test_resolve_ssl_mode_has_no_warning_for_verify_full() {
-        let resolution =
-            match resolve_ssl_mode("postgresql://pgmon@localhost/postgres?sslmode=verify-full") {
-                Ok(resolution) => resolution,
-                Err(error) => panic!("URL should parse: {error}"),
-            };
+    fn test_resolve_ssl_mode_warns_about_missing_root_cert() {
+        let dsn = format!(
+            "postgresql://pgmon@localhost/postgres?sslmode=require&sslrootcert={MISSING_FILE}"
+        );
+        let resolution = match resolve_ssl_mode(&dsn) {
+            Ok(resolution) => resolution,
+            Err(error) => panic!("URL should parse: {error}"),
+        };
+
+        assert_eq!(resolution.effective, "require");
+        assert_eq!(
+            resolution.warnings,
+            vec![format!(
+                "sslrootcert {MISSING_FILE} does not exist, so the server certificate is not \
+                 verified (libpq does the same)."
+            )]
+        );
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_warns_that_verify_full_root_cert_is_additive() {
+        let dsn = format!(
+            "postgresql://pgmon@localhost/postgres?sslmode=verify-full&sslrootcert={EXISTING_FILE}"
+        );
+        let resolution = match resolve_ssl_mode(&dsn) {
+            Ok(resolution) => resolution,
+            Err(error) => panic!("URL should parse: {error}"),
+        };
 
         assert_eq!(resolution.effective, "verify-full");
-        assert_eq!(resolution.warning, None);
+        assert!(matches!(
+            resolution.warnings.as_slice(),
+            [warning] if warning.contains("in addition to the")
+        ));
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_has_no_warning_for_verify_full_without_root_cert() {
+        let resolution = match resolve_ssl_mode(
+            "postgresql://pgmon@localhost/postgres?sslmode=verify-full&sslrootcert=",
+        ) {
+            Ok(resolution) => resolution,
+            Err(error) => panic!("URL should parse: {error}"),
+        };
+
+        assert_eq!(resolution.effective, "verify-full");
+        assert!(resolution.warnings.is_empty());
     }
 
     #[test]
