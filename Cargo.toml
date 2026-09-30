@@ -39,6 +39,23 @@ needless_borrow = "deny"
 needless_collect = "deny"
 large_stack_arrays = "deny"
 
+[features]
+default = ["tls-rustls-ring"]
+
+# TLS backends for the PostgreSQL connection. Exactly one must be enabled;
+# build.rs enforces that, so a dependency edit cannot silently produce a binary
+# without TLS support again (https://github.com/nbari/pgmon/issues/6).
+#
+# tls-rustls-ring              - rustls + ring, Mozilla roots bundled into the
+#                                binary (webpki-roots). Self-contained, which is
+#                                what the static musl releases need. Private CAs
+#                                are supplied per-connection with sslrootcert=.
+# tls-rustls-ring-native-roots - rustls + ring, reading the host OS trust store
+#                                instead. Use when an internal CA is already
+#                                installed system-wide.
+tls-rustls-ring = ["sqlx/tls-rustls-ring"]
+tls-rustls-ring-native-roots = ["sqlx/tls-rustls-ring-native-roots"]
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["color", "env", "string"] }

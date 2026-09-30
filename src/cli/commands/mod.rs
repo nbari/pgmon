@@ -31,8 +31,15 @@ fn base_command() -> Command {
         .placeholder(AnsiColor::Green.on_default());
 
     let git_hash = built_info::GIT_COMMIT_HASH.unwrap_or("unknown");
-    let long_version: &'static str =
-        Box::leak(format!("{} - {}", env!("CARGO_PKG_VERSION"), git_hash).into_boxed_str());
+    let long_version: &'static str = Box::leak(
+        format!(
+            "{} - {}\nTLS: {}",
+            env!("CARGO_PKG_VERSION"),
+            git_hash,
+            crate::tls::summary()
+        )
+        .into_boxed_str(),
+    );
 
     Command::new("pgmon")
         .about("A PostgreSQL monitoring TUI")

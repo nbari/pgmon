@@ -121,6 +121,11 @@ fn build_check_config_action(
     }
 
     lines.push(String::new());
+    lines.push("TLS".to_string());
+    lines.push(format!("- Backend: {}", crate::tls::backend()));
+    lines.push(format!("- Root certificates: {}", crate::tls::root_store()));
+
+    lines.push(String::new());
     lines.push(format!("Result: {}", if success { "ok" } else { "failed" }));
 
     Action::CheckConfig {
