@@ -73,6 +73,15 @@ enum RootCert {
     Missing(String),
 }
 
+/// Where the root certificate value sqlx will use comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootCertSetting {
+    /// A root parameter in the DSN, which sqlx always reads as a file path.
+    Dsn(String),
+    /// `PGSSLROOTCERT`, which sqlx also accepts as inline PEM.
+    Env(String),
+}
+
 impl PgClient {
     pub(super) fn from_pool(pool: PgPool, server_version_num: i32) -> Self {
         Self::new(pool, server_version_num)
@@ -200,7 +209,7 @@ fn parse_connect_options(
     })?;
 
     let root_cert = classify_root_cert(
-        root_cert_setting(&parsed, std::env::var("PGSSLROOTCERT").ok()).as_deref(),
+        root_cert_setting(&parsed, std::env::var("PGSSLROOTCERT").ok()).as_ref(),
     );
     if root_cert == RootCert::System {
         return Err(DbError::fatal(format!(
@@ -236,31 +245,37 @@ const fn effective_ssl_mode(requested: PgSslMode, root_cert: &RootCert) -> PgSsl
 /// overwrite the previous value, so a DSN value, even an empty one, hides the
 /// environment. libpq's default `~/.postgresql/root.crt` is not consulted
 /// because sqlx never loads it.
-fn root_cert_setting(url: &Url, env_root_cert: Option<String>) -> Option<String> {
+fn root_cert_setting(url: &Url, env_root_cert: Option<String>) -> Option<RootCertSetting> {
     url.query_pairs()
         .filter(|(key, _)| ROOT_CERT_PARAMS.contains(&key.as_ref()))
         .last()
-        .map(|(_, value)| value.into_owned())
-        .or(env_root_cert)
+        .map(|(_, value)| RootCertSetting::Dsn(value.into_owned()))
+        .or_else(|| env_root_cert.map(RootCertSetting::Env))
 }
 
 /// Classify a root certificate setting as libpq would for `sslmode=require`.
 ///
 /// Empty values count as unset: under `require` sqlx never reads the file, so
-/// they must not trigger the `verify-ca` upgrade. Inline PEM is recognised
-/// with the same heuristic as sqlx's `CertificateInput`.
-fn classify_root_cert(setting: Option<&str>) -> RootCert {
-    let Some(value) = setting.filter(|value| !value.is_empty()) else {
-        return RootCert::Unset;
+/// they must not trigger the `verify-ca` upgrade. Inline PEM counts only from
+/// `PGSSLROOTCERT`, where sqlx applies the PEM heuristic of its
+/// `CertificateInput`; a DSN value is always read as a file path.
+fn classify_root_cert(setting: Option<&RootCertSetting>) -> RootCert {
+    let (value, inline_pem_allowed) = match setting {
+        Some(RootCertSetting::Dsn(value)) => (value.as_str(), false),
+        Some(RootCertSetting::Env(value)) => (value.as_str(), true),
+        None => return RootCert::Unset,
     };
+    if value.is_empty() {
+        return RootCert::Unset;
+    }
     if value == "system" {
         return RootCert::System;
     }
 
     let trimmed = value.trim();
-    if (trimmed.starts_with("-----BEGIN") && trimmed.ends_with("-----"))
-        || Path::new(value).exists()
-    {
+    let inline_pem =
+        inline_pem_allowed && trimmed.starts_with("-----BEGIN") && trimmed.ends_with("-----");
+    if inline_pem || Path::new(value).exists() {
         RootCert::Available
     } else {
         RootCert::Missing(value.to_string())
@@ -563,9 +578,9 @@ fn hash_value(value: &str) -> u64 {
 #[allow(clippy::panic)]
 mod tests {
     use super::{
-        PoolKey, RootCert, classify_root_cert, conninfo_to_url, effective_ssl_mode,
-        parse_conninfo_params, prepare_connection_target, resolve_ssl_mode, root_cert_setting,
-        ssl_mode_name, ssl_mode_warning,
+        PoolKey, RootCert, RootCertSetting, classify_root_cert, conninfo_to_url,
+        effective_ssl_mode, parse_conninfo_params, prepare_connection_target, resolve_ssl_mode,
+        root_cert_setting, ssl_mode_name, ssl_mode_warning,
     };
     use sqlx::postgres::PgSslMode;
     use url::Url;
@@ -706,13 +721,13 @@ mod tests {
             &url("postgresql://localhost/postgres?sslrootcert=/first.crt&ssl-ca=/last.crt"),
             None,
         );
-        assert_eq!(setting.as_deref(), Some("/last.crt"));
+        assert_eq!(setting, Some(RootCertSetting::Dsn("/last.crt".to_string())));
 
         let setting = root_cert_setting(
             &url("postgresql://localhost/postgres?sslrootcert=/valid.crt&ssl-root-cert="),
             None,
         );
-        assert_eq!(setting.as_deref(), Some(""));
+        assert_eq!(setting, Some(RootCertSetting::Dsn(String::new())));
     }
 
     #[test]
@@ -720,27 +735,44 @@ mod tests {
         let env = Some("/env.crt".to_string());
 
         let setting = root_cert_setting(&url("postgresql://localhost/postgres"), env.clone());
-        assert_eq!(setting.as_deref(), Some("/env.crt"));
+        assert_eq!(setting, Some(RootCertSetting::Env("/env.crt".to_string())));
 
         let setting = root_cert_setting(&url("postgresql://localhost/postgres?sslrootcert="), env);
-        assert_eq!(setting.as_deref(), Some(""));
+        assert_eq!(setting, Some(RootCertSetting::Dsn(String::new())));
     }
 
     #[test]
     fn test_classify_root_cert_matches_libpq_file_rule() {
+        let dsn = |value: &str| RootCertSetting::Dsn(value.to_string());
+
         assert_eq!(classify_root_cert(None), RootCert::Unset);
-        assert_eq!(classify_root_cert(Some("")), RootCert::Unset);
-        assert_eq!(classify_root_cert(Some("system")), RootCert::System);
-        assert_eq!(classify_root_cert(Some(EXISTING_FILE)), RootCert::Available);
+        assert_eq!(classify_root_cert(Some(&dsn(""))), RootCert::Unset);
+        assert_eq!(classify_root_cert(Some(&dsn("system"))), RootCert::System);
         assert_eq!(
-            classify_root_cert(Some(MISSING_FILE)),
-            RootCert::Missing(MISSING_FILE.to_string())
+            classify_root_cert(Some(&RootCertSetting::Env("system".to_string()))),
+            RootCert::System
         );
         assert_eq!(
-            classify_root_cert(Some(
-                "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
-            )),
+            classify_root_cert(Some(&dsn(EXISTING_FILE))),
             RootCert::Available
+        );
+        assert_eq!(
+            classify_root_cert(Some(&dsn(MISSING_FILE))),
+            RootCert::Missing(MISSING_FILE.to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_root_cert_accepts_inline_pem_only_from_environment() {
+        let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+        assert_eq!(
+            classify_root_cert(Some(&RootCertSetting::Env(pem.to_string()))),
+            RootCert::Available
+        );
+        assert_eq!(
+            classify_root_cert(Some(&RootCertSetting::Dsn(pem.to_string()))),
+            RootCert::Missing(pem.to_string())
         );
     }
 
