@@ -80,13 +80,21 @@ url = "2.5"
 
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/pgmon", dest = "/usr/local/bin/pgmon", mode = "0755" },
+    { source = "target/release/pgmon", dest = "/usr/bin/pgmon", mode = "0755" },
 ]
 
 [package.metadata.deb]
+section = "database"
+extended-description = """\
+A terminal UI for monitoring PostgreSQL 14 and newer, inspired by pg_activity. \
+It shows live activity, locks, replication, databases, I/O and \
+pg_stat_statements, connects over TLS, and reads its connection from a DSN, a \
+pgmon.yaml alias, PGMON_DSN or ~/.pgpass."""
 assets = [
-    ["target/release/pgmon", "/usr/local/bin/pgmon", "755"],
+    ["target/release/pgmon", "/usr/bin/pgmon", "755"],
 ]
+# Static binary with the Mozilla roots compiled in, so no runtime dependencies
+# (not even ca-certificates) are needed.
 depends = ""
 
 
