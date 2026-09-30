@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 - **TLS Documentation**: The README's `TLS / SSL` section lists how each `sslmode` behaves in pgmon and where it differs from libpq.
 
 ### Changed
+- **Dependencies**: Updated all dependencies to their latest releases, including `pg_query` 6.2 and `dirs` 7.
 - **CI**: Clippy also checks the host-trust-store build, which `--all-features` does not cover on its own.
 
 ## [0.7.1] - 2026-06-30
