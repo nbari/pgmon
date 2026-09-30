@@ -15,6 +15,8 @@ All notable changes to this project will be documented in this file.
 - **Selectable Root Store**: Root certificates come from the bundled Mozilla set (`webpki-roots`) by default, keeping the static musl releases self-contained. Build with `--no-default-features --features tls-rustls-ring-native-roots` to use the host OS trust store instead; with both features enabled, the host trust store wins.
 - **TLS Backend Build Guard**: `pgmon` now fails to compile when no TLS backend feature is enabled, so the dependency configuration that caused #6 cannot silently return. Enabling both features is allowed, so `--all-features` builds keep working.
 - **TLS Documentation**: The README's `TLS / SSL` section lists how each `sslmode` behaves in pgmon and where it differs from libpq.
+- **Security Policy**: `.github/SECURITY.md` explains how to report a vulnerability privately and which releases receive fixes.
+- **Security Audit Workflow**: `cargo audit` checks the dependency tree against the RustSec advisory database daily, on pushes to `main` and `develop`, and on pull requests that change dependencies.
 
 ### Changed
 - **Dependencies**: Updated all dependencies to their latest releases, including `pg_query` 6.2 and `dirs` 7.
