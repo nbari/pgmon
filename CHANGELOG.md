@@ -20,7 +20,7 @@ All notable changes to this project will be documented in this file.
 - **Security Audit Workflow**: `cargo audit` checks the dependency tree against the RustSec advisory database daily, on pushes to `main` and `develop`, and on pull requests that change dependencies.
 
 ### Changed
-- **Dependencies**: Updated all dependencies to their latest releases, including `pg_query` 6.2 and `dirs` 7.
+- **Dependencies**: Updated all dependencies to their latest releases, including `pg_query` 6.2.1 (bundling libpg_query 6.2.5, which fixes an out-of-bounds write in query normalization) and `dirs` 7.
 - **Packages**: The `.deb` and `.rpm` now install `pgmon` to `/usr/bin` instead of `/usr/local/bin`, which is reserved for software installed by hand; upgrading from 0.7.1 removes the old copy. The `.deb` also gets the `database` section and a short description instead of the whole README.
 - **CI**: Clippy also checks the host-trust-store build, which `--all-features` does not cover on its own. GitHub Actions now track their latest major versions (`actions/checkout@v7`, `codecov/codecov-action@v7`, `coverallsapp/github-action@v2`, `softprops/action-gh-release@v3`, `taiki-e/install-action@v2`).
 
