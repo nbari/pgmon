@@ -175,8 +175,9 @@ The TLS connection is made by sqlx, so a few modes behave differently from
 
 | `sslmode` | Encrypted | Server certificate checked | Differences from libpq |
 | --- | --- | --- | --- |
-| `disable`, `allow` | no | no | `allow` never attempts TLS, even when the server requires it |
-| `prefer` (default) | when the server offers TLS | no | a failed TLS handshake fails the connection instead of retrying without TLS |
+| `disable` | no | no | none |
+| `allow` | only when the server rejects the unencrypted attempt | when TLS is used and `sslrootcert` names an existing file | tries without TLS first and, after an authorization error, once more with TLS, as libpq does |
+| `prefer` (default) | when the server offers and accepts TLS | when `sslrootcert` names an existing file | if the TLS attempt fails (handshake, certificate check, or an authorization error), retries once without TLS, as libpq does |
 | `require` | yes | no, unless `sslrootcert` names an existing file | with one, pgmon applies `verify-ca`, as libpq does; a missing file leaves the certificate unverified, also as in libpq |
 | `verify-ca` | yes | chain only, not the hostname | any publicly trusted certificate is accepted, because the compiled-in root store is trusted too (see below) |
 | `verify-full` | yes | chain and hostname | a publicly trusted certificate for the host name is accepted even when `sslrootcert` names a private CA |
@@ -185,6 +186,18 @@ Use `verify-full` whenever the server identity matters.
 
 More differences:
 
+- libpq retries `prefer` and `allow` after any server error; pgmon retries only
+  after an authorization error (SQLSTATE class 28, such as a `pg_hba.conf`
+  rejection), so an unrelated failure like an unknown database is not attempted
+  twice.
+- A connection that drops or resets during the TLS handshake is not retried
+  without TLS, because sqlx reports it exactly like a drop after the handshake,
+  which libpq does not retry either. Handshake failures the server reports,
+  such as an unsupported TLS version, are retried.
+- An `sslrootcert` that exists but cannot be read makes `prefer` connect without
+  TLS and makes `require` and stricter modes fail, as in libpq.
+- `sslcert` and `sslkey` must be given together and both files must exist;
+  libpq ignores a client certificate file that does not exist.
 - `sslrootcert` is trusted **in addition to** the compiled-in root store
   (bundled Mozilla roots, or the host trust store), not instead of it as in
   libpq. sqlx offers no way to trust a private CA alone.
@@ -198,7 +211,8 @@ More differences:
 
 > [!IMPORTANT]
 > The default `sslmode` is `prefer`, which silently falls back to an
-> unencrypted connection when the server does not offer TLS. Set `sslmode` to
+> unencrypted connection when the server does not offer TLS or rejects the TLS
+> attempt, even after a failed certificate check. Set `sslmode` to
 > `require` or higher whenever encryption is not optional — otherwise a
 > misconfigured server yields a plaintext session rather than an error.
 

@@ -9,6 +9,7 @@ use sqlx::{
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
+    fs::File,
     hash::{Hash, Hasher},
     path::Path,
     str::FromStr,
@@ -39,7 +40,19 @@ pub(super) struct PoolKey {
 pub(super) struct PreparedConnectionTarget {
     pub(super) key: PoolKey,
     pub(super) options: PgConnectOptions,
+    /// libpq's one retry with the other TLS choice, for `prefer` and `allow`
+    /// only; see [`tls_fallback_mode`].
+    pub(super) tls_fallback: Option<TlsFallback>,
     pub(super) target_summary: String,
+}
+
+/// The retry libpq makes after a failed `prefer` or `allow` attempt.
+#[derive(Debug, Clone)]
+pub(super) struct TlsFallback {
+    /// The mode whose retry rule applies: `prefer` or `allow`.
+    pub(super) mode: PgSslMode,
+    /// Connection options for the retry.
+    pub(super) options: PgConnectOptions,
 }
 
 /// Connection parameter names sqlx accepts for the TLS root certificate.
@@ -71,6 +84,9 @@ enum RootCert {
     Available,
     /// A path that does not exist.
     Missing(String),
+    /// A path that exists but cannot be read as a file, such as one without
+    /// read permission or a directory.
+    Unreadable(String),
 }
 
 /// Where the root certificate value sqlx will use comes from.
@@ -152,13 +168,20 @@ pub(super) fn prepare_connection_target(
         options = options.database(database);
     }
     let ssl_mode = effective_ssl_mode(options.get_ssl_mode(), &root_cert);
-    options = options.ssl_mode(ssl_mode);
+    let tls_fallback = tls_fallback_mode(ssl_mode, &root_cert).map(|mode| TlsFallback {
+        mode: ssl_mode,
+        options: options.clone().ssl_mode(mode),
+    });
+    options = options.ssl_mode(first_attempt_ssl_mode(ssl_mode, &root_cert));
 
-    let key = build_pool_key(&options, &params, database_override);
+    // Key on the libpq-level mode, not the first attempt's: a `prefer` pool may
+    // have fallen back to plaintext and must never be reused for `verify-ca`.
+    let key = build_pool_key(&options, &params, database_override, ssl_mode);
 
     Ok(PreparedConnectionTarget {
         key,
         options,
+        tls_fallback,
         target_summary: describe_connection_target(dsn),
     })
 }
@@ -233,9 +256,114 @@ fn parse_connect_options(
 /// its CA check. Every other mode is returned unchanged.
 const fn effective_ssl_mode(requested: PgSslMode, root_cert: &RootCert) -> PgSslMode {
     match (requested, root_cert) {
-        (PgSslMode::Require, RootCert::Available) => PgSslMode::VerifyCa,
+        // An unreadable file still exists, so libpq still tries to verify and
+        // then fails; sqlx does the same once it is asked to verify.
+        (PgSslMode::Require, RootCert::Available | RootCert::Unreadable(_)) => PgSslMode::VerifyCa,
         (other, _) => other,
     }
+}
+
+/// The `sslmode` of the first connection attempt for the libpq-level `mode`.
+///
+/// libpq verifies the certificate chain whenever the root CA file exists and
+/// TLS is used, including under `prefer`, where a failed check then falls back
+/// to plaintext through [`tls_fallback_mode`]. sqlx's `prefer` never verifies,
+/// so pgmon starts `prefer` as `verify-ca` in that case.
+///
+/// An existing but unreadable root file makes libpq's TLS setup fail before the
+/// handshake, after which `prefer` continues without TLS; pgmon goes straight
+/// to that outcome, since sqlx would fail reading the file with an I/O error
+/// it cannot tell apart from a network failure.
+const fn first_attempt_ssl_mode(mode: PgSslMode, root_cert: &RootCert) -> PgSslMode {
+    match (mode, root_cert) {
+        (PgSslMode::Prefer, RootCert::Available) => PgSslMode::VerifyCa,
+        (PgSslMode::Prefer, RootCert::Unreadable(_)) => PgSslMode::Disable,
+        (other, _) => other,
+    }
+}
+
+/// The `sslmode` libpq retries with when a connection in `mode` fails.
+///
+/// libpq tries `prefer` with TLS and, if that attempt fails, once more
+/// without it; it tries `allow` without TLS and, if the server rejects that,
+/// once more with it. sqlx does neither, so pgmon performs the retry itself.
+/// The TLS retry for `allow` verifies the chain when a root certificate is
+/// available, as `require` does.
+const fn tls_fallback_mode(mode: PgSslMode, root_cert: &RootCert) -> Option<PgSslMode> {
+    match (mode, root_cert) {
+        (PgSslMode::Allow, _) => Some(effective_ssl_mode(PgSslMode::Require, root_cert)),
+        // With an unreadable root file the first attempt is already without
+        // TLS; see `first_attempt_ssl_mode`.
+        (PgSslMode::Prefer, RootCert::Unreadable(_))
+        | (
+            PgSslMode::Disable | PgSslMode::Require | PgSslMode::VerifyCa | PgSslMode::VerifyFull,
+            _,
+        ) => None,
+        (PgSslMode::Prefer, _) => Some(PgSslMode::Disable),
+    }
+}
+
+/// Whether a connection attempt in `mode` that failed with `error` gets
+/// libpq's retry with the other TLS choice.
+///
+/// `prefer` retries after a TLS failure, including a server without TLS or a
+/// failed certificate check when its first attempt verifies the chain, or an
+/// authorization error, which is how `pg_hba.conf` rules that treat TLS and
+/// plaintext differently show up.
+/// `allow` retries only after an authorization error, since its first attempt
+/// does not use TLS. Network errors before any TLS exchange, such as a refused
+/// connection, and unrelated server errors, such as an unknown database, are
+/// not retried: the other TLS choice cannot change their outcome.
+pub(super) fn retries_with_tls_fallback(mode: PgSslMode, error: &sqlx::Error) -> bool {
+    match mode {
+        PgSslMode::Prefer => is_tls_failure(error) || is_authorization_failure(error),
+        PgSslMode::Allow => is_authorization_failure(error),
+        PgSslMode::Disable | PgSslMode::Require | PgSslMode::VerifyCa | PgSslMode::VerifyFull => {
+            false
+        }
+    }
+}
+
+/// Whether `error` came from setting up TLS rather than from the network or
+/// the server.
+///
+/// sqlx reports TLS setup problems, including a server without TLS, as
+/// `Error::Tls`, and rustls reports a failed handshake, such as a TLS alert from
+/// the server or a failed certificate check, as `InvalidData`. A dropped or
+/// reset connection is not counted: rustls returns the same bare error for one
+/// during the handshake and one after it, and libpq does not retry the latter.
+fn is_tls_failure(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Tls(_) => true,
+        sqlx::Error::Io(io_error) => io_error.kind() == std::io::ErrorKind::InvalidData,
+        _ => false,
+    }
+}
+
+/// Whether the server rejected the session with SQLSTATE class 28 (invalid
+/// authorization), which covers `pg_hba.conf` rejections and failed password or
+/// certificate authentication.
+fn is_authorization_failure(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(database_error) => database_error
+            .code()
+            .is_some_and(|code| code.starts_with("28")),
+        _ => false,
+    }
+}
+
+/// Note appended to the final error when the TLS retry also failed, so both
+/// attempts are visible.
+pub(super) fn tls_fallback_detail(
+    requested: PgSslMode,
+    fallback: PgSslMode,
+    first_error: &sqlx::Error,
+) -> String {
+    format!(
+        "retried with sslmode={} after sslmode={} failed: {first_error}",
+        ssl_mode_name(fallback),
+        ssl_mode_name(requested)
+    )
 }
 
 /// The root certificate value sqlx will use: the last root parameter in the
@@ -255,6 +383,9 @@ fn root_cert_setting(url: &Url, env_root_cert: Option<String>) -> Option<RootCer
 
 /// Classify a root certificate setting as libpq would for `sslmode=require`.
 ///
+/// libpq decides with `stat`, so a path that exists counts even when it cannot
+/// be read; such a path is kept apart as `Unreadable`.
+///
 /// Empty values count as unset: under `require` sqlx never reads the file, so
 /// they must not trigger the `verify-ca` upgrade. Inline PEM counts only from
 /// `PGSSLROOTCERT`, where sqlx applies the PEM heuristic of its
@@ -273,12 +404,15 @@ fn classify_root_cert(setting: Option<&RootCertSetting>) -> RootCert {
     }
 
     let trimmed = value.trim();
-    let inline_pem =
-        inline_pem_allowed && trimmed.starts_with("-----BEGIN") && trimmed.ends_with("-----");
-    if inline_pem || Path::new(value).exists() {
-        RootCert::Available
-    } else {
-        RootCert::Missing(value.to_string())
+    if inline_pem_allowed && trimmed.starts_with("-----BEGIN") && trimmed.ends_with("-----") {
+        return RootCert::Available;
+    }
+
+    let path = Path::new(value);
+    match path.metadata() {
+        Err(_) => RootCert::Missing(value.to_string()),
+        Ok(metadata) if metadata.is_file() && File::open(path).is_ok() => RootCert::Available,
+        Ok(_) => RootCert::Unreadable(value.to_string()),
     }
 }
 
@@ -296,17 +430,22 @@ const fn ssl_mode_name(mode: PgSslMode) -> &'static str {
 
 /// Explain how `mode`, as sqlx implements it, can leave a session exposed.
 ///
-/// sqlx never attempts TLS under `allow`, unlike libpq, and its `verify-ca`
-/// trusts the compiled-in root store in addition to `sslrootcert`.
+/// `allow` and `prefer` fall back between TLS and plaintext as in libpq (see
+/// [`tls_fallback_mode`]), and sqlx's `verify-ca` trusts the compiled-in root
+/// store in addition to `sslrootcert`.
 fn ssl_mode_warning(mode: PgSslMode) -> Option<String> {
     match mode {
-        PgSslMode::Disable | PgSslMode::Allow => Some(format!(
-            "sslmode={} never uses TLS; the connection is unencrypted.",
-            ssl_mode_name(mode)
-        )),
+        PgSslMode::Disable => {
+            Some("sslmode=disable never uses TLS; the connection is unencrypted.".to_string())
+        }
+        PgSslMode::Allow => Some(
+            "sslmode=allow connects unencrypted and uses TLS only if the server rejects \
+             that; use require or stricter when encryption is mandatory."
+                .to_string(),
+        ),
         PgSslMode::Prefer => Some(
-            "sslmode=prefer connects unencrypted when the server does not offer TLS; \
-             use require or stricter when encryption is mandatory."
+            "sslmode=prefer connects unencrypted when the server does not offer TLS or \
+             rejects the TLS attempt; use require or stricter when encryption is mandatory."
                 .to_string(),
         ),
         PgSslMode::VerifyCa => Some(format!(
@@ -326,6 +465,12 @@ fn ssl_mode_warning(mode: PgSslMode) -> Option<String> {
 /// [`ssl_mode_warning`].
 fn root_cert_warning(mode: PgSslMode, root_cert: &RootCert) -> Option<String> {
     match (mode, root_cert) {
+        (PgSslMode::Prefer, RootCert::Available) => Some(
+            "sslrootcert verifies the certificate chain when TLS is used, but a failed \
+             check falls back to an unencrypted connection, as in libpq; use verify-full \
+             to require a verified server."
+                .to_string(),
+        ),
         (PgSslMode::VerifyFull, RootCert::Available) => Some(format!(
             "sslrootcert is trusted in addition to the {}, not instead of it as in \
              libpq, so a certificate for this host from any of those CAs is also accepted.",
@@ -337,6 +482,17 @@ fn root_cert_warning(mode: PgSslMode, root_cert: &RootCert) -> Option<String> {
         )),
         (PgSslMode::VerifyCa | PgSslMode::VerifyFull, RootCert::Missing(path)) => Some(format!(
             "sslrootcert {path} does not exist, so the connection will fail until it does."
+        )),
+        (PgSslMode::Prefer, RootCert::Unreadable(path)) => Some(format!(
+            "sslrootcert {path} cannot be read, so pgmon connects without TLS, as libpq \
+             does when it cannot set up TLS."
+        )),
+        (PgSslMode::Allow, RootCert::Unreadable(path)) => Some(format!(
+            "sslrootcert {path} cannot be read, so the TLS retry after a rejected \
+             unencrypted attempt will fail."
+        )),
+        (PgSslMode::VerifyCa | PgSslMode::VerifyFull, RootCert::Unreadable(path)) => Some(format!(
+            "sslrootcert {path} cannot be read, so the connection will fail until it can."
         )),
         _ => None,
     }
@@ -393,6 +549,7 @@ fn build_pool_key(
     options: &PgConnectOptions,
     params: &BTreeMap<String, String>,
     database_override: Option<&str>,
+    ssl_mode: PgSslMode,
 ) -> PoolKey {
     let socket = options
         .get_socket()
@@ -413,7 +570,7 @@ fn build_pool_key(
         database,
         user,
         socket,
-        ssl_mode: format!("{:?}", options.get_ssl_mode()),
+        ssl_mode: format!("{ssl_mode:?}"),
         ssl_root_cert: params.get("sslrootcert").cloned(),
         ssl_cert: params.get("sslcert").cloned(),
         ssl_key: params.get("sslkey").cloned(),
@@ -579,16 +736,67 @@ fn hash_value(value: &str) -> u64 {
 mod tests {
     use super::{
         PoolKey, RootCert, RootCertSetting, classify_root_cert, conninfo_to_url,
-        effective_ssl_mode, parse_conninfo_params, prepare_connection_target, resolve_ssl_mode,
-        root_cert_setting, ssl_mode_name, ssl_mode_warning,
+        effective_ssl_mode, first_attempt_ssl_mode, parse_conninfo_params,
+        prepare_connection_target, resolve_ssl_mode, retries_with_tls_fallback, root_cert_setting,
+        ssl_mode_name, ssl_mode_warning, tls_fallback_detail, tls_fallback_mode,
     };
     use sqlx::postgres::PgSslMode;
+    use std::{borrow::Cow, error::Error as StdError, fmt, io};
     use url::Url;
+
+    /// A server error carrying only a SQLSTATE, for the retry decision tests.
+    #[derive(Debug)]
+    struct ServerError(&'static str);
+
+    impl fmt::Display for ServerError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "server error {}", self.0)
+        }
+    }
+
+    impl StdError for ServerError {}
+
+    impl sqlx::error::DatabaseError for ServerError {
+        fn message(&self) -> &'static str {
+            "server error"
+        }
+
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.0))
+        }
+
+        fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn server_error(code: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(ServerError(code)))
+    }
+
+    fn io_error(kind: io::ErrorKind) -> sqlx::Error {
+        sqlx::Error::Io(io::Error::from(kind))
+    }
 
     /// A root certificate path that exists whenever the tests run.
     const EXISTING_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
     /// A root certificate path that never exists.
     const MISSING_FILE: &str = "/nonexistent/pgmon-test-ca.crt";
+    /// A root certificate path that exists but is not a readable file, whatever
+    /// user runs the tests.
+    const EXISTING_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
 
     fn url(value: &str) -> Url {
         match Url::parse(value) {
@@ -760,6 +968,10 @@ mod tests {
             classify_root_cert(Some(&dsn(MISSING_FILE))),
             RootCert::Missing(MISSING_FILE.to_string())
         );
+        assert_eq!(
+            classify_root_cert(Some(&dsn(EXISTING_DIR))),
+            RootCert::Unreadable(EXISTING_DIR.to_string())
+        );
     }
 
     #[test]
@@ -897,5 +1109,238 @@ mod tests {
     #[test]
     fn test_resolve_ssl_mode_rejects_invalid_sslmode() {
         assert!(resolve_ssl_mode("postgresql://pgmon@localhost/postgres?sslmode=bogus").is_err());
+    }
+
+    #[test]
+    fn test_tls_fallback_mode_matches_libpq() {
+        let name = |mode: Option<PgSslMode>| mode.map(ssl_mode_name);
+
+        assert_eq!(
+            name(tls_fallback_mode(PgSslMode::Prefer, &RootCert::Unset)),
+            Some("disable")
+        );
+        assert_eq!(
+            name(tls_fallback_mode(PgSslMode::Allow, &RootCert::Unset)),
+            Some("require")
+        );
+        assert_eq!(
+            name(tls_fallback_mode(PgSslMode::Allow, &RootCert::Available)),
+            Some("verify-ca")
+        );
+        for mode in [
+            PgSslMode::Disable,
+            PgSslMode::Require,
+            PgSslMode::VerifyCa,
+            PgSslMode::VerifyFull,
+        ] {
+            assert_eq!(name(tls_fallback_mode(mode, &RootCert::Available)), None);
+        }
+    }
+
+    #[test]
+    fn test_prefer_retries_after_tls_and_authorization_failures() {
+        for error in [
+            sqlx::Error::Tls("server does not support TLS".into()),
+            io_error(io::ErrorKind::InvalidData),
+            server_error("28000"),
+            server_error("28P01"),
+        ] {
+            assert!(
+                retries_with_tls_fallback(PgSslMode::Prefer, &error),
+                "prefer should retry after {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prefer_does_not_retry_network_or_unrelated_errors() {
+        for error in [
+            io_error(io::ErrorKind::ConnectionRefused),
+            io_error(io::ErrorKind::TimedOut),
+            // Indistinguishable from a drop after the handshake, which libpq
+            // does not retry.
+            io_error(io::ErrorKind::UnexpectedEof),
+            io_error(io::ErrorKind::ConnectionReset),
+            io_error(io::ErrorKind::ConnectionAborted),
+            io_error(io::ErrorKind::PermissionDenied),
+            server_error("3D000"),
+            server_error("53300"),
+            sqlx::Error::PoolTimedOut,
+        ] {
+            assert!(
+                !retries_with_tls_fallback(PgSslMode::Prefer, &error),
+                "prefer should not retry after {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_allow_retries_only_after_authorization_failures() {
+        assert!(retries_with_tls_fallback(
+            PgSslMode::Allow,
+            &server_error("28000")
+        ));
+        assert!(!retries_with_tls_fallback(
+            PgSslMode::Allow,
+            &io_error(io::ErrorKind::InvalidData)
+        ));
+        assert!(!retries_with_tls_fallback(
+            PgSslMode::Allow,
+            &server_error("3D000")
+        ));
+    }
+
+    #[test]
+    fn test_strict_modes_never_retry() {
+        for mode in [
+            PgSslMode::Disable,
+            PgSslMode::Require,
+            PgSslMode::VerifyCa,
+            PgSslMode::VerifyFull,
+        ] {
+            assert!(!retries_with_tls_fallback(mode, &server_error("28000")));
+            assert!(!retries_with_tls_fallback(
+                mode,
+                &io_error(io::ErrorKind::InvalidData)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_prepare_connection_target_builds_tls_fallback_options() {
+        let fallback_mode = |dsn: &str| match prepare_connection_target(dsn, None) {
+            Ok(target) => target
+                .tls_fallback
+                .map(|fallback| ssl_mode_name(fallback.options.get_ssl_mode())),
+            Err(error) => panic!("URL should parse: {error}"),
+        };
+
+        assert_eq!(
+            fallback_mode("postgresql://pgmon@localhost/postgres?sslmode=prefer"),
+            Some("disable")
+        );
+        assert_eq!(
+            fallback_mode(&format!(
+                "postgresql://pgmon@localhost/postgres?sslmode=allow&sslrootcert={EXISTING_FILE}"
+            )),
+            Some("verify-ca")
+        );
+        assert_eq!(
+            fallback_mode("postgresql://pgmon@localhost/postgres?sslmode=require"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_tls_fallback_detail_names_both_attempts() {
+        let detail = tls_fallback_detail(
+            PgSslMode::Prefer,
+            PgSslMode::Disable,
+            &server_error("28000"),
+        );
+
+        assert_eq!(
+            detail,
+            "retried with sslmode=disable after sslmode=prefer failed: error returned from \
+             database: server error 28000"
+        );
+    }
+
+    #[test]
+    fn test_prefer_with_root_cert_verifies_first_and_falls_back_to_plaintext() {
+        let dsn = format!(
+            "postgresql://pgmon@localhost/postgres?sslmode=prefer&sslrootcert={EXISTING_FILE}"
+        );
+        let target = match prepare_connection_target(&dsn, None) {
+            Ok(target) => target,
+            Err(error) => panic!("URL should parse: {error}"),
+        };
+
+        assert_eq!(ssl_mode_name(target.options.get_ssl_mode()), "verify-ca");
+        assert_eq!(target.key.ssl_mode, "Prefer");
+        let Some(fallback) = target.tls_fallback else {
+            panic!("prefer should have a TLS fallback");
+        };
+        assert_eq!(ssl_mode_name(fallback.mode), "prefer");
+        assert_eq!(ssl_mode_name(fallback.options.get_ssl_mode()), "disable");
+    }
+
+    #[test]
+    fn test_pool_key_separates_prefer_from_verify_ca() {
+        let key = |sslmode: &str| {
+            let dsn = format!(
+                "postgresql://pgmon@localhost/postgres?sslmode={sslmode}&sslrootcert={EXISTING_FILE}"
+            );
+            match prepare_connection_target(&dsn, None) {
+                Ok(target) => target.key,
+                Err(error) => panic!("URL should parse: {error}"),
+            }
+        };
+
+        assert_ne!(key("prefer"), key("verify-ca"));
+        assert_eq!(key("require"), key("verify-ca"));
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_warns_that_prefer_verification_can_fall_back() {
+        let dsn = format!(
+            "postgresql://pgmon@localhost/postgres?sslmode=prefer&sslrootcert={EXISTING_FILE}"
+        );
+        let resolution = match resolve_ssl_mode(&dsn) {
+            Ok(resolution) => resolution,
+            Err(error) => panic!("URL should parse: {error}"),
+        };
+
+        assert_eq!(resolution.effective, "prefer");
+        assert!(
+            resolution
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("a failed check falls back"))
+        );
+    }
+
+    #[test]
+    fn test_unreadable_root_cert_follows_libpq_failed_tls_setup() {
+        let unreadable = RootCert::Unreadable(EXISTING_DIR.to_string());
+        let name = |mode: Option<PgSslMode>| mode.map(ssl_mode_name);
+
+        // prefer: TLS setup fails, so libpq ends up without TLS and no retry.
+        assert_eq!(
+            ssl_mode_name(first_attempt_ssl_mode(PgSslMode::Prefer, &unreadable)),
+            "disable"
+        );
+        assert_eq!(
+            name(tls_fallback_mode(PgSslMode::Prefer, &unreadable)),
+            None
+        );
+        // require and allow's TLS retry still try to verify, and fail.
+        assert_eq!(
+            ssl_mode_name(effective_ssl_mode(PgSslMode::Require, &unreadable)),
+            "verify-ca"
+        );
+        assert_eq!(
+            name(tls_fallback_mode(PgSslMode::Allow, &unreadable)),
+            Some("verify-ca")
+        );
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_warns_about_unreadable_root_cert() {
+        let dsn = format!(
+            "postgresql://pgmon@localhost/postgres?sslmode=prefer&sslrootcert={EXISTING_DIR}"
+        );
+        let resolution = match resolve_ssl_mode(&dsn) {
+            Ok(resolution) => resolution,
+            Err(error) => panic!("URL should parse: {error}"),
+        };
+
+        assert_eq!(resolution.effective, "prefer");
+        assert!(
+            resolution
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cannot be read, so pgmon connects without TLS"))
+        );
     }
 }

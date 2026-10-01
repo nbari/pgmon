@@ -32,4 +32,14 @@ impl DbError {
     pub(crate) fn fatal(message: impl Into<String>) -> Self {
         Self::Fatal(message.into())
     }
+
+    /// Append `detail` to the message of a transient or fatal error; other
+    /// variants carry no message and are returned unchanged.
+    pub(crate) fn with_detail(self, detail: &str) -> Self {
+        match self {
+            Self::Transient(message) => Self::Transient(format!("{message} ({detail})")),
+            Self::Fatal(message) => Self::Fatal(format!("{message} ({detail})")),
+            other @ (Self::Timeout | Self::CapabilityMissing(_)) => other,
+        }
+    }
 }
