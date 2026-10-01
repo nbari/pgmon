@@ -27,6 +27,11 @@ pub(super) struct PoolKey {
     pub(super) user: String,
     pub(super) socket: Option<String>,
     pub(super) ssl_mode: String,
+    /// The first attempt's `sslmode` and the TLS retry's, if any. They depend on
+    /// whether the root certificate file exists right now, so a file that
+    /// appears or disappears while pgmon runs leads to a new pool rather than
+    /// one connected under the old decision.
+    pub(super) ssl_attempts: String,
     pub(super) ssl_root_cert: Option<String>,
     pub(super) ssl_cert: Option<String>,
     pub(super) ssl_key: Option<String>,
@@ -174,9 +179,17 @@ pub(super) fn prepare_connection_target(
     });
     options = options.ssl_mode(first_attempt_ssl_mode(ssl_mode, &root_cert));
 
-    // Key on the libpq-level mode, not the first attempt's: a `prefer` pool may
+    // Key on the libpq-level mode as well as the attempts: a `prefer` pool may
     // have fallen back to plaintext and must never be reused for `verify-ca`.
-    let key = build_pool_key(&options, &params, database_override, ssl_mode);
+    let key = build_pool_key(
+        &options,
+        &params,
+        database_override,
+        ssl_mode,
+        tls_fallback
+            .as_ref()
+            .map(|fallback| fallback.options.get_ssl_mode()),
+    );
 
     Ok(PreparedConnectionTarget {
         key,
@@ -550,6 +563,7 @@ fn build_pool_key(
     params: &BTreeMap<String, String>,
     database_override: Option<&str>,
     ssl_mode: PgSslMode,
+    fallback_ssl_mode: Option<PgSslMode>,
 ) -> PoolKey {
     let socket = options
         .get_socket()
@@ -571,6 +585,7 @@ fn build_pool_key(
         user,
         socket,
         ssl_mode: format!("{ssl_mode:?}"),
+        ssl_attempts: format!("{:?} then {fallback_ssl_mode:?}", options.get_ssl_mode()),
         ssl_root_cert: params.get("sslrootcert").cloned(),
         ssl_cert: params.get("sslcert").cloned(),
         ssl_key: params.get("sslkey").cloned(),
@@ -882,6 +897,7 @@ mod tests {
                 user: "pgmon".to_string(),
                 socket: Some("/var/run/postgresql".to_string()),
                 ssl_mode: "Disable".to_string(),
+                ssl_attempts: "Disable then None".to_string(),
                 ssl_root_cert: None,
                 ssl_cert: None,
                 ssl_key: None,
@@ -1342,5 +1358,33 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("cannot be read, so pgmon connects without TLS"))
         );
+    }
+
+    #[test]
+    fn test_pool_key_changes_when_root_cert_appears() {
+        let root_cert = std::env::temp_dir().join(format!(
+            "pgmon-test-root-cert-appears-{}.crt",
+            std::process::id()
+        ));
+        let dsn = format!(
+            "postgresql://pgmon@localhost/postgres?sslmode=prefer&sslrootcert={}",
+            root_cert.display()
+        );
+        let key = || match prepare_connection_target(&dsn, None) {
+            Ok(target) => target.key,
+            Err(error) => panic!("URL should parse: {error}"),
+        };
+
+        let _ = std::fs::remove_file(&root_cert);
+        let before = key();
+        if let Err(error) = std::fs::write(&root_cert, "not checked by this test") {
+            panic!("test root certificate should be writable: {error}");
+        }
+        let after = key();
+        let _ = std::fs::remove_file(&root_cert);
+
+        assert_eq!(before.ssl_attempts, "Prefer then Some(Disable)");
+        assert_eq!(after.ssl_attempts, "VerifyCa then Some(Disable)");
+        assert_ne!(before, after);
     }
 }

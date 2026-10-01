@@ -177,7 +177,7 @@ The TLS connection is made by sqlx, so a few modes behave differently from
 | --- | --- | --- | --- |
 | `disable` | no | no | none |
 | `allow` | only when the server rejects the unencrypted attempt | when TLS is used and `sslrootcert` names an existing file | tries without TLS first and, after an authorization error, once more with TLS, as libpq does |
-| `prefer` (default) | when the server offers and accepts TLS | when `sslrootcert` names an existing file | if the TLS attempt fails (handshake, certificate check, or an authorization error), retries once without TLS, as libpq does |
+| `prefer` (default) | when the server offers and accepts TLS | when `sslrootcert` names an existing file | after a TLS error (a server alert or a failed certificate check) or an authorization error, retries once without TLS, like libpq except for the cases listed below; a server that does not offer TLS is used without it |
 | `require` | yes | no, unless `sslrootcert` names an existing file | with one, pgmon applies `verify-ca`, as libpq does; a missing file leaves the certificate unverified, also as in libpq |
 | `verify-ca` | yes | chain only, not the hostname | any publicly trusted certificate is accepted, because the compiled-in root store is trusted too (see below) |
 | `verify-full` | yes | chain and hostname | a publicly trusted certificate for the host name is accepted even when `sslrootcert` names a private CA |
@@ -190,10 +190,12 @@ More differences:
   after an authorization error (SQLSTATE class 28, such as a `pg_hba.conf`
   rejection), so an unrelated failure like an unknown database is not attempted
   twice.
-- A connection that drops or resets during the TLS handshake is not retried
-  without TLS, because sqlx reports it exactly like a drop after the handshake,
-  which libpq does not retry either. Handshake failures the server reports,
-  such as an unsupported TLS version, are retried.
+- rustls reports TLS errors the same way during and after the handshake, so
+  pgmon cannot tell which phase failed. A connection that drops or resets is
+  never retried without TLS (libpq retries one that drops during the
+  handshake), and a TLS protocol error is always retried (libpq fails on one
+  after the handshake, such as a corrupt record). Handshake failures the server
+  reports, such as an unsupported TLS version, are retried as in libpq.
 - An `sslrootcert` that exists but cannot be read makes `prefer` connect without
   TLS and makes `require` and stricter modes fail, as in libpq.
 - `sslcert` and `sslkey` must be given together and both files must exist;
