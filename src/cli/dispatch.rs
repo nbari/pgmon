@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn test_handler_resolves_alias_from_config() {
         let matches = commands::new().get_matches_from(vec!["pgmon", "prod"]);
-        let config_result: Result<Config, _> = serde_yaml::from_str(
+        let config_result: Result<Config, _> = serde_saphyr::from_str(
             "connections:\n  prod:\n    dsn: postgresql://prod.example.com/postgres\n",
         );
         assert!(config_result.is_ok());
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn test_handler_uses_default_connection_when_alias_is_missing() {
         let matches = commands::new().get_matches_from(vec!["pgmon"]);
-        let config_result: Result<Config, _> = serde_yaml::from_str(
+        let config_result: Result<Config, _> = serde_saphyr::from_str(
             "default_connection: local\nconnections:\n  local:\n    dsn: postgresql://localhost/postgres\n",
         );
         assert!(config_result.is_ok());
@@ -367,7 +367,7 @@ mod tests {
     fn test_handler_rejects_unknown_default_connection() {
         let matches = commands::new().get_matches_from(vec!["pgmon"]);
         let config_result: Result<Config, _> =
-            serde_yaml::from_str("default_connection: missing\n");
+            serde_saphyr::from_str("default_connection: missing\n");
         assert!(config_result.is_ok());
         let Ok(config) = config_result else {
             panic!("config should parse");
@@ -394,7 +394,7 @@ mod tests {
             "postgresql://localhost/postgres",
         ]);
         let config_result: Result<Config, _> =
-            serde_yaml::from_str("default_connection: missing\n");
+            serde_saphyr::from_str("default_connection: missing\n");
         assert!(config_result.is_ok());
         let Ok(config) = config_result else {
             panic!("config should parse");
@@ -473,7 +473,7 @@ mod tests {
             "postgresql://localhost/postgres",
         ]);
         let config_result: Result<Config, _> =
-            serde_yaml::from_str("ui:\n  header_border_color: not-a-color\n");
+            serde_saphyr::from_str("ui:\n  header_border_color: not-a-color\n");
         assert!(config_result.is_ok());
         let Ok(config) = config_result else {
             panic!("config should parse");

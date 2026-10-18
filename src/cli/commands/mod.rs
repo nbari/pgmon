@@ -146,8 +146,8 @@ fn verbose_arg() -> Arg {
         .short('v')
         .long("verbose")
         .action(ArgAction::Count)
-        .help("Increase logging verbosity")
-        .long_help("Increase the level of detail in the logs. Can be used multiple times (-vv, -vvv) to increase verbosity from INFO to DEBUG or TRACE.")
+        .help("Increase logging verbosity (written to a file)")
+        .long_help("Increase logging verbosity without writing logs to the terminal. Can be used multiple times (-vv, -vvv) to raise the level from INFO to DEBUG or TRACE. Logs are appended to PGMON_LOG, or to pgmon/pgmon.log under the user state directory. The path is printed when pgmon exits. RUST_LOG still overrides the level.")
 }
 
 fn check_config_command() -> Command {

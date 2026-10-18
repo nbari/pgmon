@@ -294,7 +294,7 @@ impl Config {
     fn load_path(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let raw: RawConfig = serde_yaml::from_str(&content)
+        let raw: RawConfig = serde_saphyr::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
         raw.into_config()
     }
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn test_config_deserialization_applies_defaults() {
-        let raw_result = serde_yaml::from_str("ui:\n  show_controls: false\n");
+        let raw_result = serde_saphyr::from_str("ui:\n  show_controls: false\n");
         assert!(raw_result.is_ok());
         let Ok(raw): Result<RawConfig, _> = raw_result else {
             panic!("raw config should parse");
@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn test_get_view_color_returns_configured_color() {
         let raw_result =
-            serde_yaml::from_str("views:\n  settings:\n    colors:\n      value: blue\n");
+            serde_saphyr::from_str("views:\n  settings:\n    colors:\n      value: blue\n");
         assert!(raw_result.is_ok());
         let Ok(raw): Result<RawConfig, _> = raw_result else {
             panic!("raw config should parse");
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_config_deserialization_supports_connection_aliases() {
-        let raw_result = serde_yaml::from_str(
+        let raw_result = serde_saphyr::from_str(
             "connections:\n  prod:\n    dsn: postgresql://prod.example.com/postgres\n",
         );
         assert!(raw_result.is_ok());
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_connection_aliases_returns_sorted_aliases() {
-        let raw_result = serde_yaml::from_str(
+        let raw_result = serde_saphyr::from_str(
             "connections:\n  staging:\n    dsn: postgres://staging\n  prod:\n    dsn: postgres://prod\n",
         );
         assert!(raw_result.is_ok());
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_config_deserialization_supports_default_connection() {
-        let raw_result = serde_yaml::from_str(
+        let raw_result = serde_saphyr::from_str(
             "default_connection: local\nconnections:\n  local:\n    dsn: postgresql://localhost/postgres\n",
         );
         assert!(raw_result.is_ok());
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn test_theme_merges_muted_hex_colors() {
-        let raw_result = serde_yaml::from_str(
+        let raw_result = serde_saphyr::from_str(
             "theme: sky\nthemes:\n  sky:\n    ui:\n      header_border_color: \"#8fa1b3\"\n      footer_border_color: \"#93a8a3\"\n    views:\n      settings:\n        colors:\n          value: \"#b7a8ba\"\n",
         );
         assert!(raw_result.is_ok());
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn test_top_level_ui_and_view_colors_override_theme() {
-        let raw_result = serde_yaml::from_str(
+        let raw_result = serde_saphyr::from_str(
             "theme: sky\nthemes:\n  sky:\n    ui:\n      header_border_color: \"#8fa1b3\"\n    views:\n      settings:\n        colors:\n          value: \"#b7a8ba\"\nui:\n  header_border_color: yellow\nviews:\n  settings:\n    colors:\n      value: blue\n",
         );
         assert!(raw_result.is_ok());
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_theme_names_returns_sorted_theme_names() {
-        let raw_result = serde_yaml::from_str(
+        let raw_result = serde_saphyr::from_str(
             "themes:\n  mint:\n    ui:\n      header_border_color: \"#9db39d\"\n  sky:\n    ui:\n      header_border_color: \"#8fa1b3\"\n",
         );
         assert!(raw_result.is_ok());
@@ -703,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_apply_theme_by_name_reapplies_overrides() {
-        let raw_result = serde_yaml::from_str(
+        let raw_result = serde_saphyr::from_str(
             "theme: sky\nthemes:\n  sky:\n    ui:\n      header_border_color: \"#8fa1b3\"\n      footer_border_color: \"#93a8a3\"\n    views:\n      settings:\n        colors:\n          value: \"#b7a8ba\"\n  mint:\n    ui:\n      header_border_color: \"#9db39d\"\n      footer_border_color: \"#9eb1ac\"\n    views:\n      settings:\n        colors:\n          value: \"#adb4c7\"\nui:\n  footer_border_color: yellow\nviews:\n  settings:\n    colors:\n      value: blue\n",
         );
         assert!(raw_result.is_ok());
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn test_builtin_theme_available_without_yaml_theme_block() {
-        let raw_result = serde_yaml::from_str("theme: mint\n");
+        let raw_result = serde_saphyr::from_str("theme: mint\n");
         assert!(raw_result.is_ok());
         let Ok(raw): Result<RawConfig, _> = raw_result else {
             panic!("raw config should parse");
@@ -750,7 +750,7 @@ mod tests {
 
     #[test]
     fn test_yaml_theme_overrides_builtin_theme_name() {
-        let raw_result = serde_yaml::from_str(
+        let raw_result = serde_saphyr::from_str(
             "theme: mint\nthemes:\n  mint:\n    ui:\n      header_border_color: \"#111111\"\n      footer_border_color: \"#222222\"\n",
         );
         assert!(raw_result.is_ok());
@@ -771,7 +771,7 @@ mod tests {
 
     #[test]
     fn test_unknown_theme_returns_error() {
-        let raw_result = serde_yaml::from_str("theme: missing\n");
+        let raw_result = serde_saphyr::from_str("theme: missing\n");
         assert!(raw_result.is_ok());
         let Ok(raw): Result<RawConfig, _> = raw_result else {
             panic!("raw config should parse");

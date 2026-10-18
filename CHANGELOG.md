@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-10-18
+
+### Fixed
+- **Verbose Logging**: `-v` no longer prints tracing output over the TUI ([#8](https://github.com/nbari/pgmon/issues/8)). Logs are appended to `PGMON_LOG` or to `pgmon/pgmon.log` in the user state directory, and the path is printed when `pgmon` exits. Quiet TUI runs do not write tracing output to the terminal either.
+
+### Changed
+- **YAML Config Parser**: Replaced deprecated `serde_yaml` (`unsafe-libyaml`) with `serde-saphyr` 2 for loading `pgmon.yaml` and `pgmon.yml`.
+- **Dependencies**: Refreshed `Cargo.lock` to the latest versions compatible with Rust 1.99. Direct dependency requirements were already current.
+
 ## [0.7.2] - 2026-09-30
 
 ### Fixed

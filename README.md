@@ -142,7 +142,7 @@ When themes are available, press `T` inside the TUI to switch between them at ru
 - `-n, --top-n <u32>`: Rows to show, 0 = all (default: 0)
 - `--home-view <activity|statements>`: Initial view
 - `-s, --sort <total_time|mean_time|calls>`: Statements sort column (default: `total_time`)
-- `-v`: Verbose logging
+- `-v`: Verbose logging, written to a file so it does not replace the TUI. The path is printed on exit (`PGMON_LOG`, or `~/.local/state/pgmon/pgmon.log` on Linux). Repeat for more detail (`-vv`, `-vvv`).
 
 Connection precedence is: explicit `--dsn`, then positional alias from `pgmon.yaml` or `pgmon.yml`, then `default_connection`, then `PGMON_DSN`, then the first usable entry in `PGPASSFILE` or `~/.pgpass`. If no aliases are configured at all, the resolution simply continues to `PGMON_DSN` and `.pgpass`.
 

@@ -1223,7 +1223,10 @@ mod tests {
             activity_summary_rows(3, 2),
             vec![vec![Some(0), Some(1)], vec![Some(2), None]]
         );
-        assert!(activity_summary_rows(0, 2).is_empty());
+        assert_eq!(
+            activity_summary_rows(0, 2),
+            Vec::<Vec<Option<usize>>>::new()
+        );
     }
 
     #[test]

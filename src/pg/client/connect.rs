@@ -1107,7 +1107,7 @@ mod tests {
         };
 
         assert_eq!(resolution.effective, "verify-full");
-        assert!(resolution.warnings.is_empty());
+        assert_eq!(resolution.warnings, Vec::<String>::new());
     }
 
     #[test]

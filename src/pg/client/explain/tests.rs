@@ -146,7 +146,7 @@ fn test_explain_safety_live_insert_does_not_mutate_rows() -> Result<()> {
             .await
             .map_err(db_error)?;
 
-        assert!(!plan.is_empty());
+        assert_ne!(plan, Vec::<String>::new());
         assert_eq!(
             table_row_count(&mut control_connection, &table_name).await?,
             0
@@ -182,7 +182,7 @@ fn test_explain_safety_live_update_does_not_mutate_rows() -> Result<()> {
             .await
             .map_err(db_error)?;
 
-        assert!(!plan.is_empty());
+        assert_ne!(plan, Vec::<String>::new());
         assert_eq!(
             table_value(&mut control_connection, &table_name, 1).await?,
             10
@@ -218,7 +218,7 @@ fn test_explain_safety_live_delete_does_not_mutate_rows() -> Result<()> {
             .await
             .map_err(db_error)?;
 
-        assert!(!plan.is_empty());
+        assert_ne!(plan, Vec::<String>::new());
         assert_eq!(
             table_row_count(&mut control_connection, &table_name).await?,
             1
@@ -256,7 +256,7 @@ fn test_explain_safety_live_modifying_cte_select_does_not_mutate_rows() -> Resul
             .await
             .map_err(db_error)?;
 
-        assert!(!plan.is_empty());
+        assert_ne!(plan, Vec::<String>::new());
         assert_eq!(
             table_row_count(&mut control_connection, &table_name).await?,
             1
@@ -302,7 +302,7 @@ fn test_explain_safety_live_generic_insert_does_not_mutate_rows() -> Result<()> 
             .await
             .map_err(db_error)?;
 
-        assert!(!plan.is_empty());
+        assert_ne!(plan, Vec::<String>::new());
         assert_eq!(
             table_row_count(&mut control_connection, &table_name).await?,
             0
