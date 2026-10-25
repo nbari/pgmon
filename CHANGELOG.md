@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.1] - 2026-10-25
+
+### Fixed
+- **Dependency Security Advisories**: Updated `ctutils` to 0.4.5 (RUSTSEC-2026-0385), `rustls-webpki` to 0.103.16 (RUSTSEC-2026-0382), and `webpki-roots` to 1.0.11 (RUSTSEC-2026-0381), resolving the three vulnerabilities reported by the security audit.
+
+### Changed
+- **Dependencies**: Refreshed `Cargo.lock` to the latest compatible versions. `cargo upgrade` confirmed that direct dependency requirements are current.
+
 ## [0.8.0] - 2026-10-18
 
 ### Fixed
